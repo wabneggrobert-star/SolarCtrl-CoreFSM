@@ -25,20 +25,16 @@ struct SafetyStatus {
   bool blockNormalPumpControl = false;
   bool forceSolarHeatDump = false;
   bool forceOvenPumpRun = false;
-
   bool ds18SensorMissing = false;
   bool frostStorageAvailable = false;
   bool controlledStagnation = false;
-  bool safetyNightCoolingAllowed = false;
-
   float lowestCollectorTemperatureC = NAN;
   float highestCollectorTemperatureC = NAN;
   float highestStorageTemperatureC = NAN;
   float frostStorageTemperatureC = NAN;
   float ovenTemperatureC = NAN;
-
   bool safetyNightCoolingActive = false;
-
+  bool safetyNightCoolingAllowed = false;
   float nightCoolingCollectorTemperatureC = NAN;
   float nightCoolingStorageTemperatureC = NAN;
   float nightCoolingDeltaC = NAN;

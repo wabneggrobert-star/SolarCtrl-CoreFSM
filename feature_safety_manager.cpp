@@ -313,7 +313,7 @@ void begin(AppContext& ctx) {
 
 static void evaluateNightCooling(AppContext& ctx, SafetyStatus& st)
 {
-    st.safetyNightCoolingActive = false;
+    g_status.safetyNightCoolingActive = false;
 
     if (!ctx.config.safetyNightCoolingEnabled)
         return;
@@ -395,7 +395,7 @@ void evaluate(AppContext& ctx) {
   // Solar hat Vorrang vor Ofen, danach Speicher- und Frostschutz.
   evaluateOvenOvertemperature(ctx);
   evaluateStorageOvertemperature(ctx);
-  evaluateNightCooling(ctx, st);
+  evaluateNightCooling(ctx, g_status);
   evaluateCollectorStagnation(ctx);
   evaluateFrostProtection(ctx);
 

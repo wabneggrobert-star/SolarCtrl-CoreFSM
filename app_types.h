@@ -10,12 +10,7 @@ static constexpr uint8_t MAX_PUMPS = 5;
 static constexpr uint8_t MAX_HEATING_CIRCUITS = 4;
 constexpr uint8_t HEATING_CIRCUIT_COUNT = 4;
 static constexpr uint8_t PUMP_ROUTE_TARGET_COUNT = 2;
-bool safetyNightCoolingActive = false;
-bool safetyNightCoolingAllowed = false;
-float nightCoolingCollectorTemperatureC = NAN;
-float nightCoolingStorageTemperatureC = NAN;
-float nightCoolingDeltaC = NAN;
-float nightCoolingPumpPercent = 0.0f;
+
 
 
 // ===================== FSM =====================

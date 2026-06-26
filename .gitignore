@@ -1,0 +1,23 @@
+# Arduino
+*.ino.cpp
+*.elf
+*.bin
+*.hex
+
+# Build
+build/
+.pio/
+.vscode/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Temporary
+*.tmp
