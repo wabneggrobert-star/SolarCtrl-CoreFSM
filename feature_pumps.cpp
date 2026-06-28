@@ -139,6 +139,122 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
     return true;
   }
 
+  bool isSolarCollectorSource(HeatSourceRole role) {
+    return role == HeatSourceRole::SOLAR_COLLECTOR_1 ||
+           role == HeatSourceRole::SOLAR_COLLECTOR_2 ||
+           role == HeatSourceRole::SOLAR_COLLECTOR_3;
+  }
+
+  bool isSolarCollectorPump(const PumpConfig& pump) {
+    return pump.sourceType == PumpSourceType::HEAT_SOURCE_ROLE &&
+           isSolarCollectorSource(pump.sourceRole);
+  }
+
+  void stopPumpZeroPercent(AppContext& ctx, uint8_t i, PumpConfig& pump) {
+    if (!validPumpIndex(i)) return;
+
+    pid[i] = {};
+    pump.state = false;
+    pump.lastPwmPercent = 0.0f;
+
+    if (pump.relayIndex != PIN_UNUSED) {
+      RelayOutputs::set(ctx, pump.relayIndex, false);
+    }
+
+    // Wichtig: Bei Ventilfahrt und Nachtkuehlung muss die Pumpe
+    // wirklich AUS bleiben. Deshalb hier immer 0 %, auch wenn das
+    // normale Sicherheitsprofil einer Heizungspumpe 100 % waere.
+    setPwmPercent(pump, 0.0f);
+  }
+
+  bool resolveNightCoolingSink(const PumpConfig& pump, Ds18Role& sinkRole, bool& hasValve) {
+    sinkRole = Ds18Role::NONE;
+    hasValve = false;
+
+    if (!isSolarCollectorPump(pump)) {
+      return false;
+    }
+
+    if (pump.switchValveEnabled) {
+      hasValve = true;
+
+      // Nachtkuehlung entlaedt bei Pumpen mit Umschaltventil bewusst Ziel B.
+      // Ziel A bleibt damit als priorisiertes Ziel geschuetzt.
+      const PumpRouteTargetConfig& targetB = pump.targets[1];
+      if (!targetB.enabled || targetB.sinkRole == Ds18Role::NONE) {
+        return false;
+      }
+
+      sinkRole = targetB.sinkRole;
+      return true;
+    }
+
+    // Ohne Umschaltventil ist das direkte Pumpenziel das Nachtkuehlziel.
+    if (pump.sinkRole == Ds18Role::NONE) {
+      return false;
+    }
+
+    sinkRole = pump.sinkRole;
+    return true;
+  }
+
+  bool ensureNightCoolingValveTargetB(AppContext& ctx, uint8_t pumpIndex, PumpConfig& pump) {
+    if (!pump.switchValveEnabled) {
+      return true;
+    }
+
+    if (pump.switchValveRelayIndex == PIN_UNUSED) {
+      return false;
+    }
+
+    const uint8_t targetIndex = 1; // Ziel B
+    const bool targetBRelayState = !pump.switchValveStateForTargetA;
+
+    // Relaisstellung fuer Ziel B setzen und waehrend der gesamten Ventilfahrt halten.
+    RelayOutputs::set(ctx, pump.switchValveRelayIndex, targetBRelayState);
+
+    const uint32_t now = millis();
+    const uint32_t travelTimeMs = pump.switchValveTravelTimeMs;
+
+    if (pump.activeTargetIndex == targetIndex && !pump.switchValveMoving) {
+      return true;
+    }
+
+    if (!pump.switchValveMoving || pump.switchValvePendingTargetIndex != targetIndex) {
+      pump.switchValveMoving = true;
+      pump.switchValveMoveStartedMs = now;
+      pump.switchValvePendingTargetIndex = targetIndex;
+
+      stopPumpZeroPercent(ctx, pumpIndex, pump);
+
+      Serial.print("NACHTKUEHLUNG PUMPE ");
+      Serial.print(pumpIndex + 1);
+      Serial.println(": Umschaltventil faehrt auf Ziel B - Pumpe bleibt AUS");
+      Serial.flush();
+
+      if (travelTimeMs == 0) {
+        pump.switchValveMoving = false;
+        pump.activeTargetIndex = targetIndex;
+        pump.switchValvePendingTargetIndex = PIN_UNUSED;
+        return true;
+      }
+
+      return false;
+    }
+
+    const uint32_t elapsedMs = now - pump.switchValveMoveStartedMs;
+    if (elapsedMs < travelTimeMs) {
+      stopPumpZeroPercent(ctx, pumpIndex, pump);
+      return false;
+    }
+
+    pump.switchValveMoving = false;
+    pump.activeTargetIndex = targetIndex;
+    pump.switchValvePendingTargetIndex = PIN_UNUSED;
+    return true;
+  }
+
+
   void forcePumpOff(AppContext& ctx, uint8_t i) {
     if (!validPumpIndex(i)) return;
 
@@ -493,6 +609,141 @@ bool safetyForceRunForSource(AppContext& ctx, HeatSourceRole sourceRole, float p
   }
 
   return anyStarted;
+}
+
+
+bool safetyForceNightCooling(AppContext& ctx, float pwmPercent) {
+  bool anyHandled = false;
+  bool anyPumpOn = false;
+  float maxPwm = 0.0f;
+
+  pwmPercent = clampFloat(pwmPercent, 0.0f, 100.0f);
+
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    PumpConfig& pump = ctx.config.pumps[i];
+
+    if (!pump.enabled) continue;
+    if (pump.mode == PumpMode::OFF) continue;
+    if (!isSolarCollectorPump(pump)) continue;
+
+    // Safety: Nachtkuehlung darf ausschliesslich Solarkollektor-Pumpen verwenden.
+    if (pump.relayIndex == PIN_UNUSED ||
+        !RelayOutputs::isUsableAsPumpEnable(ctx, pump.relayIndex)) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    Ds18Role sinkRole = Ds18Role::NONE;
+    bool hasValve = false;
+    if (!resolveNightCoolingSink(pump, sinkRole, hasValve)) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    float collectorC = NAN;
+    bool collectorValid = false;
+    pumpSourceTemp(ctx, pump, collectorC, collectorValid);
+
+    float sinkC = NAN;
+    bool sinkValid = false;
+    sensorSourceTempByRole(ctx, sinkRole, sinkC, sinkValid);
+
+    pump.lastSourceC = collectorC;
+    pump.lastSinkC = sinkC;
+    pump.lastPwmPercent = 0.0f;
+
+    if (!collectorValid || !sinkValid || isnan(collectorC) || isnan(sinkC)) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    const float coolingDeltaC = sinkC - collectorC;
+    pump.lastDiffC = coolingDeltaC;
+
+    // Energieeffizient: nur kuehlen, wenn der Kollektor wirklich deutlich kaelter ist.
+    if (collectorC > 25.0f ||
+        coolingDeltaC < 8.0f ||
+        sinkC <= ctx.config.safetyNightCoolingTargetTemperatureC) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    const uint8_t valveRelayIndex =
+        (hasValve && pump.switchValveRelayIndex != PIN_UNUSED)
+          ? pump.switchValveRelayIndex
+          : PIN_UNUSED;
+
+    if (!EnergyConflicts::canActivateRoute(
+          ctx,
+          i,
+          pump.sourceRole,
+          sinkRole,
+          pump.relayIndex,
+          valveRelayIndex
+        )) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    // Bei Umschaltventil wird immer Ziel B verwendet.
+    // Waehrend der Ventilfahrt bleibt die Pumpe zwangsweise AUS.
+    if (hasValve && !ensureNightCoolingValveTargetB(ctx, i, pump)) {
+      anyHandled = true;
+      continue;
+    }
+
+    if (hasValve) {
+      RelayOutputs::set(ctx, pump.switchValveRelayIndex, !pump.switchValveStateForTargetA);
+    }
+
+    EnergyConflicts::reserveRoute(
+      ctx,
+      i,
+      pump.sourceRole,
+      sinkRole,
+      pump.relayIndex,
+      valveRelayIndex
+    );
+
+    RelayOutputs::set(ctx, pump.relayIndex, true);
+
+    pump.state = true;
+    pump.lastPwmPercent = pwmPercent;
+
+    if (pump.mode == PumpMode::PWM && pump.pwmChannel != PIN_UNUSED) {
+      setPwmPercent(pump, pwmPercent);
+    } else {
+      setPwmPercent(pump, 0.0f);
+    }
+
+    Serial.print("SAFETY NACHTKUEHLUNG P");
+    Serial.print(i + 1);
+    Serial.print(" | Quelle=");
+    Serial.print((int)pump.sourceRole);
+    Serial.print(" | Ziel=");
+    Serial.print((int)sinkRole);
+    Serial.print(hasValve ? " (Ventil Ziel B)" : " (Direktziel)");
+    Serial.print(" | Kollektor=");
+    Serial.print(collectorC);
+    Serial.print(" C | Speicher=");
+    Serial.print(sinkC);
+    Serial.print(" C | Delta=");
+    Serial.print(coolingDeltaC);
+    Serial.print(" K | PWM=");
+    Serial.println(pwmPercent);
+    Serial.flush();
+
+    anyHandled = true;
+    anyPumpOn = true;
+    if (pwmPercent > maxPwm) {
+      maxPwm = pwmPercent;
+    }
+  }
+
+  ctx.control.relayEnable = anyPumpOn;
+  ctx.control.pwmPercent = (uint8_t)clampFloat(maxPwm, 0.0f, 100.0f);
+
+  return anyHandled;
 }
 
 bool safetyForceHeatDumpForSource(AppContext& ctx, HeatSourceRole sourceRole, float pwmPercent) {

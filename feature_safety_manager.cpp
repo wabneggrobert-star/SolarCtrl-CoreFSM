@@ -460,23 +460,9 @@ void applyOutputs(AppContext& ctx) {
     }
   }
 
-  if (s.safetyNightCoolingActive)
+if (s.safetyNightCoolingActive)
 {
-    Pumps::safetyForceRunForSource(
-        ctx,
-        HeatSourceRole::SOLAR_COLLECTOR_1,
-        s.nightCoolingPumpPercent);
-
-    Pumps::safetyForceRunForSource(
-        ctx,
-        HeatSourceRole::SOLAR_COLLECTOR_2,
-        s.nightCoolingPumpPercent);
-
-    Pumps::safetyForceRunForSource(
-        ctx,
-        HeatSourceRole::SOLAR_COLLECTOR_3,
-        s.nightCoolingPumpPercent);
-
+    Pumps::safetyForceNightCooling(ctx, s.nightCoolingPumpPercent);
     return;
 }
 

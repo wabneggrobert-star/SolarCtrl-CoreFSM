@@ -10,6 +10,7 @@ namespace Pumps {
   void safetyAllOffExceptOven(AppContext& ctx);
   bool safetyForceRunForSource(AppContext& ctx, HeatSourceRole sourceRole, float pwmPercent);
   bool safetyForceHeatDumpForSource(AppContext& ctx, HeatSourceRole sourceRole, float pwmPercent);
+  bool safetyForceNightCooling(AppContext& ctx, float pwmPercent);
 
 
 }
