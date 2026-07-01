@@ -602,6 +602,8 @@ void handleSaveMaxConfig() {
     }
   }
 
+  bool outputUsageLabel(const AppContext& ctx, OutputKind kind, uint8_t index, String& usage);
+
   void handleRelaysJson() {
     if (!s_ctx) {
       server.send(500, "application/json", "{\"error\":\"no_context\"}");
@@ -616,6 +618,8 @@ void handleSaveMaxConfig() {
 
       const RelayOutputConfig& cfg = s_ctx->config.relays[i];
       const bool state = RelayOutputs::get(*s_ctx, i);
+      String usage;
+      const bool locked = outputUsageLabel(*s_ctx, OutputKind::RELAY, i, usage);
 
       json += "{";
       json += "\"type\":\"relay\",";
@@ -625,7 +629,10 @@ void handleSaveMaxConfig() {
       json += "\"function\":\"" + String(RelayOutputs::functionToKey(cfg.function)) + "\",";
       json += "\"functionLabel\":\"" + relayFunctionLabel(cfg.function) + "\",";
       json += "\"activeLow\":" + String(cfg.activeLow ? "true" : "false") + ",";
-      json += "\"state\":" + String(state ? "true" : "false");
+      json += "\"locked\":" + String(locked ? "true" : "false") + ",";
+      json += "\"usedBy\":";
+      if (locked) json += "\"" + usage + "\""; else json += "null";
+      json += ",\"state\":" + String(state ? "true" : "false");
       json += "}";
     }
 
@@ -634,6 +641,8 @@ void handleSaveMaxConfig() {
       if (i > 0) json += ",";
 
       const PwmOutputConfig& cfg = s_ctx->config.pwmOutputs[i];
+      String usage;
+      const bool locked = outputUsageLabel(*s_ctx, OutputKind::PWM_OUTPUT, i, usage);
 
       json += "{";
       json += "\"type\":\"pwm\",";
@@ -645,7 +654,10 @@ void handleSaveMaxConfig() {
       json += "\"function\":\"" + String(RelayOutputs::functionToKey(cfg.function)) + "\",";
       json += "\"functionLabel\":\"" + relayFunctionLabel(cfg.function) + "\",";
       json += "\"profile\":\"" + pwmProfileToKey(cfg.profile) + "\",";
-      json += "\"percent\":" + String(PwmDriver::getDuty(i));
+      json += "\"locked\":" + String(locked ? "true" : "false") + ",";
+      json += "\"usedBy\":";
+      if (locked) json += "\"" + usage + "\""; else json += "null";
+      json += ",\"percent\":" + String(PwmDriver::getDuty(i));
       json += "}";
     }
 
@@ -773,6 +785,13 @@ bool outputIsUsedByValves(const AppContext& ctx, OutputKind kind, uint8_t index,
   if (usedBy < 0) return false;
   usage = "Ventil " + String(usedBy + 1);
   return true;
+}
+
+bool outputUsageLabel(const AppContext& ctx, OutputKind kind, uint8_t index, String& usage) {
+  usage = "";
+  return outputIsUsedByLegacyConsumers(ctx, kind, index, -1, usage) ||
+         outputIsUsedByHeatingCircuit(ctx, kind, index, -1, usage) ||
+         outputIsUsedByValves(ctx, kind, index, -1, usage);
 }
 
 bool validateSingleOutputFreeForUse(const AppContext& ctx, OutputKind kind, uint8_t index, const String& newUsage, int ignoreCircuitIndex = -1, int ignorePumpIndex = -1, bool ignoreAuxHeater = false, bool ignoreOven = false, int ignoreValveIndex = -1) {
