@@ -6,6 +6,7 @@
 #include "feature_relay_outputs.h"
 #include "feature_pwm_pca9685.h"
 #include "feature_sensor_assignments.h"
+#include "feature_valves.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -167,7 +168,7 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
     setPwmPercent(pump, 0.0f);
   }
 
-  bool resolveNightCoolingSink(const PumpConfig& pump, Ds18Role& sinkRole, bool& hasValve) {
+  bool resolveNightCoolingSink(const AppContext& ctx, const PumpConfig& pump, Ds18Role& sinkRole, bool& hasValve) {
     sinkRole = Ds18Role::NONE;
     hasValve = false;
 
@@ -175,11 +176,10 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
       return false;
     }
 
-    if (pump.switchValveEnabled) {
+    if (pump.valveIndex != PIN_UNUSED && Valves::isConfigured(ctx, pump.valveIndex)) {
       hasValve = true;
 
       // Nachtkuehlung entlaedt bei Pumpen mit Umschaltventil bewusst Ziel B.
-      // Ziel A bleibt damit als priorisiertes Ziel geschuetzt.
       const PumpRouteTargetConfig& targetB = pump.targets[1];
       if (!targetB.enabled || targetB.sinkRole == Ds18Role::NONE) {
         return false;
@@ -189,7 +189,6 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
       return true;
     }
 
-    // Ohne Umschaltventil ist das direkte Pumpenziel das Nachtkuehlziel.
     if (pump.sinkRole == Ds18Role::NONE) {
       return false;
     }
@@ -199,58 +198,36 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
   }
 
   bool ensureNightCoolingValveTargetB(AppContext& ctx, uint8_t pumpIndex, PumpConfig& pump) {
-    if (!pump.switchValveEnabled) {
+    if (pump.valveIndex == PIN_UNUSED || !Valves::isConfigured(ctx, pump.valveIndex)) {
       return true;
-    }
-
-    if (pump.switchValveRelayIndex == PIN_UNUSED) {
-      return false;
     }
 
     const uint8_t targetIndex = 1; // Ziel B
-    const bool targetBRelayState = !pump.switchValveStateForTargetA;
 
-    // Relaisstellung fuer Ziel B setzen und waehrend der gesamten Ventilfahrt halten.
-    RelayOutputs::set(ctx, pump.switchValveRelayIndex, targetBRelayState);
-
-    const uint32_t now = millis();
-    const uint32_t travelTimeMs = pump.switchValveTravelTimeMs;
-
-    if (pump.activeTargetIndex == targetIndex && !pump.switchValveMoving) {
+    if (Valves::currentPosition(pump.valveIndex) == ValvePosition::B && !Valves::isMoving(pump.valveIndex)) {
+      pump.activeTargetIndex = targetIndex;
+      pump.valvePendingTargetIndex = PIN_UNUSED;
       return true;
     }
 
-    if (!pump.switchValveMoving || pump.switchValvePendingTargetIndex != targetIndex) {
-      pump.switchValveMoving = true;
-      pump.switchValveMoveStartedMs = now;
-      pump.switchValvePendingTargetIndex = targetIndex;
+    if (!Valves::requestPosition(ctx, pump.valveIndex, ValvePosition::B)) {
+      return false;
+    }
 
+    pump.valvePendingTargetIndex = targetIndex;
+
+    if (Valves::isMoving(pump.valveIndex)) {
       stopPumpZeroPercent(ctx, pumpIndex, pump);
 
       Serial.print("NACHTKUEHLUNG PUMPE ");
       Serial.print(pumpIndex + 1);
-      Serial.println(": Umschaltventil faehrt auf Ziel B - Pumpe bleibt AUS");
+      Serial.println(": Ventil V2 faehrt auf Ziel B - Pumpe bleibt AUS");
       Serial.flush();
-
-      if (travelTimeMs == 0) {
-        pump.switchValveMoving = false;
-        pump.activeTargetIndex = targetIndex;
-        pump.switchValvePendingTargetIndex = PIN_UNUSED;
-        return true;
-      }
-
       return false;
     }
 
-    const uint32_t elapsedMs = now - pump.switchValveMoveStartedMs;
-    if (elapsedMs < travelTimeMs) {
-      stopPumpZeroPercent(ctx, pumpIndex, pump);
-      return false;
-    }
-
-    pump.switchValveMoving = false;
     pump.activeTargetIndex = targetIndex;
-    pump.switchValvePendingTargetIndex = PIN_UNUSED;
+    pump.valvePendingTargetIndex = PIN_UNUSED;
     return true;
   }
 
@@ -328,9 +305,9 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
     Serial.print(" | PWM=");
     Serial.print(p.lastPwmPercent);
 
-    if (p.switchValveEnabled) {
-      Serial.print(" | Umschaltventil=");
-      Serial.print(p.switchValveRelayIndex);
+    if (p.valveIndex != PIN_UNUSED) {
+      Serial.print(" | Ventil V2=");
+      Serial.print(p.valveIndex);
       Serial.print(" | Ziel=");
       if (p.activeTargetIndex == 0) Serial.print("A");
       else if (p.activeTargetIndex == 1) Serial.print("B");
@@ -475,7 +452,7 @@ void process(AppContext& ctx) {
     }
 
     if (relayOn) {
-      const uint8_t valveRelayIndex = route.hasValve ? route.valveRelayIndex : PIN_UNUSED;
+      const OutputRef valveOutput = route.hasValve ? route.valveOutput : OutputRef{};
 
       if (!EnergyConflicts::canActivateRoute(
             ctx,
@@ -483,7 +460,7 @@ void process(AppContext& ctx) {
             p.sourceRole,
             route.sinkRole,
             p.relayIndex,
-            valveRelayIndex
+            valveOutput
           )) {
         forcePumpOff(ctx, i);
         if (wasOn) {
@@ -492,17 +469,13 @@ void process(AppContext& ctx) {
         continue;
       }
 
-      if (route.hasValve) {
-        RelayOutputs::set(ctx, route.valveRelayIndex, route.valveState);
-      }
-
       EnergyConflicts::reserveRoute(
         ctx,
         i,
         p.sourceRole,
         route.sinkRole,
         p.relayIndex,
-        valveRelayIndex
+        valveOutput
       );
     }
 
@@ -635,7 +608,7 @@ bool safetyForceNightCooling(AppContext& ctx, float pwmPercent) {
 
     Ds18Role sinkRole = Ds18Role::NONE;
     bool hasValve = false;
-    if (!resolveNightCoolingSink(pump, sinkRole, hasValve)) {
+    if (!resolveNightCoolingSink(ctx, pump, sinkRole, hasValve)) {
       stopPumpZeroPercent(ctx, i, pump);
       continue;
     }
@@ -668,10 +641,7 @@ bool safetyForceNightCooling(AppContext& ctx, float pwmPercent) {
       continue;
     }
 
-    const uint8_t valveRelayIndex =
-        (hasValve && pump.switchValveRelayIndex != PIN_UNUSED)
-          ? pump.switchValveRelayIndex
-          : PIN_UNUSED;
+    const OutputRef valveOutput = hasValve ? Valves::outputRef(ctx, pump.valveIndex) : OutputRef{};
 
     if (!EnergyConflicts::canActivateRoute(
           ctx,
@@ -679,7 +649,7 @@ bool safetyForceNightCooling(AppContext& ctx, float pwmPercent) {
           pump.sourceRole,
           sinkRole,
           pump.relayIndex,
-          valveRelayIndex
+          valveOutput
         )) {
       stopPumpZeroPercent(ctx, i, pump);
       continue;
@@ -692,17 +662,13 @@ bool safetyForceNightCooling(AppContext& ctx, float pwmPercent) {
       continue;
     }
 
-    if (hasValve) {
-      RelayOutputs::set(ctx, pump.switchValveRelayIndex, !pump.switchValveStateForTargetA);
-    }
-
     EnergyConflicts::reserveRoute(
       ctx,
       i,
       pump.sourceRole,
       sinkRole,
       pump.relayIndex,
-      valveRelayIndex
+      valveOutput
     );
 
     RelayOutputs::set(ctx, pump.relayIndex, true);

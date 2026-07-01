@@ -13,6 +13,9 @@
 #include "feature_safety_manager.h"
 #include "feature_oven.h"
 #include "feature_output_validation.h"
+#include "feature_servo_driver.h"
+#include "feature_valves.h"
+#include "feature_heating_circuits.h"
 #include <WebServer.h>
 #include <SD.h>
 
@@ -147,7 +150,7 @@ void handleStatusJson() {
     const PumpConfig& pump = s_ctx->config.pumps[i];
     if (!pump.state) continue;
 
-    if (pump.switchValveEnabled && pump.activeTargetIndex < PUMP_ROUTE_TARGET_COUNT) {
+    if (pump.valveIndex != PIN_UNUSED && pump.activeTargetIndex < PUMP_ROUTE_TARGET_COUNT) {
       const Ds18Role targetRole = pump.targets[pump.activeTargetIndex].sinkRole;
       if (targetRole != Ds18Role::NONE) {
         activeSinkLabel = SensorRoles::toLabel(targetRole);
@@ -424,7 +427,7 @@ void handlePlantJson() {
     json += "\"name\":\"Pumpe " + String(i + 1) + "\",";
     json += "\"state\":" + String(p.state ? "true" : "false") + ",";
     json += "\"source\":\"" + String(HeatSourceRoles::toLabel(p.sourceRole)) + "\",";
-    json += "\"sink\":\"" + String(p.switchValveEnabled ? String("Umschaltventil") : String(SensorRoles::toLabel(p.sinkRole))) + "\",";
+    json += "\"sink\":\"" + String((p.valveIndex != PIN_UNUSED) ? String("Umschaltventil") : String(SensorRoles::toLabel(p.sinkRole))) + "\",";
     json += "\"diff\":" + String(isnan(p.lastDiffC) ? "null" : String(p.lastDiffC, 2)) + ",";
     json += "\"pwm\":" + String(p.lastPwmPercent, 1);
     json += "}";
@@ -656,6 +659,9 @@ String outputRefKindToKey(OutputKind kind) {
   return "none";
 }
 
+OutputKind outputKindFromKey(const String& key);
+int valveOutputUsedBy(const AppContext& ctx, OutputKind kind, uint8_t index, int ignoreValve);
+
 String outputRefLabel(OutputKind kind, uint8_t index) {
   if (kind == OutputKind::RELAY) return relayHardwareLabel(index);
   if (kind == OutputKind::PWM_OUTPUT) return pwmOutputHardwareLabel(index);
@@ -730,10 +736,6 @@ bool outputIsUsedByLegacyConsumers(const AppContext& ctx, OutputKind kind, uint8
         usage = "Pumpe " + String(i + 1) + " Pump Enable";
         return true;
       }
-      if (pump.switchValveEnabled && pump.switchValveRelayIndex == index) {
-        usage = "Pumpe " + String(i + 1) + " Umschaltventil";
-        return true;
-      }
     }
 
     const AuxHeaterConfig& aux = ctx.config.auxHeater;
@@ -766,12 +768,20 @@ bool outputIsUsedByLegacyConsumers(const AppContext& ctx, OutputKind kind, uint8
   return false;
 }
 
-bool validateSingleOutputFreeForUse(const AppContext& ctx, OutputKind kind, uint8_t index, const String& newUsage, int ignoreCircuitIndex = -1, int ignorePumpIndex = -1, bool ignoreAuxHeater = false, bool ignoreOven = false) {
+bool outputIsUsedByValves(const AppContext& ctx, OutputKind kind, uint8_t index, int ignoreValveIndex, String& usage) {
+  const int usedBy = valveOutputUsedBy(ctx, kind, index, ignoreValveIndex);
+  if (usedBy < 0) return false;
+  usage = "Ventil " + String(usedBy + 1);
+  return true;
+}
+
+bool validateSingleOutputFreeForUse(const AppContext& ctx, OutputKind kind, uint8_t index, const String& newUsage, int ignoreCircuitIndex = -1, int ignorePumpIndex = -1, bool ignoreAuxHeater = false, bool ignoreOven = false, int ignoreValveIndex = -1) {
   if (!outputRefAssigned(kind, index)) return true;
 
   String usage;
   if (outputIsUsedByLegacyConsumers(ctx, kind, index, ignorePumpIndex, usage, ignoreAuxHeater, ignoreOven) ||
-      outputIsUsedByHeatingCircuit(ctx, kind, index, ignoreCircuitIndex, usage)) {
+      outputIsUsedByHeatingCircuit(ctx, kind, index, ignoreCircuitIndex, usage) ||
+      outputIsUsedByValves(ctx, kind, index, ignoreValveIndex, usage)) {
     server.send(409, "text/plain", outputRefLabel(kind, index) + " ist bereits belegt: " + usage + ". Neue Zuordnung: " + newUsage);
     return false;
   }
@@ -783,13 +793,23 @@ bool validatePwmOutputModeChange(const AppContext& ctx, uint8_t index, const Pwm
   if (index >= PWM_OUTPUT_COUNT) return false;
 
   String usage;
-  if (candidate.mode == PwmOutputMode::PWM &&
-      (outputIsUsedByHeatingCircuit(ctx, OutputKind::PWM_OUTPUT, index, -1, usage))) {
-    server.send(409, "text/plain", pwmOutputHardwareLabel(index) + " ist bereits als Schaltausgang belegt: " + usage);
-    return false;
+  const PwmOutputConfig& current = ctx.config.pwmOutputs[index];
+
+  const bool usedAsSwitchOutput =
+      outputIsUsedByHeatingCircuit(ctx, OutputKind::PWM_OUTPUT, index, -1, usage) ||
+      outputIsUsedByValves(ctx, OutputKind::PWM_OUTPUT, index, -1, usage);
+
+  if (usedAsSwitchOutput) {
+    if (!candidate.enabled ||
+        candidate.mode != PwmOutputMode::SWITCH ||
+        candidate.mode != current.mode ||
+        candidate.function != current.function) {
+      server.send(409, "text/plain", pwmOutputHardwareLabel(index) + " ist bereits als Schaltausgang belegt: " + usage + ". Modus/Funktion kann nicht geändert werden.");
+      return false;
+    }
   }
 
-  if (candidate.mode == PwmOutputMode::SWITCH &&
+  if ((!candidate.enabled || candidate.mode == PwmOutputMode::SWITCH) &&
       outputIsUsedByLegacyConsumers(ctx, OutputKind::PWM_OUTPUT, index, -1, usage)) {
     server.send(409, "text/plain", pwmOutputHardwareLabel(index) + " ist bereits als PWM-Ausgang belegt: " + usage);
     return false;
@@ -803,13 +823,14 @@ bool validatePwmOutputModeChange(const AppContext& ctx, uint8_t index, const Pwm
   return true;
 }
 
-bool validateRelayFunctionChange(const AppContext& ctx, uint8_t index, RelayFunction newFunction) {
+bool validateRelayFunctionChange(const AppContext& ctx, uint8_t index, RelayFunction newFunction, bool newEnabled) {
   String usage;
   if (outputIsUsedByLegacyConsumers(ctx, OutputKind::RELAY, index, -1, usage) ||
-      outputIsUsedByHeatingCircuit(ctx, OutputKind::RELAY, index, -1, usage)) {
+      outputIsUsedByHeatingCircuit(ctx, OutputKind::RELAY, index, -1, usage) ||
+      outputIsUsedByValves(ctx, OutputKind::RELAY, index, -1, usage)) {
     const RelayOutputConfig& current = ctx.config.relays[index];
-    if (newFunction != current.function) {
-      server.send(409, "text/plain", relayHardwareLabel(index) + " ist bereits belegt: " + usage + ". Funktion kann nicht geändert werden.");
+    if (!newEnabled || newFunction != current.function) {
+      server.send(409, "text/plain", relayHardwareLabel(index) + " ist bereits belegt: " + usage + ". Ausgang kann nicht deaktiviert und Funktion kann nicht geändert werden.");
       return false;
     }
   }
@@ -996,6 +1017,10 @@ bool validateOvenOutputConfig(const AppContext& ctx, const OvenConfig& candidate
         candidate.function = RelayFunction::NONE;
       }
 
+      if (!validatePwmOutputModeChange(*s_ctx, (uint8_t)idx, candidate)) {
+        return;
+      }
+
       s_ctx->config.pwmOutputs[idx] = candidate;
       Storage::saveConfig(s_ctx->config);
       server.send(200, "text/plain", "OK");
@@ -1016,6 +1041,10 @@ bool validateOvenOutputConfig(const AppContext& ctx, const OvenConfig& candidate
     RelayFunction fn = RelayOutputs::functionFromKey(server.arg("function"));
     if (fn == RelayFunction::NONE) {
       enabled = false;
+    }
+
+    if (!validateRelayFunctionChange(*s_ctx, (uint8_t)idx, fn, enabled)) {
+      return;
     }
 
     // Auf der Seite "Ausgaenge" wird nur die Faehigkeit des Ausgangs definiert.
@@ -1100,13 +1129,18 @@ bool validateOvenOutputConfig(const AppContext& ctx, const OvenConfig& candidate
     return -1;
   }
 
-  int valveRelayUsedBy(const AppContext& ctx, uint8_t relayIndex, int ignorePump) {
-    if (relayIndex == PIN_UNUSED) return -1;
-    for (uint8_t i = 0; i < MAX_PUMPS; i++) {
-      if ((int)i == ignorePump) continue;
-      if (ctx.config.pumps[i].switchValveRelayIndex == relayIndex) return i;
+  int valveOutputUsedBy(const AppContext& ctx, OutputKind kind, uint8_t index, int ignoreValve) {
+    if (!outputRefAssigned(kind, index)) return -1;
+    for (uint8_t i = 0; i < MAX_VALVES; i++) {
+      if ((int)i == ignoreValve) continue;
+      const ValveConfig& v = ctx.config.valves[i];
+      if (v.enabled && v.output.kind == kind && v.output.index == index) return i;
     }
     return -1;
+  }
+
+  int valveRelayUsedBy(const AppContext& ctx, uint8_t relayIndex, int ignoreValve) {
+    return valveOutputUsedBy(ctx, OutputKind::RELAY, relayIndex, ignoreValve);
   }
 
   int pwmChannelUsedBy(const AppContext& ctx, uint8_t pwmChannel, int ignorePump) {
@@ -1212,28 +1246,9 @@ int feedbackPinUsedBy(const AppContext& ctx, uint8_t feedbackPin, int ignorePump
       }
     }
 
-    if (candidate.switchValveEnabled && candidate.switchValveRelayIndex != PIN_UNUSED) {
-      if (candidate.switchValveRelayIndex >= RELAY_COUNT) {
-        error = "Ventilrelais ungueltig";
-        return false;
-      }
-
-      if (!outputExistsAndMatchesFunction(ctx, OutputKind::RELAY, candidate.switchValveRelayIndex, RelayFunction::ZONE_VALVE, false)) {
-        error = "Ventilrelais ist nicht als Zonenventil konfiguriert";
-        return false;
-      }
-
-      if (candidate.mode == PumpMode::RELAY &&
-          candidate.switchValveRelayIndex == candidate.relayIndex) {
-        error = "Pumpenrelais und Ventilrelais duerfen nicht identisch sein";
-        return false;
-      }
-
-      if (!validateSingleOutputFreeForUse(ctx, OutputKind::RELAY, candidate.switchValveRelayIndex,
-                                          "Pumpe " + String(pumpIndex + 1) + " Umschaltventil",
-                                          -1, pumpIndex)) {
-        return false;
-      }
+    if (candidate.valveIndex != PIN_UNUSED && candidate.valveIndex >= MAX_VALVES) {
+      error = "Ventilindex ungueltig";
+      return false;
     }
 
     return true;
@@ -1274,11 +1289,14 @@ int feedbackPinUsedBy(const AppContext& ctx, uint8_t feedbackPin, int ignorePump
       json += "\"pidKd\":" + String(p.pidKd, 4) + ",";
       json += "\"minPwmPercent\":" + String(p.minPwmPercent, 2) + ",";
       json += "\"maxPwmPercent\":" + String(p.maxPwmPercent, 2) + ",";
-      json += "\"switchValveEnabled\":" + String(p.switchValveEnabled ? "true" : "false") + ",";
-      json += "\"switchValveRelayIndex\":" + String(p.switchValveRelayIndex) + ",";
-      json += "\"switchValveTravelTimeMs\":" + String(p.switchValveTravelTimeMs) + ",";
-      json += "\"switchValveMoving\":" + String(p.switchValveMoving ? "true" : "false") + ",";
-      json += "\"switchValveStateForTargetA\":" + String(p.switchValveStateForTargetA ? "true" : "false") + ",";
+      const bool pumpValveEnabled = (p.valveIndex != PIN_UNUSED && p.valveIndex < MAX_VALVES && s_ctx->config.valves[p.valveIndex].enabled);
+      const ValveConfig& pv = pumpValveEnabled ? s_ctx->config.valves[p.valveIndex] : s_ctx->config.valves[0];
+      json += "\"valveIndex\":" + String(p.valveIndex) + ",";
+      json += "\"switchValveEnabled\":" + String(pumpValveEnabled ? "true" : "false") + ",";
+      json += "\"switchValveRelayIndex\":" + String((pumpValveEnabled && pv.output.kind == OutputKind::RELAY) ? pv.output.index : PIN_UNUSED) + ",";
+      json += "\"switchValveTravelTimeMs\":" + String(pumpValveEnabled ? pv.travelTimeMs : 0) + ",";
+      json += "\"switchValveMoving\":" + String((pumpValveEnabled && Valves::isMoving(p.valveIndex)) ? "true" : "false") + ",";
+      json += "\"switchValveStateForTargetA\":" + String((pumpValveEnabled && !pv.activeHighForB) ? "true" : "false") + ",";
       json += "\"activeTargetIndex\":" + String(p.activeTargetIndex) + ",";
       json += "\"targets\":[";
       for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
@@ -1423,13 +1441,11 @@ int feedbackPinUsedBy(const AppContext& ctx, uint8_t feedbackPin, int ignorePump
     if (server.hasArg("targetSelect")) {
       String targetSelect = server.arg("targetSelect");
       if (targetSelect.startsWith("sink:")) {
-        p.switchValveEnabled = false;
-        p.switchValveRelayIndex = PIN_UNUSED;
+        p.valveIndex = PIN_UNUSED;
         p.sinkRole = SensorRoles::fromKey(targetSelect.substring(5));
       } else if (targetSelect.startsWith("valve:")) {
-        p.switchValveEnabled = true;
         p.sinkRole = Ds18Role::NONE;
-        p.switchValveRelayIndex = (uint8_t)targetSelect.substring(6).toInt();
+        p.valveIndex = (uint8_t)targetSelect.substring(6).toInt();
       }
     }
 
@@ -1437,6 +1453,7 @@ int feedbackPinUsedBy(const AppContext& ctx, uint8_t feedbackPin, int ignorePump
     if (server.hasArg("pwmChannel")) p.pwmChannel = (uint8_t)server.arg("pwmChannel").toInt();
     if (server.hasArg("pwmProfile")) p.pwmProfile = (server.arg("pwmProfile") == "heating") ? PwmProfile::HEATING : PwmProfile::SOLAR;
     if (server.hasArg("feedbackPin")) p.feedbackPin = (uint8_t)server.arg("feedbackPin").toInt();
+    if (server.hasArg("valveIndex")) p.valveIndex = (uint8_t)server.arg("valveIndex").toInt();
 
     if (server.hasArg("targetDiff")) p.targetDiff = server.arg("targetDiff").toFloat();
     if (server.hasArg("hysteresis")) p.hysteresis = server.arg("hysteresis").toFloat();
@@ -1446,11 +1463,6 @@ int feedbackPinUsedBy(const AppContext& ctx, uint8_t feedbackPin, int ignorePump
     if (server.hasArg("pidKd")) p.pidKd = server.arg("pidKd").toFloat();
     if (server.hasArg("minPwmPercent")) p.minPwmPercent = server.arg("minPwmPercent").toFloat();
     if (server.hasArg("maxPwmPercent")) p.maxPwmPercent = server.arg("maxPwmPercent").toFloat();
-
-    if (server.hasArg("switchValveEnabled")) p.switchValveEnabled = (server.arg("switchValveEnabled").toInt() != 0);
-    if (server.hasArg("switchValveRelayIndex")) p.switchValveRelayIndex = (uint8_t)server.arg("switchValveRelayIndex").toInt();
-    if (server.hasArg("switchValveTravelTimeMs")) p.switchValveTravelTimeMs = (uint32_t)server.arg("switchValveTravelTimeMs").toInt();
-    if (server.hasArg("switchValveStateForTargetA")) p.switchValveStateForTargetA = (server.arg("switchValveStateForTargetA").toInt() != 0);
 
     for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
       const String prefix = "target" + String(t) + "_";
@@ -1470,9 +1482,10 @@ if (!validatePumpRelayMapping(*s_ctx, (uint8_t)idx, p, validationError)) {
   return;
 }
 
+
 if (!OutputValidation::validateAll(*s_ctx, validationError)) {
   p = old;
-  server.send(409, "text/plain", validationError);
+    server.send(409, "text/plain", validationError);
   return;
 }
 
@@ -1710,6 +1723,253 @@ server.send(200, "text/plain", "OK");
     server.send(200, "text/plain", "OK");
   }
 
+  String testOutputRefKind(const OutputRef& ref) {
+    return outputRefKindToKey(ref.kind);
+  }
+
+  String testOutputRefLabel(const OutputRef& ref) {
+    return outputRefLabel(ref.kind, ref.index);
+  }
+
+
+  String valvePositionToKey(ValvePosition pos) {
+    return (pos == ValvePosition::B) ? "B" : "A";
+  }
+
+  void testSetOutputRef(AppContext& ctx, const OutputRef& ref, bool on, uint8_t percent = 100) {
+    if (ref.kind == OutputKind::RELAY && ref.index < RELAY_COUNT) {
+      RelayOutputs::set(ctx, ref.index, on);
+      return;
+    }
+
+    if (ref.kind == OutputKind::PWM_OUTPUT && ref.index < PWM_OUTPUT_COUNT) {
+      const PwmOutputConfig& po = ctx.config.pwmOutputs[ref.index];
+      if (po.mode == PwmOutputMode::PWM) {
+        PwmDriver::setDuty(ref.index, on ? percent : 0, po.profile);
+      } else {
+        PwmDriver::setSwitch(ref.index, on, po.profile);
+      }
+    }
+  }
+
+  void appendTestSafetyJson(String& json) {
+    const SafetyManager::SafetyStatus& st = SafetyManager::status();
+    json += "\"safety\":{";
+    json += "\"mode\":\"" + String(SafetyManager::modeToText(st.mode)) + "\",";
+    json += "\"message\":\"" + String(st.message) + "\",";
+    json += "\"frostProtectionActive\":" + String(st.frostProtectionActive ? "true" : "false") + ",";
+    json += "\"collectorStagnationActive\":" + String(st.collectorStagnationActive ? "true" : "false") + ",";
+    json += "\"storageOvertemperatureActive\":" + String(st.storageOvertemperatureActive ? "true" : "false") + ",";
+    json += "\"ovenOvertemperatureActive\":" + String(st.ovenOvertemperatureActive ? "true" : "false") + ",";
+    json += "\"sensorFaultActive\":" + String(st.sensorFaultActive ? "true" : "false") + ",";
+    json += "\"blockNormalPumpControl\":" + String(st.blockNormalPumpControl ? "true" : "false") + ",";
+    json += "\"forceSolarHeatDump\":" + String(st.forceSolarHeatDump ? "true" : "false") + ",";
+    json += "\"forceOvenPumpRun\":" + String(st.forceOvenPumpRun ? "true" : "false") + ",";
+    json += "\"controlledStagnation\":" + String(st.controlledStagnation ? "true" : "false") + ",";
+    json += "\"lowestCollectorTemperatureC\":" + jsonFloat(st.lowestCollectorTemperatureC, 1) + ",";
+    json += "\"highestCollectorTemperatureC\":" + jsonFloat(st.highestCollectorTemperatureC, 1) + ",";
+    json += "\"highestStorageTemperatureC\":" + jsonFloat(st.highestStorageTemperatureC, 1) + ",";
+    json += "\"frostStorageTemperatureC\":" + jsonFloat(st.frostStorageTemperatureC, 1) + ",";
+    json += "\"ovenTemperatureC\":" + jsonFloat(st.ovenTemperatureC, 1) + ",";
+    json += "\"nightCoolingActive\":" + String(st.safetyNightCoolingActive ? "true" : "false") + ",";
+    json += "\"nightCoolingCollectorTemperatureC\":" + jsonFloat(st.nightCoolingCollectorTemperatureC, 1) + ",";
+    json += "\"nightCoolingStorageTemperatureC\":" + jsonFloat(st.nightCoolingStorageTemperatureC, 1) + ",";
+    json += "\"nightCoolingDeltaC\":" + jsonFloat(st.nightCoolingDeltaC, 1) + ",";
+    json += "\"nightCoolingPumpPercent\":" + jsonFloat(st.nightCoolingPumpPercent, 0);
+    json += "}";
+  }
+
+
+  String valveOutputLabel(const OutputRef& ref) {
+    return outputRefLabel(ref.kind, ref.index);
+  }
+
+  int pumpUsingValve(const AppContext& ctx, uint8_t valveIndex, int ignorePump = -1) {
+    if (valveIndex == PIN_UNUSED) return -1;
+    for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+      if ((int)i == ignorePump) continue;
+      if (ctx.config.pumps[i].valveIndex == valveIndex) return i;
+    }
+    return -1;
+  }
+
+  void appendValveOutputOptions(String& json, const AppContext& ctx) {
+    json += "\"outputOptions\":[";
+    bool first = true;
+
+    for (uint8_t i = 0; i < RELAY_COUNT; i++) {
+      const RelayOutputConfig& r = ctx.config.relays[i];
+      if (!r.enabled || r.function != RelayFunction::ZONE_VALVE) continue;
+      if (!first) json += ",";
+      first = false;
+      json += "{\"kind\":\"relay\",\"index\":" + String(i) + ",\"label\":\"" + relayHardwareLabel(i) + "\",\"usedBy\":" + String(valveRelayUsedBy(ctx, i, -1)) + "}";
+    }
+
+    for (uint8_t i = 0; i < PWM_OUTPUT_COUNT; i++) {
+      const PwmOutputConfig& po = ctx.config.pwmOutputs[i];
+      if (!po.enabled || po.mode != PwmOutputMode::SWITCH || po.function != RelayFunction::ZONE_VALVE) continue;
+      if (!first) json += ",";
+      first = false;
+      json += "{\"kind\":\"pwm\",\"index\":" + String(i) + ",\"label\":\"" + pwmOutputHardwareLabel(i) + "\",\"usedBy\":" + String(valveOutputUsedBy(ctx, OutputKind::PWM_OUTPUT, i, -1)) + "}";
+    }
+
+    json += "]";
+  }
+
+  void handleValvesJson() {
+    if (!s_ctx) {
+      server.send(500, "application/json", "{\"error\":\"no_context\"}");
+      return;
+    }
+
+    String json = "{";
+    json += "\"valves\":[";
+    for (uint8_t i = 0; i < MAX_VALVES; i++) {
+      if (i > 0) json += ",";
+      const ValveConfig& v = s_ctx->config.valves[i];
+      json += "{";
+      json += "\"index\":" + String(i) + ",";
+      json += "\"name\":\"Ventil " + String(i + 1) + "\",";
+      json += "\"enabled\":" + String(v.enabled ? "true" : "false") + ",";
+      json += "\"outputKind\":\"" + outputRefKindToKey(v.output.kind) + "\",";
+      json += "\"outputIndex\":" + String(v.output.index) + ",";
+      json += "\"outputLabel\":\"" + valveOutputLabel(v.output) + "\",";
+      json += "\"travelTimeMs\":" + String(v.travelTimeMs) + ",";
+      json += "\"activeHighForB\":" + String(v.activeHighForB ? "true" : "false") + ",";
+      json += "\"safetyPosition\":\"" + String(Valves::positionToKey(v.safetyPosition)) + "\",";
+      json += "\"lastRequestedPosition\":\"" + String(Valves::positionToKey(v.lastRequestedPosition)) + "\",";
+      json += "\"current\":\"" + String(Valves::positionToKey(Valves::currentPosition(i))) + "\",";
+      json += "\"target\":\"" + String(Valves::positionToKey(Valves::targetPosition(i))) + "\",";
+      json += "\"moving\":" + String(Valves::isMoving(i) ? "true" : "false") + ",";
+      json += "\"moveRemainingMs\":" + String(Valves::moveRemainingMs(*s_ctx, i)) + ",";
+      json += "\"usedByPump\":" + String(pumpUsingValve(*s_ctx, i));
+      json += "}";
+    }
+
+    json += "],\"pumps\":[";
+    for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+      if (i > 0) json += ",";
+      const PumpConfig& p = s_ctx->config.pumps[i];
+      json += "{";
+      json += "\"index\":" + String(i) + ",";
+      json += "\"name\":\"Pumpe " + String(i + 1) + "\",";
+      json += "\"enabled\":" + String(p.enabled ? "true" : "false") + ",";
+      json += "\"sourceLabel\":\"" + String(p.sourceType == PumpSourceType::SENSOR_ROLE ? SensorRoles::toLabel(p.sourceSensorRole) : HeatSourceRoles::toLabel(p.sourceRole)) + "\",";
+      json += "\"valveIndex\":" + String(p.valveIndex) + ",";
+      json += "\"activeTargetIndex\":" + String(p.activeTargetIndex) + ",";
+      json += "\"targets\":[";
+      for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
+        if (t > 0) json += ",";
+        const PumpRouteTargetConfig& target = p.targets[t];
+        json += "{";
+        json += "\"index\":" + String(t) + ",";
+        json += "\"name\":\"Ziel " + String(t == 0 ? "A" : "B") + "\",";
+        json += "\"enabled\":" + String(target.enabled ? "true" : "false") + ",";
+        json += "\"sinkRole\":\"" + String(SensorRoles::toKey(target.sinkRole)) + "\",";
+        json += "\"sinkLabel\":\"" + String(SensorRoles::toLabel(target.sinkRole)) + "\",";
+        json += "\"targetDiffOverride\":" + String(target.targetDiffOverride, 2) + ",";
+        json += "\"hysteresisOverride\":" + String(target.hysteresisOverride, 2) + ",";
+        json += "\"minTempC\":" + String(target.minTempC, 2) + ",";
+        json += "\"maxTempC\":" + String(target.maxTempC, 2) + ",";
+        json += "\"active\":" + String(target.active ? "true" : "false") + ",";
+        json += "\"lastSinkC\":" + jsonFloat(target.lastSinkC, 2) + ",";
+        json += "\"lastDiffC\":" + jsonFloat(target.lastDiffC, 2);
+        json += "}";
+      }
+      json += "]}";
+    }
+
+    json += "],";
+    appendValveOutputOptions(json, *s_ctx);
+
+    json += ",\"sinkRoles\":[";
+    bool firstSink = true;
+    appendActiveDs18RoleOptions(json, *s_ctx, firstSink);
+    json += "]}";
+
+    server.send(200, "application/json", json);
+  }
+
+  void handleValveConfig() {
+    if (!serviceSessionValid()) {
+      server.send(403, "text/plain", "Nicht erlaubt");
+      return;
+    }
+    if (!s_ctx) {
+      server.send(500, "text/plain", "Kein Kontext");
+      return;
+    }
+    if (!server.hasArg("pumpIndex")) {
+      server.send(400, "text/plain", "pumpIndex fehlt");
+      return;
+    }
+
+    const int pumpIdx = server.arg("pumpIndex").toInt();
+    if (pumpIdx < 0 || pumpIdx >= MAX_PUMPS) {
+      server.send(400, "text/plain", "ungueltige Pumpe");
+      return;
+    }
+
+    ConfigData oldConfig = s_ctx->config;
+    PumpConfig& pump = s_ctx->config.pumps[pumpIdx];
+
+    uint8_t valveIndex = PIN_UNUSED;
+    if (server.hasArg("valveIndex")) valveIndex = (uint8_t)server.arg("valveIndex").toInt();
+
+    if (valveIndex == PIN_UNUSED) {
+      pump.valveIndex = PIN_UNUSED;
+    } else {
+      if (valveIndex >= MAX_VALVES) {
+        server.send(400, "text/plain", "ungueltiges Ventil");
+        return;
+      }
+
+      const int usedBy = pumpUsingValve(*s_ctx, valveIndex, pumpIdx);
+      if (usedBy >= 0) {
+        server.send(409, "text/plain", "Ventil wird bereits von Pumpe " + String(usedBy + 1) + " verwendet");
+        return;
+      }
+
+      ValveConfig& valve = s_ctx->config.valves[valveIndex];
+      valve.enabled = server.arg("enabled").toInt() != 0;
+      valve.output.kind = outputKindFromKey(server.arg("outputKind"));
+      valve.output.index = server.hasArg("outputIndex") ? (uint8_t)server.arg("outputIndex").toInt() : PIN_UNUSED;
+      valve.travelTimeMs = server.hasArg("travelTimeMs") ? (uint32_t)server.arg("travelTimeMs").toInt() : valve.travelTimeMs;
+      valve.activeHighForB = server.arg("activeHighForB").toInt() != 0;
+      valve.safetyPosition = Valves::positionFromKey(server.arg("safetyPosition"));
+
+      if (valve.enabled) {
+        if (!outputExistsAndMatchesFunction(*s_ctx, valve.output.kind, valve.output.index, RelayFunction::ZONE_VALVE, false)) {
+          s_ctx->config = oldConfig;
+          server.send(409, "text/plain", "Ventilausgang ist nicht als Zonenventil konfiguriert");
+          return;
+        }
+      }
+
+      pump.valveIndex = valve.enabled ? valveIndex : PIN_UNUSED;
+    }
+
+    for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
+      const String prefix = "target" + String(t) + "_";
+      if (server.hasArg(prefix + "enabled")) pump.targets[t].enabled = (server.arg(prefix + "enabled").toInt() != 0);
+      if (server.hasArg(prefix + "sinkRole")) pump.targets[t].sinkRole = SensorRoles::fromKey(server.arg(prefix + "sinkRole"));
+      if (server.hasArg(prefix + "targetDiffOverride")) pump.targets[t].targetDiffOverride = server.arg(prefix + "targetDiffOverride").toFloat();
+      if (server.hasArg(prefix + "hysteresisOverride")) pump.targets[t].hysteresisOverride = server.arg(prefix + "hysteresisOverride").toFloat();
+      if (server.hasArg(prefix + "minTempC")) pump.targets[t].minTempC = server.arg(prefix + "minTempC").toFloat();
+      if (server.hasArg(prefix + "maxTempC")) pump.targets[t].maxTempC = server.arg(prefix + "maxTempC").toFloat();
+    }
+
+    String validationError;
+    if (!OutputValidation::validateAll(*s_ctx, validationError)) {
+      s_ctx->config = oldConfig;
+      server.send(409, "text/plain", validationError);
+      return;
+    }
+
+    Storage::saveConfig(s_ctx->config);
+    server.send(200, "text/plain", "OK");
+  }
+
   void handleTestOverviewJson() {
     if (!s_ctx) {
       server.send(500, "application/json", "{\"error\":\"no_context\"}");
@@ -1729,13 +1989,32 @@ server.send(200, "text/plain", "OK");
       json += "\"state\":" + String(RelayOutputs::get(*s_ctx, i) ? "true" : "false");
       json += "}";
     }
+
     json += "],\"pcaChannels\":[";
     for (uint8_t ch = 0; ch < PWM_OUTPUT_COUNT; ch++) {
       if (ch > 0) json += ",";
       const PwmOutputConfig& out = s_ctx->config.pwmOutputs[ch];
-      json += "{\"index\":" + String(ch) + ",\"label\":\"" + pwmOutputHardwareLabel(ch) + "\",\"mode\":\"" + pwmOutputModeToKey(out.mode) + "\",\"function\":\"" + String(RelayOutputs::functionToKey(out.function)) + "\",\"percent\":" + String(PwmDriver::getDuty(ch)) + "}";
+      json += "{";
+      json += "\"index\":" + String(ch) + ",";
+      json += "\"label\":\"" + pwmOutputHardwareLabel(ch) + "\",";
+      json += "\"mode\":\"" + pwmOutputModeToKey(out.mode) + "\",";
+      json += "\"modeLabel\":\"" + pwmOutputModeLabel(out.mode) + "\",";
+      json += "\"function\":\"" + String(RelayOutputs::functionToKey(out.function)) + "\",";
+      json += "\"profile\":\"" + pwmProfileToKey(out.profile) + "\",";
+      json += "\"enabled\":" + String(out.enabled ? "true" : "false") + ",";
+      json += "\"percent\":" + String(PwmDriver::getDuty(ch));
+      json += "}";
     }
-    json += "],\"pumps\":[";
+
+    json += "],\"servo\":{";
+    json += "\"available\":true,";
+    json += "\"label\":\"Ofenklappen-Servo\",";
+    json += "\"pin\":" + String(OVEN_SERVO_PIN) + ",";
+    json += "\"initialized\":" + String(ServoDriver::initialized() ? "true" : "false") + ",";
+    json += "\"angle\":" + String(ServoDriver::angle());
+    json += "}";
+
+    json += ",\"pumps\":[";
     for (uint8_t i = 0; i < MAX_PUMPS; i++) {
       if (i > 0) json += ",";
       const PumpConfig& pump = s_ctx->config.pumps[i];
@@ -1744,15 +2023,119 @@ server.send(200, "text/plain", "OK");
       json += "\"label\":\"Pumpe " + String(i + 1) + "\",";
       json += "\"enabled\":" + String(pump.enabled ? "true" : "false") + ",";
       json += "\"mode\":\"" + pumpModeToKey(pump.mode) + "\",";
+      json += "\"sourceType\":\"" + String(pump.sourceType == PumpSourceType::SENSOR_ROLE ? "sensor" : "heat_source") + "\",";
+      json += "\"sourceLabel\":\"" + String(pump.sourceType == PumpSourceType::SENSOR_ROLE ? SensorRoles::toLabel(pump.sourceSensorRole) : HeatSourceRoles::toLabel(pump.sourceRole)) + "\",";
+      json += "\"sinkLabel\":\"" + String(pump.sinkRole == Ds18Role::NONE ? "Priorisierter Sink" : SensorRoles::toLabel(pump.sinkRole)) + "\",";
       json += "\"relayIndex\":" + String(pump.relayIndex) + ",";
       json += "\"pwmChannel\":" + String(pump.pwmChannel) + ",";
       json += "\"feedbackPin\":" + String(pump.feedbackPin) + ",";
+      json += "\"state\":" + String(pump.state ? "true" : "false") + ",";
+      json += "\"lastSourceC\":" + jsonFloat(pump.lastSourceC, 1) + ",";
+      json += "\"lastSinkC\":" + jsonFloat(pump.lastSinkC, 1) + ",";
+      json += "\"lastDiffC\":" + jsonFloat(pump.lastDiffC, 1) + ",";
+      json += "\"lastPwmPercent\":" + jsonFloat(pump.lastPwmPercent, 0) + ",";
       json += "\"feedbackSignalPresent\":" + String(pump.feedbackSignalPresent ? "true" : "false") + ",";
       json += "\"feedbackError\":" + String(pump.feedbackError ? "true" : "false") + ",";
       json += "\"feedbackDutyPercent\":" + jsonFloat(pump.feedbackDutyPercent, 1);
       json += "}";
     }
+
+    json += "],\"valves\":[";
+    for (uint8_t i = 0; i < MAX_VALVES; i++) {
+      if (i > 0) json += ",";
+      const ValveConfig& valve = s_ctx->config.valves[i];
+      json += "{";
+      json += "\"index\":" + String(i) + ",";
+      json += "\"label\":\"Ventil " + String(i + 1) + "\",";
+      json += "\"enabled\":" + String(valve.enabled ? "true" : "false") + ",";
+      json += "\"outputKind\":\"" + testOutputRefKind(valve.output) + "\",";
+      json += "\"outputIndex\":" + String(valve.output.index) + ",";
+      json += "\"outputLabel\":\"" + testOutputRefLabel(valve.output) + "\",";
+      json += "\"travelTimeMs\":" + String(valve.travelTimeMs) + ",";
+      json += "\"current\":\"" + valvePositionToKey(Valves::currentPosition(i)) + "\",";
+      json += "\"target\":\"" + valvePositionToKey(Valves::targetPosition(i)) + "\",";
+      json += "\"moving\":" + String(Valves::isMoving(i) ? "true" : "false") + ",";
+      json += "\"safetyPosition\":\"" + valvePositionToKey(valve.safetyPosition) + "\"";
+      json += "}";
+    }
+
+    json += "],\"heatingCircuits\":[";
+    for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+      if (i > 0) json += ",";
+      const HeatingCircuitConfig& cfg = s_ctx->config.heatingCircuits[i];
+      const HeatingCircuitRuntime& rt = s_ctx->heatingCircuitRuntime[i];
+      json += "{";
+      json += "\"index\":" + String(i) + ",";
+      json += "\"label\":\"HK" + String(i + 1) + "\",";
+      json += "\"enabled\":" + String(cfg.enabled ? "true" : "false") + ",";
+      json += "\"mixerOpenLabel\":\"" + testOutputRefLabel(cfg.mixerOpenOutput) + "\",";
+      json += "\"mixerCloseLabel\":\"" + testOutputRefLabel(cfg.mixerCloseOutput) + "\",";
+      json += "\"pumpLabel\":\"" + testOutputRefLabel(cfg.pumpOutput) + "\",";
+      json += "\"pumpMode\":" + String((int)cfg.pumpMode) + ",";
+      json += "\"active\":" + String(rt.active ? "true" : "false") + ",";
+      json += "\"pumpActive\":" + String(rt.pumpActive ? "true" : "false") + ",";
+      json += "\"opening\":" + String(rt.opening ? "true" : "false") + ",";
+      json += "\"closing\":" + String(rt.closing ? "true" : "false") + ",";
+      json += "\"flowTemperatureC\":" + jsonFloat(rt.flowTemperatureC, 1) + ",";
+      json += "\"returnTemperatureC\":" + jsonFloat(rt.returnTemperatureC, 1) + ",";
+      json += "\"roomTemperatureC\":" + jsonFloat(rt.roomTemperatureC, 1) + ",";
+      json += "\"outsideTemperatureC\":" + jsonFloat(rt.outsideTemperatureC, 1) + ",";
+      json += "\"targetFlowTemperatureC\":" + jsonFloat(rt.targetFlowTemperatureC, 1) + ",";
+      json += "\"mixerPosition\":" + String(rt.estimatedMixerPositionPercent);
+      json += "}";
+    }
+
+    json += "],\"sensors\":{\"ds18b20\":[";
+    for (uint8_t i = 0; i < s_ctx->ds18b20.count; i++) {
+      if (i > 0) json += ",";
+      const Ds18b20DeviceInfo& d = s_ctx->ds18b20.devices[i];
+      json += "{";
+      json += "\"index\":" + String(i) + ",";
+      json += "\"address\":\"" + String(d.addressText) + "\",";
+      json += "\"role\":\"" + String(SensorRoles::toLabel(d.role)) + "\",";
+      json += "\"temperatureC\":" + jsonFloat(d.lastTempC, 1) + ",";
+      json += "\"valid\":" + String(d.lastValid ? "true" : "false");
+      json += "}";
+    }
+    json += "],\"max\":[";
+    for (uint8_t i = 0; i < 3; i++) {
+      if (i > 0) json += ",";
+      const MaxChannelReading& r = s_ctx->maxReadings[i];
+      json += "{";
+      json += "\"index\":" + String(i) + ",";
+      json += "\"present\":" + String(r.present ? "true" : "false") + ",";
+      json += "\"valid\":" + String(r.valid ? "true" : "false") + ",";
+      json += "\"temperatureC\":" + jsonFloat(r.tempC, 1) + ",";
+      json += "\"resistanceOhm\":" + jsonFloat(r.resistanceOhm, 1) + ",";
+      json += "\"fault\":" + String(r.fault);
+      json += "}";
+    }
     json += "]}";
+
+    json += ",";
+    appendTestSafetyJson(json);
+
+    json += ",\"diagnostics\":{";
+    json += "\"faultActive\":" + String(s_ctx->diag.faultActive ? "true" : "false") + ",";
+    json += "\"faultText\":\"" + String(s_ctx->diag.faultText) + "\",";
+    json += "\"bootCount\":" + String(s_ctx->diag.bootCount) + ",";
+    json += "\"sensorErrorCount\":" + String(s_ctx->diag.sensorErrorCount) + ",";
+    json += "\"sdErrorCount\":" + String(s_ctx->diag.sdErrorCount) + ",";
+    json += "\"faultCount\":" + String(s_ctx->diag.faultCount) + ",";
+    json += "\"maxErrorCount\":" + String(s_ctx->diag.maxErrorCount) + ",";
+    json += "\"sdAvailable\":" + String(s_ctx->sdAvailable ? "true" : "false") + ",";
+    json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+    json += "\"uptimeMs\":" + String(millis());
+    json += "}";
+
+    String validationError;
+    const bool outputValid = OutputValidation::validateAll(*s_ctx, validationError);
+    json += ",\"outputValidation\":{";
+    json += "\"ok\":" + String(outputValid ? "true" : "false") + ",";
+    json += "\"message\":\"" + validationError + "\"";
+    json += "}";
+
+    json += "}";
     server.send(200, "application/json", json);
   }
 
@@ -1813,6 +2196,105 @@ server.send(200, "text/plain", "OK");
     server.send(200, "text/plain", "OK");
   }
 
+  void handleTestServo() {
+    if (!commissioningTestAuthorized()) {
+      server.send(403, "text/plain", "Testmodus nicht aktiv oder Inbetriebnahme-PIN falsch");
+      return;
+    }
+
+    if (!server.hasArg("angle")) {
+      server.send(400, "text/plain", "angle fehlt");
+      return;
+    }
+
+    int angle = server.arg("angle").toInt();
+    if (angle < 0) angle = 0;
+    if (angle > 180) angle = 180;
+
+    const uint8_t actual = ServoDriver::setAngle((uint8_t)angle);
+
+    Serial.print("SERVO TEST GPIO");
+    Serial.print(OVEN_SERVO_PIN);
+    Serial.print(" -> ");
+    Serial.print(actual);
+    Serial.println(" Grad");
+    Serial.flush();
+
+    server.send(200, "text/plain", "OK");
+  }
+
+
+  void handleTestValvePosition() {
+    if (!commissioningTestAuthorized()) {
+      server.send(403, "text/plain", "Testmodus nicht aktiv oder Inbetriebnahme-PIN falsch");
+      return;
+    }
+    if (!server.hasArg("index") || !server.hasArg("position")) {
+      server.send(400, "text/plain", "index/position fehlt");
+      return;
+    }
+
+    int idx = server.arg("index").toInt();
+    if (idx < 0 || idx >= MAX_VALVES) {
+      server.send(400, "text/plain", "ungueltiges Ventil");
+      return;
+    }
+
+    ValvePosition pos = (server.arg("position") == "B") ? ValvePosition::B : ValvePosition::A;
+    if (!Valves::requestPosition(*s_ctx, (uint8_t)idx, pos)) {
+      const ValveConfig& valve = s_ctx->config.valves[idx];
+      if (!valve.enabled) server.send(400, "text/plain", "Ventil ist nicht aktiviert");
+      else if (valve.output.kind == OutputKind::NONE || valve.output.index == PIN_UNUSED) server.send(400, "text/plain", "Ventil hat keinen Ausgang");
+      else server.send(400, "text/plain", "Ventil konnte nicht gefahren werden");
+      return;
+    }
+
+    server.send(200, "text/plain", "OK");
+  }
+
+  void handleTestHeatingCircuitOutput() {
+    if (!commissioningTestAuthorized()) {
+      server.send(403, "text/plain", "Testmodus nicht aktiv oder Inbetriebnahme-PIN falsch");
+      return;
+    }
+    if (!server.hasArg("index") || !server.hasArg("output") || !server.hasArg("state")) {
+      server.send(400, "text/plain", "index/output/state fehlt");
+      return;
+    }
+
+    int idx = server.arg("index").toInt();
+    if (idx < 0 || idx >= MAX_HEATING_CIRCUITS) {
+      server.send(400, "text/plain", "ungueltiger Heizkreis");
+      return;
+    }
+
+    const HeatingCircuitConfig& cfg = s_ctx->config.heatingCircuits[idx];
+    const String output = server.arg("output");
+    const bool on = server.arg("state").toInt() != 0;
+    uint8_t percent = 100;
+    if (server.hasArg("percent")) {
+      int p = server.arg("percent").toInt();
+      if (p < 0) p = 0;
+      if (p > 100) p = 100;
+      percent = (uint8_t)p;
+    }
+
+    if (output == "open") {
+      testSetOutputRef(*s_ctx, cfg.mixerCloseOutput, false, 0);
+      testSetOutputRef(*s_ctx, cfg.mixerOpenOutput, on, percent);
+    } else if (output == "close") {
+      testSetOutputRef(*s_ctx, cfg.mixerOpenOutput, false, 0);
+      testSetOutputRef(*s_ctx, cfg.mixerCloseOutput, on, percent);
+    } else if (output == "pump") {
+      testSetOutputRef(*s_ctx, cfg.pumpOutput, on, percent);
+    } else {
+      server.send(400, "text/plain", "ungueltiger Ausgang");
+      return;
+    }
+
+    server.send(200, "text/plain", "OK");
+  }
+
   void handleTestAllOff() {
     if (!commissioningTestAuthorized()) {
       server.send(403, "text/plain", "Testmodus nicht aktiv oder Inbetriebnahme-PIN falsch");
@@ -1820,6 +2302,9 @@ server.send(200, "text/plain", "OK");
     }
     RelayOutputs::allOff(*s_ctx);
     PwmDriver::allOff();
+    ServoDriver::close();
+    Valves::allOff(*s_ctx);
+    HeatingCircuits::allOff(*s_ctx);
     server.send(200, "text/plain", "OK");
   }
 
@@ -2027,8 +2512,12 @@ namespace {
   }
 
   OutputKind outputKindFromKey(const String& key) {
-    if (key == "relay") return OutputKind::RELAY;
-    if (key == "pwm") return OutputKind::PWM_OUTPUT;
+    String k = key;
+    k.trim();
+    k.toLowerCase();
+
+    if (k == "relay" || k == "r" || k == "relais") return OutputKind::RELAY;
+    if (k == "pwm" || k == "po" || k == "pwm_output") return OutputKind::PWM_OUTPUT;
     return OutputKind::NONE;
   }
 
@@ -2351,7 +2840,6 @@ void begin(AppContext& ctx) {
   server.on("/api/ds18b20", handleDs18b20Json);
   server.on("/api/roles", handleRolesJson);
   server.on("/api/assignments", HTTP_GET, handleAssignmentsJson);
-
   server.on("/service-assign-role", HTTP_POST, handleAssignRole);
   server.on("/api/plant", HTTP_GET, handlePlantJson);
   server.on("/api/heat-sources", HTTP_GET, handleHeatSourcesJson);
@@ -2360,6 +2848,8 @@ void begin(AppContext& ctx) {
   server.on("/service-relay-config", HTTP_POST, handleRelayConfig);
   server.on("/api/pumps", HTTP_GET, handlePumpsJson);
   server.on("/service-pump-config", HTTP_POST, handlePumpConfig);
+  server.on("/api/valves", HTTP_GET, handleValvesJson);
+  server.on("/service-valve-config", HTTP_POST, handleValveConfig);
   server.on("/api/oven", HTTP_GET, handleOvenJson);
   server.on("/service-save-oven", HTTP_POST, handleOvenSave);
   server.on("/service-oven-start", HTTP_POST, handleOvenStart);
@@ -2369,6 +2859,9 @@ void begin(AppContext& ctx) {
   server.on("/service-testmode", HTTP_POST, handleTestModeSet);
   server.on("/service-test-relay-raw", HTTP_POST, handleTestRelayRaw);
   server.on("/service-test-pca-pwm", HTTP_POST, handleTestPcaPwm);
+  server.on("/service-test-servo", HTTP_POST, handleTestServo);
+  server.on("/service-test-valve", HTTP_POST, handleTestValvePosition);
+  server.on("/service-test-heating-circuit-output", HTTP_POST, handleTestHeatingCircuitOutput);
   server.on("/service-test-all-off", HTTP_POST, handleTestAllOff);
   server.on("/service-assign-heat-source", HTTP_POST, handleAssignHeatSource);
   server.on("/service-save-max-config", HTTP_POST, handleSaveMaxConfig);

@@ -3,6 +3,7 @@
 #include "config.h"
 #include "feature_relay_outputs.h"
 #include "feature_safety_manager.h"
+#include "feature_servo_driver.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -30,17 +31,6 @@ float g_lastError = 0.0f;
 uint32_t g_lastPidMs = 0;
 
 static constexpr uint32_t OVEN_PID_INTERVAL_MS = 1000;
-static constexpr uint32_t SERVO_PWM_FREQUENCY_HZ = 50;
-static constexpr uint8_t SERVO_PWM_RESOLUTION_BITS = 16;
-static constexpr uint32_t SERVO_PWM_MAX_DUTY = (1UL << SERVO_PWM_RESOLUTION_BITS) - 1UL;
-
-uint32_t servoPulseUsToDuty(uint16_t pulseUs) {
-  return (uint32_t)((uint64_t)pulseUs * SERVO_PWM_MAX_DUTY / 20000ULL);
-}
-
-uint16_t angleToPulseUs(uint8_t angle) {
-  return (uint16_t)(500 + ((uint32_t)angle * 2000UL / 180UL));
-}
 
 float clampFloat(float value, float minimum, float maximum) {
   if (value < minimum) return minimum;
@@ -55,10 +45,7 @@ uint8_t clampAngle(float value) {
 }
 
 void writeServoAngle(uint8_t angle) {
-  g_servoAngle = angle;
-  const uint16_t pulseUs = angleToPulseUs(angle);
-  const uint32_t duty = servoPulseUsToDuty(pulseUs);
-  ledcWrite(OVEN_SERVO_PIN, duty);
+  g_servoAngle = ServoDriver::setAngle(angle);
 }
 
 void closeAirFlap() {
@@ -235,7 +222,7 @@ namespace OvenControl {
 void begin(AppContext& ctx) {
   (void)ctx;
 
-  ledcAttach(OVEN_SERVO_PIN, SERVO_PWM_FREQUENCY_HZ, SERVO_PWM_RESOLUTION_BITS);
+  ServoDriver::begin();
   closeAirFlap();
   resetPid();
 
@@ -274,7 +261,7 @@ bool pumpActive() {
 }
 
 uint8_t servoAngle() {
-  return g_servoAngle;
+  return ServoDriver::angle();
 }
 
 float ovenTemperatureC() {

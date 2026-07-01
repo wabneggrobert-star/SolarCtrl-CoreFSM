@@ -394,6 +394,10 @@ struct PumpConfig {
   PwmProfile pwmProfile = PwmProfile::SOLAR;
   uint8_t feedbackPin = PIN_UNUSED;
 
+  // Valve V2: optionales Umschaltventil aus ConfigData.valves[].
+  // PIN_UNUSED = kein Ventil. Die Ventil-Hardware wird nur noch in ValveConfig.output definiert.
+  uint8_t valveIndex = PIN_UNUSED;
+
   // Optionales 2-Ziel-Umschaltventil.
   // Wenn deaktiviert, verwendet die Pumpe sinkRole wie bisher.
   // Wenn aktiviert, werden targets[0] und targets[1] als Ziel A/B verwendet.
@@ -415,6 +419,7 @@ struct PumpConfig {
 
   PumpRouteTargetConfig targets[PUMP_ROUTE_TARGET_COUNT];
   uint8_t activeTargetIndex = PIN_UNUSED;
+  uint8_t valvePendingTargetIndex = PIN_UNUSED;
 
   // Begrenzung fuer Profil C / Solar-PWM
   float minPwmPercent = 10.0f;
@@ -445,6 +450,13 @@ struct EnergyRouteReservation {
   Ds18Role sinkRole = Ds18Role::NONE;
 
   uint8_t pumpRelayIndex = PIN_UNUSED;
+
+  // Valve V2: echtes Ventil-Output-Target. Kann RELAY oder PWM_OUTPUT sein.
+  // Als Rohwerte gespeichert, weil OutputRef erst im Heizkreis-/Ventil-Block definiert wird.
+  uint8_t valveOutputKind = 0;
+  uint8_t valveOutputIndex = PIN_UNUSED;
+
+  // Legacy-/Diagnosefeld fuer bestehende Anzeigen/Logs bei Relaisventilen.
   uint8_t valveRelayIndex = PIN_UNUSED;
 };
 //==========Heizstab/Elektrokessel========

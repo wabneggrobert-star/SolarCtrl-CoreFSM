@@ -13,7 +13,7 @@ namespace EnergyConflicts {
     HeatSourceRole sourceRole,
     Ds18Role sinkRole,
     uint8_t pumpRelayIndex,
-    uint8_t valveRelayIndex
+    const OutputRef& valveOutput
   );
 
   void reserveRoute(
@@ -22,7 +22,7 @@ namespace EnergyConflicts {
     HeatSourceRole sourceRole,
     Ds18Role sinkRole,
     uint8_t pumpRelayIndex,
-    uint8_t valveRelayIndex
+    const OutputRef& valveOutput
   );
 
 }

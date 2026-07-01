@@ -30,6 +30,24 @@ bool validIndexForKind(OutputKind kind, uint8_t index) {
   return false;
 }
 
+bool outputSupportsFunction(const ConfigData& cfg, const OutputRef& ref, RelayFunction requiredFunction) {
+  if (ref.kind == OutputKind::NONE || ref.index == PIN_UNUSED) return false;
+
+  if (ref.kind == OutputKind::RELAY) {
+    if (ref.index >= RELAY_COUNT) return false;
+    const RelayOutputConfig& out = cfg.relays[ref.index];
+    return out.enabled && out.function == requiredFunction;
+  }
+
+  if (ref.kind == OutputKind::PWM_OUTPUT) {
+    if (ref.index >= PWM_OUTPUT_COUNT) return false;
+    const PwmOutputConfig& out = cfg.pwmOutputs[ref.index];
+    return out.enabled && out.mode == PwmOutputMode::SWITCH && out.function == requiredFunction;
+  }
+
+  return false;
+}
+
 bool addOutput(
     OutputSlot relaySlots[RELAY_COUNT],
     OutputSlot pwmSlots[PWM_OUTPUT_COUNT],
@@ -38,8 +56,15 @@ bool addOutput(
     const String& owner,
     String& error
 ) {
-  if (!validIndexForKind(kind, index)) {
+  if (kind == OutputKind::NONE || index == PIN_UNUSED) {
     return true;
+  }
+
+  if (!validIndexForKind(kind, index)) {
+    error = owner;
+    error += ": ungueltiger Ausgang ";
+    error += outputLabel(kind, index);
+    return false;
   }
 
   OutputSlot* slot = nullptr;
@@ -188,14 +213,11 @@ bool validateConfig(const ConfigData& cfg, String& error) {
       }
     }
 
-    if (pump.switchValveEnabled && pump.switchValveRelayIndex != PIN_UNUSED) {
-      if (!addOutput(
-              relaySlots,
-              pwmSlots,
-              OutputKind::RELAY,
-              pump.switchValveRelayIndex,
-              "Pumpe " + String(i + 1) + " Umschaltventil",
-              error)) {
+    if (pump.valveIndex != PIN_UNUSED) {
+      if (pump.valveIndex >= MAX_VALVES || !cfg.valves[pump.valveIndex].enabled) {
+        error = "Pumpe ";
+        error += String(i + 1);
+        error += ": Ventilzuordnung ungueltig oder Ventil nicht aktiviert";
         return false;
       }
     }
@@ -233,23 +255,25 @@ bool validateConfig(const ConfigData& cfg, String& error) {
     if (!addOutputRef(relaySlots, pwmSlots, hk.pumpOutput, "HK" + String(i + 1) + " Pumpe", error)) return false;
   }
 
-  // Ventile: aktivieren, sobald ConfigData.valves[] produktiv verwendet wird.
-  /*
+  // Valve V2
   for (uint8_t i = 0; i < MAX_VALVES; i++) {
     const ValveConfig& valve = cfg.valves[i];
-
     if (!valve.enabled) continue;
-
-    if (!addOutputRef(
-            relaySlots,
-            pwmSlots,
-            valve.output,
-            "Ventil " + String(i + 1),
-            error)) {
+    if (!outputRefAssigned(valve.output)) {
+      error = "Ventil ";
+      error += String(i + 1);
+      error += ": Ausgang fehlt";
       return false;
     }
+    if (!outputSupportsFunction(cfg, valve.output, RelayFunction::ZONE_VALVE)) {
+      error = "Ventil ";
+      error += String(i + 1);
+      error += ": Ausgang muss als Zonenventil konfiguriert sein";
+      return false;
+    }
+
+    if (!addOutputRef(relaySlots, pwmSlots, valve.output, "Ventil " + String(i + 1), error)) return false;
   }
-  */
 
   return true;
 }

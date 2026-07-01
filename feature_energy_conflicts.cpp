@@ -8,12 +8,44 @@ namespace {
     return pumpIndex < MAX_PUMPS;
   }
 
+  bool outputRefAssigned(const OutputRef& ref) {
+    return ref.kind != OutputKind::NONE && ref.index != PIN_UNUSED;
+  }
+
+  bool sameOutputRef(const OutputRef& a, const OutputRef& b) {
+    return outputRefAssigned(a) &&
+           outputRefAssigned(b) &&
+           a.kind == b.kind &&
+           a.index == b.index;
+  }
+
+  String outputRefLabel(const OutputRef& ref) {
+    if (!outputRefAssigned(ref)) return "kein Ventilausgang";
+    if (ref.kind == OutputKind::RELAY) return "R" + String(ref.index);
+    if (ref.kind == OutputKind::PWM_OUTPUT) return "PO-" + String(ref.index);
+    return "unbekannter Ausgang";
+  }
+
+  uint8_t legacyRelayIndex(const OutputRef& ref) {
+    if (ref.kind == OutputKind::RELAY) return ref.index;
+    return PIN_UNUSED;
+  }
+
+  OutputRef reservationValveOutput(const EnergyRouteReservation& r) {
+    OutputRef ref;
+    ref.kind = (OutputKind)r.valveOutputKind;
+    ref.index = r.valveOutputIndex;
+    return ref;
+  }
+
   void resetReservation(EnergyRouteReservation& r) {
     r.active = false;
     r.pumpIndex = PIN_UNUSED;
     r.sourceRole = HeatSourceRole::NONE;
     r.sinkRole = Ds18Role::NONE;
     r.pumpRelayIndex = PIN_UNUSED;
+    r.valveOutputKind = (uint8_t)OutputKind::NONE;
+    r.valveOutputIndex = PIN_UNUSED;
     r.valveRelayIndex = PIN_UNUSED;
   }
 
@@ -32,8 +64,8 @@ namespace {
     Serial.print((int)existing.sinkRole);
     Serial.print(" | PumpRelais=");
     Serial.print(existing.pumpRelayIndex);
-    Serial.print(" | VentilRelais=");
-    Serial.println(existing.valveRelayIndex);
+    Serial.print(" | VentilAusgang=");
+    Serial.println(outputRefLabel(reservationValveOutput(existing)));
     Serial.flush();
   }
 
@@ -57,7 +89,7 @@ bool canActivateRoute(
   HeatSourceRole sourceRole,
   Ds18Role sinkRole,
   uint8_t pumpRelayIndex,
-  uint8_t valveRelayIndex
+  const OutputRef& valveOutput
 ) {
   if (!validPumpIndex(pumpIndex)) return false;
   if (sinkRole == Ds18Role::NONE) return false;
@@ -80,11 +112,10 @@ bool canActivateRoute(
       return false;
     }
 
-    // Ein Umschalt-/Zonenventil darf nicht von zwei aktiven Routen gleichzeitig angefordert werden.
-    if (valveRelayIndex != PIN_UNUSED &&
-        r.valveRelayIndex != PIN_UNUSED &&
-        r.valveRelayIndex == valveRelayIndex) {
-      printConflict("Ventilrelais bereits belegt", pumpIndex, r);
+    // Valve V2: Ein Ventilausgang darf nicht von zwei aktiven Routen gleichzeitig angefordert werden.
+    // Das gilt fuer Relaisausgaenge R0-R7 und PWM-Schaltausgaenge PO-0 bis PO-7.
+    if (sameOutputRef(reservationValveOutput(r), valveOutput)) {
+      printConflict("Ventilausgang bereits belegt", pumpIndex, r);
       return false;
     }
   }
@@ -99,7 +130,7 @@ void reserveRoute(
   HeatSourceRole sourceRole,
   Ds18Role sinkRole,
   uint8_t pumpRelayIndex,
-  uint8_t valveRelayIndex
+  const OutputRef& valveOutput
 ) {
   if (!validPumpIndex(pumpIndex)) return;
 
@@ -109,7 +140,9 @@ void reserveRoute(
   r.sourceRole = sourceRole;
   r.sinkRole = sinkRole;
   r.pumpRelayIndex = pumpRelayIndex;
-  r.valveRelayIndex = valveRelayIndex;
+  r.valveOutputKind = (uint8_t)valveOutput.kind;
+  r.valveOutputIndex = valveOutput.index;
+  r.valveRelayIndex = legacyRelayIndex(valveOutput);
 
   Serial.print("ENERGIE ROUTE RESERVIERT: P");
   Serial.print(pumpIndex + 1);
@@ -119,8 +152,8 @@ void reserveRoute(
   Serial.print((int)sinkRole);
   Serial.print(" PumpRelais=");
   Serial.print(pumpRelayIndex);
-  Serial.print(" VentilRelais=");
-  Serial.println(valveRelayIndex);
+  Serial.print(" VentilAusgang=");
+  Serial.println(outputRefLabel(valveOutput));
   Serial.flush();
 }
 

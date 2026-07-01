@@ -16,12 +16,11 @@ namespace PumpRouting {
     float targetDiff = NAN;
     float hysteresis = NAN;
 
-    uint8_t valveRelayIndex = PIN_UNUSED;
-    bool valveState = false;
+    uint8_t valveIndex = PIN_UNUSED;
+    OutputRef valveOutput;
+    uint8_t valveRelayIndex = PIN_UNUSED; // Legacy-/Diagnosefeld fuer Relaisventile
     bool hasValve = false;
 
-    // true bedeutet: Ziel ist gewaehlt, Ventil faehrt aber noch.
-    // Pumpe muss in dieser Zeit AUS bleiben.
     bool valveMoving = false;
     uint32_t valveMoveRemainingMs = 0;
   };
@@ -29,17 +28,6 @@ namespace PumpRouting {
   void begin(AppContext& ctx);
   void closeAllTargets(AppContext& ctx, uint8_t pumpIndex);
 
-  RouteResult resolve(
-    AppContext& ctx,
-    uint8_t pumpIndex,
-    float sourceC,
-    bool sourceValid
-  );
-
-  RouteResult resolveHeatDumpCoolestTarget(
-    AppContext& ctx,
-    uint8_t pumpIndex,
-    float sourceC,
-    bool sourceValid
-  );
+  RouteResult resolve(AppContext& ctx, uint8_t pumpIndex, float sourceC, bool sourceValid);
+  RouteResult resolveHeatDumpCoolestTarget(AppContext& ctx, uint8_t pumpIndex, float sourceC, bool sourceValid);
 }

@@ -255,6 +255,7 @@ namespace {
       cfg.pumps[i].pwmChannel = (i < 5) ? PUMP_PWM_CHANNELS[i] : PIN_UNUSED;
       cfg.pumps[i].pwmProfile = PwmProfile::SOLAR;
       cfg.pumps[i].feedbackPin =(i < FEEDBACK_INPUT_COUNT) ? i : PIN_UNUSED;
+      cfg.pumps[i].valveIndex = PIN_UNUSED;
       cfg.pumps[i].minPwmPercent = 10.0f;
       cfg.pumps[i].maxPwmPercent = 100.0f;
       cfg.pumps[i].state = false;
@@ -270,6 +271,7 @@ namespace {
       cfg.pumps[i].switchValvePendingTargetIndex = PIN_UNUSED;
       cfg.pumps[i].switchValveStateForTargetA = false;
       cfg.pumps[i].activeTargetIndex = PIN_UNUSED;
+      cfg.pumps[i].valvePendingTargetIndex = PIN_UNUSED;
       for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
         cfg.pumps[i].targets[t].enabled = false;
         cfg.pumps[i].targets[t].sinkRole = Ds18Role::NONE;
@@ -281,6 +283,15 @@ namespace {
         cfg.pumps[i].targets[t].lastSinkC = NAN;
         cfg.pumps[i].targets[t].lastDiffC = NAN;
       }
+    }
+
+    for (uint8_t i = 0; i < MAX_VALVES; i++) {
+      cfg.valves[i].enabled = false;
+      cfg.valves[i].output = OutputRef{};
+      cfg.valves[i].travelTimeMs = 30000UL;
+      cfg.valves[i].activeHighForB = true;
+      cfg.valves[i].safetyPosition = ValvePosition::A;
+      cfg.valves[i].lastRequestedPosition = ValvePosition::A;
     }
 
     cfg.auxHeater.enabled = false;
@@ -575,6 +586,9 @@ bool loadConfig(ConfigData& cfg) {
     v = valueOf(text, prefix + "feedbackPin");
     if (v.length()) cfg.pumps[i].feedbackPin = (uint8_t)v.toInt();
 
+    v = valueOf(text, prefix + "valveIndex");
+    if (v.length()) cfg.pumps[i].valveIndex = (uint8_t)v.toInt();
+
     v = valueOf(text, prefix + "targetDiff");
     if (v.length()) cfg.pumps[i].targetDiff = v.toFloat();
 
@@ -611,6 +625,20 @@ bool loadConfig(ConfigData& cfg) {
     v = valueOf(text, prefix + "switchValveStateForTargetA");
     if (v.length()) cfg.pumps[i].switchValveStateForTargetA = (v.toInt() != 0);
 
+    // Valve V2 Migration: alte Pumpen-Ventilfelder einmalig in ValveConfig uebernehmen.
+    if (cfg.pumps[i].valveIndex == PIN_UNUSED &&
+        cfg.pumps[i].switchValveEnabled &&
+        cfg.pumps[i].switchValveRelayIndex != PIN_UNUSED &&
+        i < MAX_VALVES) {
+      cfg.pumps[i].valveIndex = i;
+      cfg.valves[i].enabled = true;
+      cfg.valves[i].output.kind = OutputKind::RELAY;
+      cfg.valves[i].output.index = cfg.pumps[i].switchValveRelayIndex;
+      cfg.valves[i].travelTimeMs = cfg.pumps[i].switchValveTravelTimeMs;
+      cfg.valves[i].activeHighForB = !cfg.pumps[i].switchValveStateForTargetA;
+      cfg.valves[i].safetyPosition = ValvePosition::A;
+    }
+
     for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
       const String tPrefix = prefix + "target" + String(t) + "_";
 
@@ -631,6 +659,32 @@ bool loadConfig(ConfigData& cfg) {
     }
   }
 
+
+
+  for (uint8_t i = 0; i < MAX_VALVES; i++) {
+    const String prefix = "valve" + String(i) + "_";
+
+    v = valueOf(text, prefix + "enabled");
+    if (v.length()) cfg.valves[i].enabled = (v.toInt() != 0);
+
+    v = valueOf(text, prefix + "outputKind");
+    if (v.length()) cfg.valves[i].output.kind = (OutputKind)v.toInt();
+
+    v = valueOf(text, prefix + "outputIndex");
+    if (v.length()) cfg.valves[i].output.index = (uint8_t)v.toInt();
+
+    v = valueOf(text, prefix + "travelTimeMs");
+    if (v.length()) cfg.valves[i].travelTimeMs = (uint32_t)v.toInt();
+
+    v = valueOf(text, prefix + "activeHighForB");
+    if (v.length()) cfg.valves[i].activeHighForB = (v.toInt() != 0);
+
+    v = valueOf(text, prefix + "safetyPosition");
+    if (v.length()) cfg.valves[i].safetyPosition = (v.toInt() == 1) ? ValvePosition::B : ValvePosition::A;
+
+    v = valueOf(text, prefix + "lastRequestedPosition");
+    if (v.length()) cfg.valves[i].lastRequestedPosition = (v.toInt() == 1) ? ValvePosition::B : ValvePosition::A;
+  }
 
   v = valueOf(text, "auxHeaterEnabled");
   if (v.length()) cfg.auxHeater.enabled = (v.toInt() != 0);
@@ -895,6 +949,7 @@ bool saveConfig(const ConfigData& cfg) {
     text += prefix + "pwmChannel=" + String(cfg.pumps[i].pwmChannel) + "\n";
     text += prefix + "pwmProfile=" + String(cfg.pumps[i].pwmProfile == PwmProfile::HEATING ? 1 : 0) + "\n";
     text += prefix + "feedbackPin=" + String(cfg.pumps[i].feedbackPin) + "\n";
+    text += prefix + "valveIndex=" + String(cfg.pumps[i].valveIndex) + "\n";
     text += prefix + "targetDiff=" + String(cfg.pumps[i].targetDiff, 2) + "\n";
     text += prefix + "hysteresis=" + String(cfg.pumps[i].hysteresis, 2) + "\n";
     text += prefix + "startDiff=" + String(cfg.pumps[i].startDiff, 2) + "\n";
@@ -919,6 +974,17 @@ bool saveConfig(const ConfigData& cfg) {
     }
   }
 
+  // Valve V2 Konfiguration
+  for (uint8_t i = 0; i < MAX_VALVES; i++) {
+    const String prefix = "valve" + String(i) + "_";
+    text += prefix + "enabled=" + String(cfg.valves[i].enabled ? 1 : 0) + "\n";
+    text += prefix + "outputKind=" + String((int)cfg.valves[i].output.kind) + "\n";
+    text += prefix + "outputIndex=" + String(cfg.valves[i].output.index) + "\n";
+    text += prefix + "travelTimeMs=" + String(cfg.valves[i].travelTimeMs) + "\n";
+    text += prefix + "activeHighForB=" + String(cfg.valves[i].activeHighForB ? 1 : 0) + "\n";
+    text += prefix + "safetyPosition=" + String(cfg.valves[i].safetyPosition == ValvePosition::B ? 1 : 0) + "\n";
+    text += prefix + "lastRequestedPosition=" + String(cfg.valves[i].lastRequestedPosition == ValvePosition::B ? 1 : 0) + "\n";
+  }
 
   text += "auxHeaterEnabled=" + String(cfg.auxHeater.enabled ? 1 : 0) + "\n";
   text += "auxHeaterMinimumTemperatureC=" + String(cfg.auxHeater.minimumTemperatureC, 2) + "\n";
