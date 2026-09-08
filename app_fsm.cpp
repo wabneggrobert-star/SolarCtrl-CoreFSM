@@ -175,21 +175,58 @@ void AppFSM::stateLoadConfig() {
 void AppFSM::stateInitNetwork() {
   Serial.println("INIT_NETWORK gestartet");
 
-  WiFi.mode(WIFI_AP);
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setSleep(false);
 
-  const char* ssid = ctx_.config.apName[0] ? ctx_.config.apName : DEFAULT_AP_SSID;
-  const char* pass = ctx_.config.apPassword[0] ? ctx_.config.apPassword : DEFAULT_AP_PASSWORD;
+  const char* apSsid = ctx_.config.apName[0] ? ctx_.config.apName : DEFAULT_AP_SSID;
+  const char* apPass = ctx_.config.apPassword[0] ? ctx_.config.apPassword : DEFAULT_AP_PASSWORD;
+  const char* hostName = ctx_.config.hostName[0] ? ctx_.config.hostName : "solarctrl";
+
+  WiFi.setHostname(hostName);
 
   Serial.print("Starte AP mit SSID: ");
-  Serial.println(ssid);
+  Serial.println(apSsid);
 
-  bool ok = WiFi.softAP(ssid, pass);
+  bool apOk = WiFi.softAP(apSsid, apPass);
 
   Serial.print("softAP Ergebnis: ");
-  Serial.println(ok ? "OK" : "FEHLER");
+  Serial.println(apOk ? "OK" : "FEHLER");
 
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
+
+  if (ctx_.config.staEnabled && ctx_.config.staSsid[0]) {
+    Serial.print("Verbinde mit WLAN SSID: ");
+    Serial.println(ctx_.config.staSsid);
+
+    if (ctx_.config.staPassword[0]) {
+      WiFi.begin(ctx_.config.staSsid, ctx_.config.staPassword);
+    } else {
+      WiFi.begin(ctx_.config.staSsid);
+    }
+
+    const uint32_t startedAt = millis();
+    while (WiFi.status() != WL_CONNECTED && (uint32_t)(millis() - startedAt) < 10000UL) {
+      delay(250);
+      Serial.print(".");
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.print("WLAN verbunden. STA IP: ");
+      Serial.println(WiFi.localIP());
+      Serial.print("Hostname: ");
+      Serial.println(hostName);
+      Serial.print("RSSI: ");
+      Serial.print(WiFi.RSSI());
+      Serial.println(" dBm");
+    } else {
+      Serial.println("WLAN-Verbindung fehlgeschlagen. SoftAP bleibt aktiv.");
+      WiFi.disconnect(false);
+    }
+  } else {
+    Serial.println("WLAN-Client deaktiviert oder keine SSID konfiguriert. Nur SoftAP aktiv.");
+  }
 
   changeState(SystemState::INIT_UI);
 }
@@ -469,6 +506,13 @@ void AppFSM::stateUpdateRuntime() {
 }
 
 void AppFSM::stateFault() {
+  if (UI::commissioningTestActive()) {
+    if ((uint32_t)(millis() - ctx_.stateEnteredAtMs) >= FAULT_RETRY_INTERVAL_MS) {
+      changeState(SystemState::READ_SENSORS);
+    }
+    return;
+  }
+
   forceAllPumpsOff(ctx_);
   RelayOutputs::allOff(ctx_);
   HeatingCircuits::allOff(ctx_);

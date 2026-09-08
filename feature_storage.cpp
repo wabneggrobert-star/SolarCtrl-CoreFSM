@@ -81,6 +81,47 @@ namespace {
     return String((double)v, (unsigned int)decimals);
   }
 
+  int findValveByOutput(const ConfigData& cfg, OutputKind kind, uint8_t index) {
+    if (index == PIN_UNUSED || kind == OutputKind::NONE) return -1;
+    for (uint8_t i = 0; i < MAX_VALVES; i++) {
+      const ValveConfig& v = cfg.valves[i];
+      if (v.enabled && v.output.kind == kind && v.output.index == index) return i;
+    }
+    return -1;
+  }
+
+  int findFreeValveSlot(const ConfigData& cfg, uint8_t preferred) {
+    if (preferred < MAX_VALVES) {
+      const ValveConfig& v = cfg.valves[preferred];
+      if (!v.enabled && v.output.index == PIN_UNUSED) return preferred;
+    }
+
+    for (uint8_t i = 0; i < MAX_VALVES; i++) {
+      const ValveConfig& v = cfg.valves[i];
+      if (!v.enabled && v.output.index == PIN_UNUSED) return i;
+    }
+    return -1;
+  }
+
+  void migrateLegacySwitchValve(ConfigData& cfg, uint8_t pumpIndex, bool enabled, uint8_t relayIndex, uint32_t travelTimeMs, bool stateForTargetA) {
+    if (!enabled || relayIndex == PIN_UNUSED || pumpIndex >= MAX_PUMPS) return;
+    if (cfg.pumps[pumpIndex].valveIndex != PIN_UNUSED) return;
+
+    int valveIndex = findValveByOutput(cfg, OutputKind::RELAY, relayIndex);
+    if (valveIndex < 0) valveIndex = findFreeValveSlot(cfg, pumpIndex);
+    if (valveIndex < 0 || valveIndex >= MAX_VALVES) return;
+
+    ValveConfig& valve = cfg.valves[valveIndex];
+    valve.enabled = true;
+    valve.output.kind = OutputKind::RELAY;
+    valve.output.index = relayIndex;
+    valve.travelTimeMs = travelTimeMs > 0 ? travelTimeMs : 15000UL;
+    valve.activeHighForB = !stateForTargetA;
+    valve.safetyPosition = ValvePosition::A;
+
+    cfg.pumps[pumpIndex].valveIndex = (uint8_t)valveIndex;
+  }
+
   RelayFunction relayFunctionFromInt(int v) {
     switch (v) {
       case 1: return RelayFunction::PUMP_ENABLE;
@@ -183,6 +224,10 @@ namespace {
 
     copyText(cfg.apName, sizeof(cfg.apName), DEFAULT_AP_SSID);
     copyText(cfg.apPassword, sizeof(cfg.apPassword), DEFAULT_AP_PASSWORD);
+    cfg.staEnabled = false;
+    cfg.staSsid[0] = '\0';
+    cfg.staPassword[0] = '\0';
+    copyText(cfg.hostName, sizeof(cfg.hostName), "solarctrl");
     copyText(cfg.servicePin, sizeof(cfg.servicePin), DEFAULT_SERVICE_PIN);
 
     cfg.solarFluidType = SolarFluidType::GLYCOL;
@@ -263,13 +308,6 @@ namespace {
       cfg.pumps[i].lastSinkC = NAN;
       cfg.pumps[i].lastDiffC = NAN;
       cfg.pumps[i].lastPwmPercent = 0.0f;
-      cfg.pumps[i].switchValveEnabled = false;
-      cfg.pumps[i].switchValveRelayIndex = PIN_UNUSED;
-      cfg.pumps[i].switchValveTravelTimeMs = 15000;
-      cfg.pumps[i].switchValveMoving = false;
-      cfg.pumps[i].switchValveMoveStartedMs = 0;
-      cfg.pumps[i].switchValvePendingTargetIndex = PIN_UNUSED;
-      cfg.pumps[i].switchValveStateForTargetA = false;
       cfg.pumps[i].activeTargetIndex = PIN_UNUSED;
       cfg.pumps[i].valvePendingTargetIndex = PIN_UNUSED;
       for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
@@ -422,6 +460,18 @@ bool loadConfig(ConfigData& cfg) {
   v = valueOf(text, "apPassword");
   if (v.length()) copyText(cfg.apPassword, sizeof(cfg.apPassword), v.c_str());
 
+  v = valueOf(text, "staEnabled");
+  if (v.length()) cfg.staEnabled = (v.toInt() != 0);
+
+  v = valueOf(text, "staSsid");
+  if (v.length()) copyText(cfg.staSsid, sizeof(cfg.staSsid), v.c_str());
+
+  v = valueOf(text, "staPassword");
+  if (v.length()) copyText(cfg.staPassword, sizeof(cfg.staPassword), v.c_str());
+
+  v = valueOf(text, "hostName");
+  if (v.length()) copyText(cfg.hostName, sizeof(cfg.hostName), v.c_str());
+
   v = valueOf(text, "servicePin");
   if (v.length()) copyText(cfg.servicePin, sizeof(cfg.servicePin), v.c_str());
 
@@ -552,6 +602,15 @@ bool loadConfig(ConfigData& cfg) {
     if (v.length()) cfg.pwmOutputs[i].profile = pwmProfileFromInt(v.toInt());
   }
 
+  bool legacySwitchValveEnabled[MAX_PUMPS] = {};
+  uint8_t legacySwitchValveRelayIndex[MAX_PUMPS];
+  uint32_t legacySwitchValveTravelTimeMs[MAX_PUMPS];
+  bool legacySwitchValveStateForTargetA[MAX_PUMPS] = {};
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    legacySwitchValveRelayIndex[i] = PIN_UNUSED;
+    legacySwitchValveTravelTimeMs[i] = 15000UL;
+  }
+
   // Pumpen-Konfiguration wird hier bereits vorbereitet, UI folgt im naechsten Schritt.
   for (uint8_t i = 0; i < MAX_PUMPS; i++) {
     const String prefix = "pump" + String(i) + "_";
@@ -613,31 +672,19 @@ bool loadConfig(ConfigData& cfg) {
     v = valueOf(text, prefix + "maxPwmPercent");
     if (v.length()) cfg.pumps[i].maxPwmPercent = v.toFloat();
 
+    // Legacy-Import fuer alte SD-Konfigurationen. Diese Werte werden nur
+    // zwischengespeichert und nach dem Laden von Valve V2 migriert.
     v = valueOf(text, prefix + "switchValveEnabled");
-    if (v.length()) cfg.pumps[i].switchValveEnabled = (v.toInt() != 0);
+    if (v.length()) legacySwitchValveEnabled[i] = (v.toInt() != 0);
 
     v = valueOf(text, prefix + "switchValveRelayIndex");
-    if (v.length()) cfg.pumps[i].switchValveRelayIndex = (uint8_t)v.toInt();
+    if (v.length()) legacySwitchValveRelayIndex[i] = (uint8_t)v.toInt();
 
     v = valueOf(text, prefix + "switchValveTravelTimeMs");
-    if (v.length()) cfg.pumps[i].switchValveTravelTimeMs = (uint32_t)v.toInt();
+    if (v.length()) legacySwitchValveTravelTimeMs[i] = (uint32_t)v.toInt();
 
     v = valueOf(text, prefix + "switchValveStateForTargetA");
-    if (v.length()) cfg.pumps[i].switchValveStateForTargetA = (v.toInt() != 0);
-
-    // Valve V2 Migration: alte Pumpen-Ventilfelder einmalig in ValveConfig uebernehmen.
-    if (cfg.pumps[i].valveIndex == PIN_UNUSED &&
-        cfg.pumps[i].switchValveEnabled &&
-        cfg.pumps[i].switchValveRelayIndex != PIN_UNUSED &&
-        i < MAX_VALVES) {
-      cfg.pumps[i].valveIndex = i;
-      cfg.valves[i].enabled = true;
-      cfg.valves[i].output.kind = OutputKind::RELAY;
-      cfg.valves[i].output.index = cfg.pumps[i].switchValveRelayIndex;
-      cfg.valves[i].travelTimeMs = cfg.pumps[i].switchValveTravelTimeMs;
-      cfg.valves[i].activeHighForB = !cfg.pumps[i].switchValveStateForTargetA;
-      cfg.valves[i].safetyPosition = ValvePosition::A;
-    }
+    if (v.length()) legacySwitchValveStateForTargetA[i] = (v.toInt() != 0);
 
     for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
       const String tPrefix = prefix + "target" + String(t) + "_";
@@ -684,6 +731,19 @@ bool loadConfig(ConfigData& cfg) {
 
     v = valueOf(text, prefix + "lastRequestedPosition");
     if (v.length()) cfg.valves[i].lastRequestedPosition = (v.toInt() == 1) ? ValvePosition::B : ValvePosition::A;
+  }
+
+  // Abschluss der Legacy-Migration erst nach Valve V2 Load, damit bereits
+  // vorhandene valveX_* Eintraege Vorrang vor alten pumpX_switchValve* Keys haben.
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    migrateLegacySwitchValve(
+      cfg,
+      i,
+      legacySwitchValveEnabled[i],
+      legacySwitchValveRelayIndex[i],
+      legacySwitchValveTravelTimeMs[i],
+      legacySwitchValveStateForTargetA[i]
+    );
   }
 
   v = valueOf(text, "auxHeaterEnabled");
@@ -875,6 +935,10 @@ bool saveConfig(const ConfigData& cfg) {
 
   text += "apName=" + String(cfg.apName) + "\n";
   text += "apPassword=" + String(cfg.apPassword) + "\n";
+  text += "staEnabled=" + String(cfg.staEnabled ? 1 : 0) + "\n";
+  text += "staSsid=" + String(cfg.staSsid) + "\n";
+  text += "staPassword=" + String(cfg.staPassword) + "\n";
+  text += "hostName=" + String(cfg.hostName) + "\n";
   text += "servicePin=" + String(cfg.servicePin) + "\n";
 
   text += "solarFluidType=" + String((int)cfg.solarFluidType) + "\n";
@@ -958,10 +1022,6 @@ bool saveConfig(const ConfigData& cfg) {
     text += prefix + "pidKd=" + String(cfg.pumps[i].pidKd, 4) + "\n";
     text += prefix + "minPwmPercent=" + String(cfg.pumps[i].minPwmPercent, 2) + "\n";
     text += prefix + "maxPwmPercent=" + String(cfg.pumps[i].maxPwmPercent, 2) + "\n";
-    text += prefix + "switchValveEnabled=" + String(cfg.pumps[i].switchValveEnabled ? 1 : 0) + "\n";
-    text += prefix + "switchValveRelayIndex=" + String(cfg.pumps[i].switchValveRelayIndex) + "\n";
-    text += prefix + "switchValveTravelTimeMs=" + String(cfg.pumps[i].switchValveTravelTimeMs) + "\n";
-    text += prefix + "switchValveStateForTargetA=" + String(cfg.pumps[i].switchValveStateForTargetA ? 1 : 0) + "\n";
 
     for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
       const String tPrefix = prefix + "target" + String(t) + "_";
@@ -1237,5 +1297,19 @@ bool saveSensorAssignments(const SensorAssignmentTable& table) {
 
   return writeFileText(FILE_SENSOR_ASSIGNMENTS, text);
 }
+void resetConfig(ConfigData& cfg) {
+  setDefaults(cfg);
+}
 
+void resetDiagnostics(DiagnosticData& d) {
+  setDiagDefaults(d);
+}
+
+void resetMaintenance(MaintenanceData& m) {
+  setMaintenanceDefaults(m);
+}
+
+void resetSensorAssignments(SensorAssignmentTable& table) {
+  setAssignmentDefaults(table);
+}
 }

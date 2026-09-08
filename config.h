@@ -17,8 +17,8 @@ static constexpr uint8_t PIN_I2C_SCL = 22;
 // ======================================================
 // 0x20: MAX31865 Chip-Selects
 // 0x21: Relais-Ausgänge fuer Pumpen und Zonenventile
-static constexpr uint8_t PCF8574_MAX_ADDR   = 0x20;
-static constexpr uint8_t PCF8574_RELAY_ADDR = 0x21;
+static constexpr uint8_t PCF8574_MAX_ADDR   = 0x38;
+static constexpr uint8_t PCF8574_RELAY_ADDR = 0x39;
 
 // Rueckwaertskompatibel fuer bestehenden MAX-PCF-Code
 static constexpr uint8_t PCF8574_ADDR = PCF8574_MAX_ADDR;
@@ -83,6 +83,15 @@ static constexpr float MAX31865_RNOMINAL       = 1000.0f;
 static constexpr float MAX31865_RREF           = 4700.0f;
 static constexpr float HEAT_SOURCE_TEMP_MIN_C  = -40.0f;
 static constexpr float HEAT_SOURCE_TEMP_MAX_C  = 400.0f;
+
+// MAX31865 Plausibilitaet fuer PT1000-Messkanaele.
+// Diese Werte sind bewusst enger als HEAT_SOURCE_TEMP_MAX_C:
+// Ein unbeschalteter/floating MAX-Kanal darf nicht als gueltige Waermequelle
+// in die Regelung laufen, auch wenn das Fault-Register 0 meldet.
+static constexpr float MAX31865_VALID_R_MIN_OHM     = 800.0f;
+static constexpr float MAX31865_VALID_R_MAX_OHM     = 1900.0f;
+static constexpr float MAX31865_VALID_TEMP_MIN_C    = -40.0f;
+static constexpr float MAX31865_VALID_TEMP_MAX_C    = 220.0f;
 
 // ======================================================
 // DS18B20 Plausibilitaet

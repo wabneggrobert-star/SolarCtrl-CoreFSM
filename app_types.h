@@ -229,8 +229,11 @@ struct MaxChannelReading {
   float tempC = NAN;
   float rawTempC = NAN;
   float resistanceOhm = NAN;
-  uint16_t rawRtd = 0;
+  uint16_t rawRtd = 0;        // Rohregister inkl. Fault-Bit im LSB
+  uint16_t rtdCode = 0;       // 15-bit RTD-Code: rawRtd >> 1
   uint8_t fault = 0;
+  bool rawFaultBit = false;
+  char status[40] = "not_read";
 };
 
 struct HeatSourceAssignment {
@@ -398,24 +401,9 @@ struct PumpConfig {
   // PIN_UNUSED = kein Ventil. Die Ventil-Hardware wird nur noch in ValveConfig.output definiert.
   uint8_t valveIndex = PIN_UNUSED;
 
-  // Optionales 2-Ziel-Umschaltventil.
-  // Wenn deaktiviert, verwendet die Pumpe sinkRole wie bisher.
-  // Wenn aktiviert, werden targets[0] und targets[1] als Ziel A/B verwendet.
-  bool switchValveEnabled = false;
-  uint8_t switchValveRelayIndex = PIN_UNUSED;
-
-  // Zeit, die das Umschaltventil mechanisch zum Umstellen braucht.
-  // Waehrend dieser Zeit bleibt die Pumpe ausgeschaltet.
-  uint32_t switchValveTravelTimeMs = 15000;
-
-  // Runtime fuer Ventilbewegung. Nicht dauerhaft relevant, wird aber im UI angezeigt.
-  bool switchValveMoving = false;
-  uint32_t switchValveMoveStartedMs = 0;
-  uint8_t switchValvePendingTargetIndex = PIN_UNUSED;
-
-  // Logischer RelayOutputs::set(...)-Zustand fuer Ziel A.
-  // Ziel B verwendet automatisch den invertierten Zustand.
-  bool switchValveStateForTargetA = false;
+  // Valve V2 ersetzt die alte switchValve-Relaislogik.
+  // Ziel A/B werden ueber targets[] konfiguriert; die Hardwarezuordnung liegt
+  // ausschliesslich in ConfigData.valves[pump.valveIndex].
 
   PumpRouteTargetConfig targets[PUMP_ROUTE_TARGET_COUNT];
   uint8_t activeTargetIndex = PIN_UNUSED;
@@ -631,6 +619,12 @@ struct ConfigData {
 
   char apName[32] = "SolarCtrl";
   char apPassword[32] = "12345678";
+
+  bool staEnabled = false;
+  char staSsid[32] = "";
+  char staPassword[64] = "";
+  char hostName[32] = "solarctrl";
+
   char servicePin[16] = "1234";
 
   SolarFluidType solarFluidType = SolarFluidType::GLYCOL;

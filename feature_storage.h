@@ -15,4 +15,13 @@ namespace Storage {
 
   bool loadSensorAssignments(SensorAssignmentTable& table);
   bool saveSensorAssignments(const SensorAssignmentTable& table);
+
+  void resetConfig(ConfigData& cfg);
+  void resetDiagnostics(DiagnosticData& d);
+  void resetMaintenance(MaintenanceData& m);
+  void resetSensorAssignments(SensorAssignmentTable& table);
+  void resetConfig(ConfigData& cfg);
+void resetDiagnostics(DiagnosticData& d);
+void resetMaintenance(MaintenanceData& m);
+void resetSensorAssignments(SensorAssignmentTable& table);
 }
