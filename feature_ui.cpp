@@ -18,6 +18,7 @@
 #include "feature_pump_routing.h"
 #include "feature_heating_circuits.h"
 #include "feature_heat_sources_max31865.h"
+#include "feature_alarms.h"
 #include <WebServer.h>
 #include <SD.h>
 #include <WiFi.h>
@@ -109,6 +110,9 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
   String jsonFloat(float v, uint8_t decimals);
   String jsonEscape(const char* value);
   String ipToString(const IPAddress& ip);
+  void handleAlarmsJson();
+  void handleAlarmsAck();
+  void handleAlarmsClearHistory();
 
   String contentType(const String& path) {
     if (path.endsWith(".html")) return "text/html";
@@ -709,6 +713,7 @@ void handleSaveMaxConfig() {
       case RelayFunction::ZONE_VALVE: return "Zonenventil";
       case RelayFunction::HEATER_ROD: return "Heizstab";
       case RelayFunction::MIXER: return "Mischer";
+      case RelayFunction::ALARM_BUZZER: return "Summer / Alarm";
       case RelayFunction::NONE:
       default: return "frei";
     }
@@ -1152,7 +1157,16 @@ bool validateOvenOutputConfig(const AppContext& ctx, const OvenConfig& candidate
         return;
       }
 
+      PwmOutputConfig old = s_ctx->config.pwmOutputs[idx];
       s_ctx->config.pwmOutputs[idx] = candidate;
+
+      String validationError;
+      if (!OutputValidation::validateAll(*s_ctx, validationError)) {
+        s_ctx->config.pwmOutputs[idx] = old;
+        server.send(409, "text/plain", validationError);
+        return;
+      }
+
       Storage::saveConfig(s_ctx->config);
       server.send(200, "text/plain", "OK");
       return;
@@ -1180,7 +1194,17 @@ bool validateOvenOutputConfig(const AppContext& ctx, const OvenConfig& candidate
 
     // Auf der Seite "Ausgaenge" wird nur die Faehigkeit des Ausgangs definiert.
     // Harte Doppelbelegung wird erst beim Zuordnen in Verbraucher-Menues geprueft.
+    RelayOutputConfig old = s_ctx->config.relays[idx];
     RelayOutputs::configure(*s_ctx, (uint8_t)idx, enabled, fn, activeLow);
+
+    String validationError;
+    if (!OutputValidation::validateAll(*s_ctx, validationError)) {
+      s_ctx->config.relays[idx] = old;
+      RelayOutputs::set(*s_ctx, (uint8_t)idx, false);
+      server.send(409, "text/plain", validationError);
+      return;
+    }
+
     Storage::saveConfig(s_ctx->config);
 
     server.send(200, "text/plain", "OK");
@@ -2611,9 +2635,12 @@ server.send(200, "text/plain", "OK");
     json += ",";
     appendTestSafetyJson(json);
 
+    json += ",\"alarms\":";
+    Alarms::appendJson(json);
+
     json += ",\"diagnostics\":{";
     json += "\"faultActive\":" + String(s_ctx->diag.faultActive ? "true" : "false") + ",";
-    json += "\"faultText\":\"" + String(s_ctx->diag.faultText) + "\",";
+    json += "\"faultText\":\"" + jsonEscape(s_ctx->diag.faultText) + "\",";
     json += "\"bootCount\":" + String(s_ctx->diag.bootCount) + ",";
     json += "\"sensorErrorCount\":" + String(s_ctx->diag.sensorErrorCount) + ",";
     json += "\"sdErrorCount\":" + String(s_ctx->diag.sdErrorCount) + ",";
@@ -2809,6 +2836,44 @@ server.send(200, "text/plain", "OK");
     server.send(200, "text/plain", "OK");
   }
 
+
+  void handleAlarmsJson() {
+    String json;
+    Alarms::appendJson(json);
+    server.send(200, "application/json", json);
+  }
+
+  void handleAlarmsAck() {
+    if (!testSessionValid()) {
+      server.send(403, "text/plain", "Service-PIN falsch oder fehlt");
+      return;
+    }
+
+    uint8_t count = 0;
+    if (server.hasArg("id") && server.arg("id").length() > 0) {
+      if (!Alarms::acknowledge(server.arg("id").c_str())) {
+        server.send(409, "text/plain", "Alarm nicht gefunden oder kritischer aktiver Alarm ist nicht quittierbar");
+        return;
+      }
+      count = 1;
+    } else {
+      count = Alarms::acknowledgeAllNonCritical();
+    }
+
+    server.send(200, "text/plain", "Quittiert: " + String(count));
+  }
+
+  void handleAlarmsClearHistory() {
+    if (!testSessionValid()) {
+      server.send(403, "text/plain", "Service-PIN falsch oder fehlt");
+      return;
+    }
+
+    Alarms::clearHistory();
+    Alarms::recordInfo("alarm_history_cleared", "Alarmhistorie wurde geloescht");
+    server.send(200, "text/plain", "Alarmhistorie geloescht");
+  }
+
   void handleFactoryReset() {
     if (!testSessionValid()) {
       server.send(403, "text/plain", "Service-PIN falsch oder fehlt");
@@ -2833,6 +2898,10 @@ server.send(200, "text/plain", "OK");
     Storage::resetConfig(s_ctx->config);
     Storage::resetDiagnostics(s_ctx->diag);
     Storage::resetMaintenance(s_ctx->maintenance);
+    Alarms::resetAll();
+    Alarms::recordInfo("factory_reset", clearSensorLinks
+      ? "Werkseinstellungen ausgefuehrt, Sensor- und Waermequellen-Zuordnung geloescht"
+      : "Werkseinstellungen ausgefuehrt, Sensor- und Waermequellen-Zuordnung erhalten");
 
     if (clearSensorLinks) {
       Storage::resetSensorAssignments(s_ctx->assignments);
@@ -3418,6 +3487,9 @@ void begin(AppContext& ctx) {
   server.on("/service-oven-start", HTTP_POST, handleOvenStart);
   server.on("/service-oven-stop", HTTP_POST, handleOvenStop);
   server.on("/api/test", HTTP_GET, handleTestOverviewJson);
+  server.on("/api/alarms", HTTP_GET, handleAlarmsJson);
+  server.on("/service-alarms-ack", HTTP_POST, handleAlarmsAck);
+  server.on("/service-alarms-clear-history", HTTP_POST, handleAlarmsClearHistory);
   server.on("/api/testmode", HTTP_GET, handleTestModeGet);
   server.on("/service-testmode", HTTP_POST, handleTestModeSet);
   server.on("/service-test-relay-raw", HTTP_POST, handleTestRelayRaw);

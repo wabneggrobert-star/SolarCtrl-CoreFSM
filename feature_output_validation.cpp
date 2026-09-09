@@ -275,6 +275,35 @@ bool validateConfig(const ConfigData& cfg, String& error) {
     if (!addOutputRef(relaySlots, pwmSlots, valve.output, "Ventil " + String(i + 1), error)) return false;
   }
 
+
+  // Summer / Alarm-Ausgang: exakt ein Ausgang darf als Alarm-Summer markiert sein.
+  bool buzzerSeen = false;
+  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
+    const RelayOutputConfig& r = cfg.relays[i];
+    if (!r.enabled || r.function != RelayFunction::ALARM_BUZZER) continue;
+    if (buzzerSeen) {
+      error = "Mehrere Summer-/Alarm-Ausgaenge konfiguriert";
+      return false;
+    }
+    buzzerSeen = true;
+    if (!addOutput(relaySlots, pwmSlots, OutputKind::RELAY, i, "Summer / Alarm", error)) return false;
+  }
+
+  for (uint8_t i = 0; i < PWM_OUTPUT_COUNT; i++) {
+    const PwmOutputConfig& po = cfg.pwmOutputs[i];
+    if (!po.enabled || po.function != RelayFunction::ALARM_BUZZER) continue;
+    if (po.mode != PwmOutputMode::SWITCH) {
+      error = "PO-" + String(i) + ": Summer / Alarm muss im Modus Schaltausgang stehen";
+      return false;
+    }
+    if (buzzerSeen) {
+      error = "Mehrere Summer-/Alarm-Ausgaenge konfiguriert";
+      return false;
+    }
+    buzzerSeen = true;
+    if (!addOutput(relaySlots, pwmSlots, OutputKind::PWM_OUTPUT, i, "Summer / Alarm", error)) return false;
+  }
+
   return true;
 }
 

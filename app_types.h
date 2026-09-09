@@ -321,7 +321,8 @@ enum class RelayFunction : uint8_t {
   PUMP_ENABLE,
   ZONE_VALVE,
   HEATER_ROD,
-  MIXER
+  MIXER,
+  ALARM_BUZZER
 };
 
 struct RelayOutputConfig {

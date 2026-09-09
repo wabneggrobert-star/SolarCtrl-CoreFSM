@@ -93,6 +93,19 @@ bool set(AppContext& ctx, uint8_t relayIndex, bool on) {
       Serial.print("ZONENVENTIL");
       break;
 
+    case RelayFunction::HEATER_ROD:
+      Serial.print("HEIZSTAB");
+      break;
+
+    case RelayFunction::MIXER:
+      Serial.print("MISCHER");
+      break;
+
+    case RelayFunction::ALARM_BUZZER:
+      Serial.print("SUMMER/ALARM");
+      break;
+
+    case RelayFunction::NONE:
     default:
       Serial.print("NONE");
       break;
@@ -191,6 +204,8 @@ const char* functionToKey(RelayFunction f) {
       return "heater_rod";
     case RelayFunction::MIXER:
       return "mixer";
+    case RelayFunction::ALARM_BUZZER:
+      return "alarm_buzzer";
     case RelayFunction::NONE:
     default:
       return "none";
@@ -202,6 +217,7 @@ RelayFunction functionFromKey(const String& key) {
   if (key == "zone_valve") return RelayFunction::ZONE_VALVE;
   if (key == "heater_rod") return RelayFunction::HEATER_ROD;
   if (key == "mixer") return RelayFunction::MIXER;
+  if (key == "alarm_buzzer") return RelayFunction::ALARM_BUZZER;
   return RelayFunction::NONE;
 }
 

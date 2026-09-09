@@ -16,10 +16,13 @@
 #include "feature_aux_heater.h"
 #include "feature_oven.h"
 #include "feature_heating_circuits.h"
+#include "feature_alarms.h"
+#include "feature_output_validation.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <string.h>
+#include <stdio.h>
 
 namespace {
   void copyFaultText(char* dst, size_t dstSize, const char* src) {
@@ -51,6 +54,8 @@ void AppFSM::begin() {
   ctx_.stateEnteredAtMs = millis();
   ctx_.lastSampleAtMs = 0;
   ctx_.lastRuntimeSaveAtMs = millis();
+  Alarms::begin();
+  Alarms::recordInfo("system_boot", "Steuerung gestartet");
 }
 
 void AppFSM::loop() {
@@ -119,6 +124,8 @@ void AppFSM::loop() {
       stateFault();
       break;
   }
+
+  Alarms::process(ctx_);
 }
 
 void AppFSM::changeState(SystemState next) {
@@ -145,9 +152,15 @@ void AppFSM::stateInitHw() {
 void AppFSM::stateInitSd() {
   ctx_.sdAvailable = SDCard::begin();
 
+  Alarms::setPersistentHistoryEnabled(ctx_.sdAvailable);
+
   if (!ctx_.sdAvailable) {
     ctx_.diag.sdErrorCount++;
     copyFaultText(ctx_.diag.faultText, sizeof(ctx_.diag.faultText), "SD Initialisierung fehlgeschlagen");
+    Alarms::raise("sd_init_failed", Alarms::Severity::WARNING, "SD Initialisierung fehlgeschlagen", true);
+  } else {
+    Alarms::clear("sd_init_failed");
+    Alarms::recordInfo("sd_ready", "SD-Karte bereit; Alarmhistorie aktiv");
   }
 
   changeState(SystemState::INIT_STORAGE);
@@ -264,6 +277,7 @@ void AppFSM::stateInitSensors() {
       sizeof(ctx_.diag.faultText),
       "DS18B20 Initialisierung fehlgeschlagen"
     );
+    Alarms::raise("ds18b20_init_failed", Alarms::Severity::CRITICAL, "DS18B20 Initialisierung fehlgeschlagen", false);
     changeState(SystemState::FAULT);
     return;
   }
@@ -274,6 +288,7 @@ void AppFSM::stateInitSensors() {
       sizeof(ctx_.diag.faultText),
       "MAX31865 Initialisierung fehlgeschlagen"
     );
+    Alarms::raise("max31865_init_failed", Alarms::Severity::CRITICAL, "MAX31865 Initialisierung fehlgeschlagen", false);
     changeState(SystemState::FAULT);
     return;
   }
@@ -288,12 +303,14 @@ void AppFSM::stateInitSensors() {
         sizeof(ctx_.diag.faultText),
         "Kein DS18B20 gefunden"
       );
+      Alarms::raise("ds18b20_not_found", Alarms::Severity::CRITICAL, "Kein DS18B20 gefunden", false);
     } else {
       copyFaultText(
         ctx_.diag.faultText,
         sizeof(ctx_.diag.faultText),
         "DS18B20 Rollen-Zuordnung erforderlich"
       );
+      Alarms::raise("ds18b20_role_assignment_required", Alarms::Severity::CRITICAL, "DS18B20 Rollen-Zuordnung erforderlich", false);
     }
 
     Serial.println("SensorAssignments FEHLER");
@@ -305,6 +322,10 @@ void AppFSM::stateInitSensors() {
 
   Serial.println("SensorAssignments OK");
   Serial.flush();
+  Alarms::clear("ds18b20_init_failed");
+  Alarms::clear("ds18b20_not_found");
+  Alarms::clear("ds18b20_role_assignment_required");
+  Alarms::clear("max31865_init_failed");
 
   Serial.println("Storage::saveSensorAssignments...");
   Serial.flush();
@@ -365,12 +386,15 @@ void AppFSM::stateSelfTest() {
     ctx_.diag.sensorErrorCount++;
     ctx_.diag.faultActive = true;
     copyFaultText(ctx_.diag.faultText, sizeof(ctx_.diag.faultText), "Waermequelle oder Sink beim Start ungueltig");
+    Alarms::raise("startup_source_or_sink_invalid", Alarms::Severity::CRITICAL, "Waermequelle oder Ziel-Sensor beim Start ungueltig", false);
     changeState(SystemState::FAULT);
     return;
   }
 
   ctx_.diag.faultActive = false;
   ctx_.diag.faultText[0] = '\0';
+  Alarms::clear("startup_source_or_sink_invalid");
+  Alarms::clear("source_or_sink_invalid");
 
   changeState(SystemState::IDLE);
 }
@@ -424,12 +448,15 @@ void AppFSM::stateValidateSensors() {
     ctx_.diag.sensorErrorCount++;
     ctx_.diag.faultActive = true;
     copyFaultText(ctx_.diag.faultText, sizeof(ctx_.diag.faultText), "Waermequelle oder Sink ungueltig");
+    Alarms::raise("source_or_sink_invalid", Alarms::Severity::CRITICAL, "Waermequelle oder Ziel-Sensor ungueltig", false);
     changeState(SystemState::FAULT);
     return;
   }
 
   ctx_.diag.faultActive = false;
   ctx_.diag.faultText[0] = '\0';
+  Alarms::clear("source_or_sink_invalid");
+  Alarms::clear("startup_source_or_sink_invalid");
 
   changeState(SystemState::COMPUTE_CONTROL);
 }
@@ -496,6 +523,55 @@ void AppFSM::stateApplyOutputs() {
 
 void AppFSM::stateUpdateRuntime() {
   ctx_.lastRuntimeSaveAtMs = millis();
+
+  if (ctx_.config.staEnabled && ctx_.config.staSsid[0]) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Alarms::clear("wifi_sta_disconnected");
+    } else {
+      Alarms::raise("wifi_sta_disconnected", Alarms::Severity::WARNING, "WLAN-Client ist nicht verbunden; SoftAP bleibt aktiv", true);
+    }
+  } else {
+    Alarms::clear("wifi_sta_disconnected");
+  }
+
+  String outputValidationError;
+  if (!OutputValidation::validateAll(ctx_, outputValidationError)) {
+    Alarms::raise("output_config_invalid", Alarms::Severity::CRITICAL, outputValidationError.c_str(), false);
+  } else {
+    Alarms::clear("output_config_invalid");
+  }
+
+  const auto& safetyStatus = SafetyManager::status();
+  if (safetyStatus.collectorStagnationActive) {
+    Alarms::raise("safety_collector_stagnation", Alarms::Severity::WARNING, "Kollektor-Stagnationsschutz aktiv", true);
+  } else {
+    Alarms::clear("safety_collector_stagnation");
+  }
+
+  if (safetyStatus.storageOvertemperatureActive) {
+    Alarms::raise("safety_storage_overtemperature", Alarms::Severity::CRITICAL, "Speicher-Uebertemperatur aktiv", false);
+  } else {
+    Alarms::clear("safety_storage_overtemperature");
+  }
+
+  if (safetyStatus.ovenOvertemperatureActive) {
+    Alarms::raise("safety_oven_overtemperature", Alarms::Severity::CRITICAL, "Ofen-Uebertemperatur aktiv", false);
+  } else {
+    Alarms::clear("safety_oven_overtemperature");
+  }
+
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    char alarmId[40];
+    snprintf(alarmId, sizeof(alarmId), "pump_%u_feedback_error", (unsigned)(i + 1));
+    const PumpConfig& pump = ctx_.config.pumps[i];
+    if (pump.enabled && pump.feedbackError) {
+      char msg[96];
+      snprintf(msg, sizeof(msg), "Pumpe %u: Feedbacksignal ungueltig", (unsigned)(i + 1));
+      Alarms::raise(alarmId, Alarms::Severity::WARNING, msg, true);
+    } else {
+      Alarms::clear(alarmId);
+    }
+  }
 
   Storage::saveDiagnostics(ctx_.diag);
   Storage::saveMaintenance(ctx_.maintenance);

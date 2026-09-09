@@ -128,6 +128,7 @@ namespace {
       case 2: return RelayFunction::ZONE_VALVE;
       case 3: return RelayFunction::HEATER_ROD;
       case 4: return RelayFunction::MIXER;
+      case 5: return RelayFunction::ALARM_BUZZER;
       default: return RelayFunction::NONE;
     }
   }
@@ -138,6 +139,7 @@ namespace {
       case RelayFunction::ZONE_VALVE: return 2;
       case RelayFunction::HEATER_ROD: return 3;
       case RelayFunction::MIXER: return 4;
+      case RelayFunction::ALARM_BUZZER: return 5;
       case RelayFunction::NONE:
       default: return 0;
     }
