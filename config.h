@@ -104,6 +104,8 @@ static constexpr float SINK_TEMP_MAX_C = 125.0f;
 // ======================================================
 static constexpr const char* DEFAULT_AP_SSID     = "SolarCtrl";
 static constexpr const char* DEFAULT_AP_PASSWORD = "12345678";
+static constexpr const char* DEFAULT_HOSTNAME    = "solarctrl";
+static constexpr uint32_t WIFI_STA_CONNECT_TIMEOUT_MS = 10000UL;
 
 // ======================================================
 // Service

@@ -176,27 +176,26 @@ void AppFSM::stateInitNetwork() {
   Serial.println("INIT_NETWORK gestartet");
 
   WiFi.mode(WIFI_AP_STA);
-  WiFi.setSleep(false);
 
-  const char* apSsid = ctx_.config.apName[0] ? ctx_.config.apName : DEFAULT_AP_SSID;
-  const char* apPass = ctx_.config.apPassword[0] ? ctx_.config.apPassword : DEFAULT_AP_PASSWORD;
-  const char* hostName = ctx_.config.hostName[0] ? ctx_.config.hostName : "solarctrl";
+  const char* ssid = ctx_.config.apName[0] ? ctx_.config.apName : DEFAULT_AP_SSID;
+  const char* pass = ctx_.config.apPassword[0] ? ctx_.config.apPassword : DEFAULT_AP_PASSWORD;
+  const char* hostName = ctx_.config.hostName[0] ? ctx_.config.hostName : DEFAULT_HOSTNAME;
 
   WiFi.setHostname(hostName);
 
   Serial.print("Starte AP mit SSID: ");
-  Serial.println(apSsid);
+  Serial.println(ssid);
 
-  bool apOk = WiFi.softAP(apSsid, apPass);
+  bool ok = WiFi.softAP(ssid, pass);
 
   Serial.print("softAP Ergebnis: ");
-  Serial.println(apOk ? "OK" : "FEHLER");
+  Serial.println(ok ? "OK" : "FEHLER");
 
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
 
   if (ctx_.config.staEnabled && ctx_.config.staSsid[0]) {
-    Serial.print("Verbinde mit WLAN SSID: ");
+    Serial.print("Verbinde mit WLAN: ");
     Serial.println(ctx_.config.staSsid);
 
     if (ctx_.config.staPassword[0]) {
@@ -205,10 +204,10 @@ void AppFSM::stateInitNetwork() {
       WiFi.begin(ctx_.config.staSsid);
     }
 
-    const uint32_t startedAt = millis();
-    while (WiFi.status() != WL_CONNECTED && (uint32_t)(millis() - startedAt) < 10000UL) {
+    uint32_t startMs = millis();
+    while (WiFi.status() != WL_CONNECTED && (uint32_t)(millis() - startMs) < WIFI_STA_CONNECT_TIMEOUT_MS) {
       delay(250);
-      Serial.print(".");
+      Serial.print('.');
     }
     Serial.println();
 
@@ -218,14 +217,13 @@ void AppFSM::stateInitNetwork() {
       Serial.print("Hostname: ");
       Serial.println(hostName);
       Serial.print("RSSI: ");
-      Serial.print(WiFi.RSSI());
-      Serial.println(" dBm");
+      Serial.println(WiFi.RSSI());
     } else {
       Serial.println("WLAN-Verbindung fehlgeschlagen. SoftAP bleibt aktiv.");
       WiFi.disconnect(false);
     }
   } else {
-    Serial.println("WLAN-Client deaktiviert oder keine SSID konfiguriert. Nur SoftAP aktiv.");
+    Serial.println("WLAN-Client deaktiviert. Nur SoftAP aktiv.");
   }
 
   changeState(SystemState::INIT_UI);
@@ -507,6 +505,8 @@ void AppFSM::stateUpdateRuntime() {
 
 void AppFSM::stateFault() {
   if (UI::commissioningTestActive()) {
+    // Manueller Testmodus hat Vorrang vor dem Fault-All-Off,
+    // damit Relais-/Pumpen-/Ventiltests nicht sofort wieder überschrieben werden.
     if ((uint32_t)(millis() - ctx_.stateEnteredAtMs) >= FAULT_RETRY_INTERVAL_MS) {
       changeState(SystemState::READ_SENSORS);
     }

@@ -225,9 +225,9 @@ namespace {
     copyText(cfg.apName, sizeof(cfg.apName), DEFAULT_AP_SSID);
     copyText(cfg.apPassword, sizeof(cfg.apPassword), DEFAULT_AP_PASSWORD);
     cfg.staEnabled = false;
-    cfg.staSsid[0] = '\0';
-    cfg.staPassword[0] = '\0';
-    copyText(cfg.hostName, sizeof(cfg.hostName), "solarctrl");
+    copyText(cfg.staSsid, sizeof(cfg.staSsid), "");
+    copyText(cfg.staPassword, sizeof(cfg.staPassword), "");
+    copyText(cfg.hostName, sizeof(cfg.hostName), DEFAULT_HOSTNAME);
     copyText(cfg.servicePin, sizeof(cfg.servicePin), DEFAULT_SERVICE_PIN);
 
     cfg.solarFluidType = SolarFluidType::GLYCOL;
@@ -1297,6 +1297,7 @@ bool saveSensorAssignments(const SensorAssignmentTable& table) {
 
   return writeFileText(FILE_SENSOR_ASSIGNMENTS, text);
 }
+
 void resetConfig(ConfigData& cfg) {
   setDefaults(cfg);
 }
@@ -1312,4 +1313,5 @@ void resetMaintenance(MaintenanceData& m) {
 void resetSensorAssignments(SensorAssignmentTable& table) {
   setAssignmentDefaults(table);
 }
+
 }
