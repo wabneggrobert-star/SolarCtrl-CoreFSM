@@ -20,6 +20,7 @@
 #include "feature_heating_circuits.h"
 #include "feature_heat_sources_max31865.h"
 #include "feature_alarms.h"
+#include "feature_aux_heater.h"
 #include <WebServer.h>
 #include <SD.h>
 #include <WiFi.h>
