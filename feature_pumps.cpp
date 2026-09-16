@@ -33,6 +33,12 @@ namespace {
     return channel != PIN_UNUSED && channel < 16;
   }
 
+  bool pwmOutputAvailableForPump(const AppContext& ctx, uint8_t channel) {
+    if (channel == PIN_UNUSED || channel >= PWM_OUTPUT_COUNT) return false;
+    const PwmOutputConfig& out = ctx.config.pwmOutputs[channel];
+    return out.enabled && out.mode == PwmOutputMode::PWM;
+  }
+
   uint8_t defaultPcaChannelFor(uint8_t pumpIndex) {
     if (pumpIndex >= MAX_PUMPS) return PIN_UNUSED;
     return PUMP_PWM_CHANNELS[pumpIndex];
@@ -48,6 +54,12 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
 }
 
   void setPwmPercent(const PumpConfig& pump, float percent) {
+    // Wichtig: Das Pumpenmodul darf nur PCA-Kanaele anfassen, die wirklich
+    // als PWM-Pumpenausgang dieser Pumpe verwendet werden. Deaktivierte Pumpen
+    // und Relaispumpen behalten teilweise Default-pwmChannel-Werte. Ohne diese
+    // Abgrenzung wuerden sie fremde PO-Schaltausgaenge, z. B. Zusatzheizung
+    // Heizstab PO1-PO3, bei jedem Reglerlauf wieder auf 0 % setzen.
+    if (pump.mode != PumpMode::PWM) return;
     if (!validPcaChannel(pump.pwmChannel)) return;
     percent = clampFloat(percent, 0.0f, 100.0f);
     PwmDriver::setDuty(pump.pwmChannel, static_cast<uint8_t>(percent), pump.pwmProfile);
@@ -138,6 +150,72 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
     temperatureC = ctx.sensors.activeHeatSource.tempC;
     valid = ctx.sensors.activeHeatSource.valid;
     return true;
+  }
+
+
+  bool isOvenPump(const PumpConfig& pump) {
+    return pump.sourceType == PumpSourceType::HEAT_SOURCE_ROLE &&
+           pump.sourceRole == HeatSourceRole::ALT_SOURCE_OVEN;
+  }
+
+  Ds18Role heatingCircuitFlowRole(uint8_t circuitIndex) {
+    switch (circuitIndex) {
+      case 0: return Ds18Role::HK1_FLOW;
+      case 1: return Ds18Role::HK2_FLOW;
+      case 2: return Ds18Role::HK3_FLOW;
+      case 3: return Ds18Role::HK4_FLOW;
+      default: return Ds18Role::NONE;
+    }
+  }
+
+  Ds18Role heatingCircuitReturnRole(uint8_t circuitIndex) {
+    switch (circuitIndex) {
+      case 0: return Ds18Role::HK1_RETURN;
+      case 1: return Ds18Role::HK2_RETURN;
+      case 2: return Ds18Role::HK3_RETURN;
+      case 3: return Ds18Role::HK4_RETURN;
+      default: return Ds18Role::NONE;
+    }
+  }
+
+  int8_t heatingCircuitIndexFromPumpRoute(const PumpConfig& pump) {
+    if (pump.sourceType != PumpSourceType::SENSOR_ROLE) return -1;
+    for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+      if (pump.sourceSensorRole == heatingCircuitFlowRole(i) &&
+          pump.sinkRole == heatingCircuitReturnRole(i)) {
+        return (int8_t)i;
+      }
+    }
+    return -1;
+  }
+
+  bool isHeatingCircuitPump(const PumpConfig& pump) {
+    return heatingCircuitIndexFromPumpRoute(pump) >= 0;
+  }
+
+  bool pumpEnableRelayReady(const AppContext& ctx, const PumpConfig& pump) {
+    return pump.relayIndex != PIN_UNUSED &&
+           pump.relayIndex < RELAY_COUNT &&
+           RelayOutputs::isUsableAsPumpEnable(ctx, pump.relayIndex);
+  }
+
+  float computeOvenPwmPercent(const PumpConfig& pump, float ovenTemperatureC, float targetTemperatureC, bool targetValid) {
+    const float minPwm = clampFloat(pump.minPwmPercent, 0.0f, 100.0f);
+    const float maxPwm = clampFloat(pump.maxPwmPercent, minPwm, 100.0f);
+
+    if (!targetValid || isnan(ovenTemperatureC) || isnan(targetTemperatureC)) {
+      return maxPwm;
+    }
+
+    const float deltaC = ovenTemperatureC - targetTemperatureC;
+    const float startC = pump.startDiff > 0.1f ? pump.startDiff : 3.0f;
+    const float fullC = pump.targetDiff > startC ? pump.targetDiff : (startC + 5.0f);
+
+    if (deltaC <= startC) return minPwm;
+    if (deltaC >= fullC) return maxPwm;
+
+    const float factor = (deltaC - startC) / (fullC - startC);
+    return minPwm + (maxPwm - minPwm) * factor;
   }
 
   bool isSolarCollectorSource(HeatSourceRole role) {
@@ -379,6 +457,13 @@ void process(AppContext& ctx) {
       continue;
     }
 
+    // Spezialpumpen werden zwar im Pumpenmenue konfiguriert, aber nicht durch
+    // die freie Differenz-/Routinglogik geregelt. Das jeweilige Modul fordert
+    // die Pumpe an, das Pumpenmodul setzt nur die zentrale Hardware-Konfig.
+    if (isOvenPump(p) || isHeatingCircuitPump(p)) {
+      continue;
+    }
+
     if (p.relayIndex == PIN_UNUSED || !RelayOutputs::isUsableAsPumpEnable(ctx, p.relayIndex)) {
       forcePumpOff(ctx, i);
       continue;
@@ -503,6 +588,150 @@ void process(AppContext& ctx) {
 
   ctx.control.relayEnable = anyRelayOn;
   ctx.control.pwmPercent = (uint8_t)clampFloat(maxPwm, 0.0f, 100.0f);
+}
+
+int8_t configuredOvenPumpIndex(const AppContext& ctx) {
+  int8_t found = -1;
+
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    const PumpConfig& pump = ctx.config.pumps[i];
+    if (!pump.enabled || pump.mode == PumpMode::OFF || !isOvenPump(pump)) continue;
+
+    if (found >= 0) {
+      // Mehrfachkonfiguration ist eine Validierungsaufgabe. Fuer die Runtime
+      // verwenden wir deterministisch die erste aktive Ofenpumpe.
+      continue;
+    }
+    found = (int8_t)i;
+  }
+
+  return found;
+}
+
+int8_t configuredHeatingCircuitPumpIndex(const AppContext& ctx, uint8_t circuitIndex) {
+  if (circuitIndex >= MAX_HEATING_CIRCUITS) return -1;
+
+  int8_t found = -1;
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    const PumpConfig& pump = ctx.config.pumps[i];
+    if (!pump.enabled || pump.mode == PumpMode::OFF) continue;
+    if (heatingCircuitIndexFromPumpRoute(pump) != (int8_t)circuitIndex) continue;
+
+    if (found >= 0) {
+      // Mehrfachkonfiguration wird in der Validierung abgefangen.
+      continue;
+    }
+    found = (int8_t)i;
+  }
+  return found;
+}
+
+bool applyHeatingCircuitPumpRequest(AppContext& ctx, uint8_t circuitIndex, bool run, uint8_t percent, float flowTemperatureC, float returnTemperatureC, bool returnValid) {
+  const int8_t pumpIndex = configuredHeatingCircuitPumpIndex(ctx, circuitIndex);
+  if (pumpIndex < 0) {
+    return false;
+  }
+
+  PumpConfig& pump = ctx.config.pumps[(uint8_t)pumpIndex];
+  const bool wasOn = pump.state;
+
+  if (!pumpEnableRelayReady(ctx, pump)) {
+    forcePumpOff(ctx, (uint8_t)pumpIndex);
+    return false;
+  }
+
+  if (!run) {
+    forcePumpOff(ctx, (uint8_t)pumpIndex);
+    if (wasOn) {
+      printPumpSwitch((uint8_t)pumpIndex, false, pump);
+    }
+    return true;
+  }
+
+  percent = (uint8_t)clampFloat(percent, pump.minPwmPercent, pump.maxPwmPercent);
+
+  if (pump.mode == PumpMode::PWM) {
+    if (!validPcaChannel(pump.pwmChannel) || !pwmOutputAvailableForPump(ctx, pump.pwmChannel)) {
+      forcePumpOff(ctx, (uint8_t)pumpIndex);
+      return false;
+    }
+  }
+
+  pump.state = true;
+  pump.lastSourceC = flowTemperatureC;
+  pump.lastSinkC = returnValid ? returnTemperatureC : NAN;
+  pump.lastDiffC = (returnValid && !isnan(flowTemperatureC) && !isnan(returnTemperatureC))
+                    ? flowTemperatureC - returnTemperatureC
+                    : NAN;
+  pump.lastPwmPercent = (pump.mode == PumpMode::PWM) ? percent : 0.0f;
+
+  RelayOutputs::set(ctx, pump.relayIndex, true);
+
+  if (pump.mode == PumpMode::PWM) {
+    setPwmPercent(pump, percent);
+  }
+
+  updatePumpFeedback(pump);
+
+  if (!wasOn) {
+    printPumpSwitch((uint8_t)pumpIndex, true, pump);
+  }
+
+  return true;
+}
+
+bool applyOvenPumpRequest(AppContext& ctx, bool run, float ovenTemperatureC, float targetTemperatureC, bool targetValid) {
+  const int8_t pumpIndex = configuredOvenPumpIndex(ctx);
+  if (pumpIndex < 0) {
+    return false;
+  }
+
+  PumpConfig& pump = ctx.config.pumps[(uint8_t)pumpIndex];
+  const bool wasOn = pump.state;
+
+  if (!pumpEnableRelayReady(ctx, pump)) {
+    forcePumpOff(ctx, (uint8_t)pumpIndex);
+    return false;
+  }
+
+  if (!run) {
+    forcePumpOff(ctx, (uint8_t)pumpIndex);
+    if (wasOn) {
+      printPumpSwitch((uint8_t)pumpIndex, false, pump);
+    }
+    return true;
+  }
+
+  float pwmPercent = 0.0f;
+  if (pump.mode == PumpMode::PWM) {
+    if (!validPcaChannel(pump.pwmChannel) || !pwmOutputAvailableForPump(ctx, pump.pwmChannel)) {
+      forcePumpOff(ctx, (uint8_t)pumpIndex);
+      return false;
+    }
+    pwmPercent = computeOvenPwmPercent(pump, ovenTemperatureC, targetTemperatureC, targetValid);
+  }
+
+  pump.state = true;
+  pump.lastSourceC = ovenTemperatureC;
+  pump.lastSinkC = targetValid ? targetTemperatureC : NAN;
+  pump.lastDiffC = (targetValid && !isnan(ovenTemperatureC) && !isnan(targetTemperatureC))
+                    ? ovenTemperatureC - targetTemperatureC
+                    : NAN;
+  pump.lastPwmPercent = (pump.mode == PumpMode::PWM) ? pwmPercent : 0.0f;
+
+  RelayOutputs::set(ctx, pump.relayIndex, true);
+
+  if (pump.mode == PumpMode::PWM) {
+    setPwmPercent(pump, pwmPercent);
+  }
+
+  updatePumpFeedback(pump);
+
+  if (!wasOn) {
+    printPumpSwitch((uint8_t)pumpIndex, true, pump);
+  }
+
+  return true;
 }
 
 void safetyAllOff(AppContext& ctx) {

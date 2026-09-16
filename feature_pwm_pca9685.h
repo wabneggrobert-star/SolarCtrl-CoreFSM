@@ -14,5 +14,13 @@ namespace PwmDriver {
   void setSwitch(uint8_t channel, bool on, PwmProfile profile);
 
   uint8_t getDuty(uint8_t channel);
+
+  // Frueher Start-Fallback ohne geladene Konfiguration: alle Kanaele nach
+  // SOLAR-Profil logisch AUS. Fuer den normalen Betrieb die profilbewusste
+  // Ueberladung mit ConfigData verwenden.
   void allOff();
+
+  // Schaltet jeden konfigurierbaren PO-Kanal logisch AUS und beruecksichtigt
+  // dabei sein gespeichertes PWM-Profil (SOLAR/HEATING).
+  void allOff(const ConfigData& config);
 }

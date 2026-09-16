@@ -340,9 +340,13 @@ namespace {
     cfg.auxHeater.hysteresisC = 2.0f;
     cfg.auxHeater.sinkRole = Ds18Role::NONE;
     cfg.auxHeater.pumpRelay = PIN_UNUSED;
+    cfg.auxHeater.pumpOutput = OutputRef{};
     cfg.auxHeater.heaterRelay1 = PIN_UNUSED;
     cfg.auxHeater.heaterRelay2 = PIN_UNUSED;
     cfg.auxHeater.heaterRelay3 = PIN_UNUSED;
+    cfg.auxHeater.heaterOutput1 = OutputRef{};
+    cfg.auxHeater.heaterOutput2 = OutputRef{};
+    cfg.auxHeater.heaterOutput3 = OutputRef{};
     cfg.auxHeater.preRunMs = 300000UL;
     cfg.auxHeater.cooldownMs = 300000UL;
 
@@ -766,6 +770,15 @@ bool loadConfig(ConfigData& cfg) {
   v = valueOf(text, "auxHeaterPumpRelay");
   if (v.length()) cfg.auxHeater.pumpRelay = (uint8_t)v.toInt();
 
+  bool auxPumpOutputConfigured = false;
+  v = valueOf(text, "auxHeaterPumpOutputKind");
+  if (v.length()) { cfg.auxHeater.pumpOutput.kind = (OutputKind)v.toInt(); auxPumpOutputConfigured = true; }
+  v = valueOf(text, "auxHeaterPumpOutputIndex");
+  if (v.length()) { cfg.auxHeater.pumpOutput.index = (uint8_t)v.toInt(); auxPumpOutputConfigured = true; }
+  if (!auxPumpOutputConfigured && cfg.auxHeater.pumpRelay != PIN_UNUSED) {
+    cfg.auxHeater.pumpOutput = OutputRef{OutputKind::RELAY, cfg.auxHeater.pumpRelay};
+  }
+
   v = valueOf(text, "auxHeaterRelay1");
   if (v.length()) cfg.auxHeater.heaterRelay1 = (uint8_t)v.toInt();
 
@@ -774,6 +787,36 @@ bool loadConfig(ConfigData& cfg) {
 
   v = valueOf(text, "auxHeaterRelay3");
   if (v.length()) cfg.auxHeater.heaterRelay3 = (uint8_t)v.toInt();
+
+  // Neue OutputRef-Konfiguration fuer Heizstab-Stufen.
+  // Legacy auxHeaterRelayX wird weiterhin geladen und auf RELAY migriert,
+  // wenn noch keine neuen auxHeaterOutputXKind/Index-Werte vorhanden sind.
+  bool auxOut1Configured = false;
+  bool auxOut2Configured = false;
+  bool auxOut3Configured = false;
+
+  v = valueOf(text, "auxHeaterOutput1Kind");
+  if (v.length()) { cfg.auxHeater.heaterOutput1.kind = (OutputKind)v.toInt(); auxOut1Configured = true; }
+  v = valueOf(text, "auxHeaterOutput1Index");
+  if (v.length()) { cfg.auxHeater.heaterOutput1.index = (uint8_t)v.toInt(); auxOut1Configured = true; }
+
+  v = valueOf(text, "auxHeaterOutput2Kind");
+  if (v.length()) { cfg.auxHeater.heaterOutput2.kind = (OutputKind)v.toInt(); auxOut2Configured = true; }
+  v = valueOf(text, "auxHeaterOutput2Index");
+  if (v.length()) { cfg.auxHeater.heaterOutput2.index = (uint8_t)v.toInt(); auxOut2Configured = true; }
+
+  v = valueOf(text, "auxHeaterOutput3Kind");
+  if (v.length()) { cfg.auxHeater.heaterOutput3.kind = (OutputKind)v.toInt(); auxOut3Configured = true; }
+  v = valueOf(text, "auxHeaterOutput3Index");
+  if (v.length()) { cfg.auxHeater.heaterOutput3.index = (uint8_t)v.toInt(); auxOut3Configured = true; }
+
+  if (!auxOut1Configured && cfg.auxHeater.heaterRelay1 != PIN_UNUSED) cfg.auxHeater.heaterOutput1 = OutputRef{OutputKind::RELAY, cfg.auxHeater.heaterRelay1};
+  if (!auxOut2Configured && cfg.auxHeater.heaterRelay2 != PIN_UNUSED) cfg.auxHeater.heaterOutput2 = OutputRef{OutputKind::RELAY, cfg.auxHeater.heaterRelay2};
+  if (!auxOut3Configured && cfg.auxHeater.heaterRelay3 != PIN_UNUSED) cfg.auxHeater.heaterOutput3 = OutputRef{OutputKind::RELAY, cfg.auxHeater.heaterRelay3};
+
+  cfg.auxHeater.heaterRelay1 = (cfg.auxHeater.heaterOutput1.kind == OutputKind::RELAY) ? cfg.auxHeater.heaterOutput1.index : PIN_UNUSED;
+  cfg.auxHeater.heaterRelay2 = (cfg.auxHeater.heaterOutput2.kind == OutputKind::RELAY) ? cfg.auxHeater.heaterOutput2.index : PIN_UNUSED;
+  cfg.auxHeater.heaterRelay3 = (cfg.auxHeater.heaterOutput3.kind == OutputKind::RELAY) ? cfg.auxHeater.heaterOutput3.index : PIN_UNUSED;
 
   v = valueOf(text, "auxHeaterPreRunMs");
   if (v.length()) cfg.auxHeater.preRunMs = (uint32_t)v.toInt();
@@ -814,6 +857,12 @@ bool loadConfig(ConfigData& cfg) {
   v = valueOf(text, "ovenServoBaseAngle");
   if (v.length()) cfg.oven.servoBaseAngle = (uint8_t)v.toInt();
 
+  // Sicherheitsmigration: Die alte Bedeutung von ovenServoBaseAngle war
+  // eine Regel-/Startgrundstellung. Ab jetzt ist sie die Standby-/
+  // Sicherheitsstellung und muss 0° sein, damit die Luftklappe im Standby,
+  // bei Stop und nach einem Neustart nicht offen bleibt.
+  cfg.oven.servoBaseAngle = 0;
+
   v = valueOf(text, "ovenPidKp");
   if (v.length()) cfg.oven.pidKp = v.toFloat();
 
@@ -839,6 +888,25 @@ bool loadConfig(ConfigData& cfg) {
 
   v = valueOf(text, "ovenPumpStopDropFromPeakC");
   if (v.length()) cfg.oven.pumpStopDropFromPeakC = v.toFloat();
+
+  v = valueOf(text, "ovenServoClosedAngle");
+  if (v.length()) cfg.oven.servoClosedAngle = (uint8_t)v.toInt();
+  v = valueOf(text, "ovenServoOpenAngle");
+  if (v.length()) cfg.oven.servoOpenAngle = (uint8_t)v.toInt();
+  v = valueOf(text, "ovenServoStandbyOpeningPercent");
+  if (v.length()) cfg.oven.servoStandbyOpeningPercent = (uint8_t)v.toInt();
+  v = valueOf(text, "ovenServoStartOpeningPercent");
+  if (v.length()) cfg.oven.servoStartOpeningPercent = (uint8_t)v.toInt();
+  v = valueOf(text, "ovenServoMinimumOpeningPercent");
+  if (v.length()) cfg.oven.servoMinimumOpeningPercent = (uint8_t)v.toInt();
+  v = valueOf(text, "ovenServoMaximumOpeningPercent");
+  if (v.length()) cfg.oven.servoMaximumOpeningPercent = (uint8_t)v.toInt();
+  v = valueOf(text, "ovenServoStepPercent");
+  if (v.length()) cfg.oven.servoStepPercent = (uint8_t)v.toInt();
+  v = valueOf(text, "ovenServoDeadbandC");
+  if (v.length()) cfg.oven.servoDeadbandC = v.toFloat();
+  v = valueOf(text, "ovenBurnoutVentMinutes");
+  if (v.length()) cfg.oven.burnoutVentMinutes = (uint16_t)v.toInt();
 
 
   for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
@@ -1053,10 +1121,18 @@ bool saveConfig(const ConfigData& cfg) {
   text += "auxHeaterTargetTemperatureC=" + String(cfg.auxHeater.targetTemperatureC, 2) + "\n";
   text += "auxHeaterHysteresisC=" + String(cfg.auxHeater.hysteresisC, 2) + "\n";
   text += "auxHeaterSinkRole=" + String(ds18RoleToInt(cfg.auxHeater.sinkRole)) + "\n";
-  text += "auxHeaterPumpRelay=" + String(cfg.auxHeater.pumpRelay) + "\n";
-  text += "auxHeaterRelay1=" + String(cfg.auxHeater.heaterRelay1) + "\n";
-  text += "auxHeaterRelay2=" + String(cfg.auxHeater.heaterRelay2) + "\n";
-  text += "auxHeaterRelay3=" + String(cfg.auxHeater.heaterRelay3) + "\n";
+  text += "auxHeaterPumpRelay=" + String((cfg.auxHeater.pumpOutput.kind == OutputKind::RELAY) ? cfg.auxHeater.pumpOutput.index : PIN_UNUSED) + "\n";
+  text += "auxHeaterPumpOutputKind=" + String((int)cfg.auxHeater.pumpOutput.kind) + "\n";
+  text += "auxHeaterPumpOutputIndex=" + String(cfg.auxHeater.pumpOutput.index) + "\n";
+  text += "auxHeaterRelay1=" + String((cfg.auxHeater.heaterOutput1.kind == OutputKind::RELAY) ? cfg.auxHeater.heaterOutput1.index : PIN_UNUSED) + "\n";
+  text += "auxHeaterRelay2=" + String((cfg.auxHeater.heaterOutput2.kind == OutputKind::RELAY) ? cfg.auxHeater.heaterOutput2.index : PIN_UNUSED) + "\n";
+  text += "auxHeaterRelay3=" + String((cfg.auxHeater.heaterOutput3.kind == OutputKind::RELAY) ? cfg.auxHeater.heaterOutput3.index : PIN_UNUSED) + "\n";
+  text += "auxHeaterOutput1Kind=" + String((int)cfg.auxHeater.heaterOutput1.kind) + "\n";
+  text += "auxHeaterOutput1Index=" + String(cfg.auxHeater.heaterOutput1.index) + "\n";
+  text += "auxHeaterOutput2Kind=" + String((int)cfg.auxHeater.heaterOutput2.kind) + "\n";
+  text += "auxHeaterOutput2Index=" + String(cfg.auxHeater.heaterOutput2.index) + "\n";
+  text += "auxHeaterOutput3Kind=" + String((int)cfg.auxHeater.heaterOutput3.kind) + "\n";
+  text += "auxHeaterOutput3Index=" + String(cfg.auxHeater.heaterOutput3.index) + "\n";
   text += "auxHeaterPreRunMs=" + String(cfg.auxHeater.preRunMs) + "\n";
   text += "auxHeaterCooldownMs=" + String(cfg.auxHeater.cooldownMs) + "\n";
 
@@ -1080,6 +1156,15 @@ bool saveConfig(const ConfigData& cfg) {
   text += "ovenAutoStartRiseC=" + String(cfg.oven.autoStartRiseC) + "\n";
   text += "ovenAutoReturnToStandbyTemperatureC=" + String(cfg.oven.autoReturnToStandbyTemperatureC) + "\n";
   text += "ovenPumpStopDropFromPeakC=" + String(cfg.oven.pumpStopDropFromPeakC) + "\n"; 
+  text += "ovenServoClosedAngle=" + String(cfg.oven.servoClosedAngle) + "\n";
+  text += "ovenServoOpenAngle=" + String(cfg.oven.servoOpenAngle) + "\n";
+  text += "ovenServoStandbyOpeningPercent=" + String(cfg.oven.servoStandbyOpeningPercent) + "\n";
+  text += "ovenServoStartOpeningPercent=" + String(cfg.oven.servoStartOpeningPercent) + "\n";
+  text += "ovenServoMinimumOpeningPercent=" + String(cfg.oven.servoMinimumOpeningPercent) + "\n";
+  text += "ovenServoMaximumOpeningPercent=" + String(cfg.oven.servoMaximumOpeningPercent) + "\n";
+  text += "ovenServoStepPercent=" + String(cfg.oven.servoStepPercent) + "\n";
+  text += "ovenServoDeadbandC=" + String(cfg.oven.servoDeadbandC) + "\n";
+  text += "ovenBurnoutVentMinutes=" + String(cfg.oven.burnoutVentMinutes) + "\n";
 
 
   

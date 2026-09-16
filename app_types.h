@@ -448,6 +448,21 @@ struct EnergyRouteReservation {
   // Legacy-/Diagnosefeld fuer bestehende Anzeigen/Logs bei Relaisventilen.
   uint8_t valveRelayIndex = PIN_UNUSED;
 };
+enum class OutputKind : uint8_t {
+  NONE = 0,
+  RELAY = 1,
+  PWM_OUTPUT = 2
+};
+
+struct OutputRef {
+  OutputKind kind = OutputKind::NONE;
+  uint8_t index = PIN_UNUSED;
+
+  OutputRef() = default;
+  OutputRef(OutputKind outputKind, uint8_t outputIndex)
+    : kind(outputKind), index(outputIndex) {}
+};
+
 //==========Heizstab/Elektrokessel========
 struct AuxHeaterConfig {
   bool enabled = false;
@@ -458,11 +473,20 @@ struct AuxHeaterConfig {
 
   Ds18Role sinkRole = Ds18Role::NONE;
 
-  uint8_t pumpRelay = 255;
+  // Legacy-Feld bleibt fuer bestehende system.cfg-Dateien erhalten.
+  // Neue Runtime/UI verwendet pumpOutput, damit die Zusatzheizungs-Pumpe auch auf PO-Schaltausgaengen liegen kann.
+  uint8_t pumpRelay = PIN_UNUSED;
+  OutputRef pumpOutput;
 
-  uint8_t heaterRelay1 = 255;
-  uint8_t heaterRelay2 = 255;
-  uint8_t heaterRelay3 = 255;
+  // Legacy-Felder bleiben fuer bestehende system.cfg-Dateien erhalten.
+  // Neue Runtime/UI verwendet heaterOutput1..3, damit Heizstaebe auch auf PO-Schaltausgaengen liegen koennen.
+  uint8_t heaterRelay1 = PIN_UNUSED;
+  uint8_t heaterRelay2 = PIN_UNUSED;
+  uint8_t heaterRelay3 = PIN_UNUSED;
+
+  OutputRef heaterOutput1;
+  OutputRef heaterOutput2;
+  OutputRef heaterOutput3;
 
   uint32_t preRunMs = 300000UL;
   uint32_t cooldownMs = 300000UL;
@@ -491,9 +515,27 @@ struct OvenConfig {
   float pumpOffTemperatureDifferenceC = 2.0f;
   float pumpStopDropFromPeakC = 5.0f;
 
-  uint8_t servoMinimumAngle = 0;
+  // Legacy-Winkel bleiben fuer bestehende Configs/API kompatibel, werden aber
+  // fuer die Luftklappenregelung nicht mehr direkt verwendet.
+  uint8_t servoMinimumAngle = 20;
   uint8_t servoMaximumAngle = 90;
-  uint8_t servoBaseAngle = 45;
+  uint8_t servoBaseAngle = 0;
+
+  // Luftklappen-Kalibrierung: Die Ofenlogik arbeitet in 0..100 % Oeffnung.
+  // Erst ganz am Ende wird daraus der echte Servo-Winkel berechnet.
+  uint8_t servoClosedAngle = 45;                 // Winkel bei 0 % Oeffnung
+  uint8_t servoOpenAngle = 135;                  // Winkel bei 100 % Oeffnung
+  uint8_t servoStandbyOpeningPercent = 0;        // Standby/Stop/Safety
+  uint8_t servoStartOpeningPercent = 100;        // Anheizen bis Zieltemperatur
+  uint8_t servoMinimumOpeningPercent = 20;       // kleinste Oeffnung im Regelbetrieb/Restglut
+  uint8_t servoMaximumOpeningPercent = 100;      // groesste Oeffnung im Regelbetrieb
+  uint8_t servoStepPercent = 5;                  // Schrittweite je Regelintervall
+  float servoDeadbandC = 3.0f;                   // Totband um Zieltemperatur ±K
+
+  // Ein einziger Zeitwert fuer Peak-Timeout und Abbrand-Nachlauf.
+  // Ablauf: X Minuten normale Servo-Regelung, danach X/2 Minuten minimale
+  // Regeloeffnung, danach Standby-/Safety-Oeffnung.
+  uint16_t burnoutVentMinutes = 10;
 
   float pidKp = 2.0f;
   float pidKi = 0.02f;
@@ -502,22 +544,11 @@ struct OvenConfig {
 
 
 // ===================== Heizkreise / Mischer =====================
-enum class OutputKind : uint8_t {
-  NONE = 0,
-  RELAY = 1,
-  PWM_OUTPUT = 2
-};
-
 enum class ValvePosition : uint8_t {
   A = 0,
   B = 1
 };
 
-
-struct OutputRef {
-  OutputKind kind = OutputKind::NONE;
-  uint8_t index = PIN_UNUSED;
-};
 
 struct ValveConfig {
   bool enabled = false;
@@ -568,8 +599,14 @@ struct HeatingCircuitConfig {
   float maximumFlowTemperatureC = 55.0f;
   float minimumFlowTemperatureC = 20.0f;
 
+  bool roomControlEnabled = false;
   float roomTargetTemperatureC = 21.0f;
   float roomInfluenceK = 3.0f;
+
+  // PWM-Heizkreispumpe: Regelung nach Spreizung Vorlauf/Ruecklauf.
+  // Die Hardware/PWM-Ausgaenge bleiben zentral im Pumpenmenue.
+  float pumpTargetDeltaC = 5.0f;
+  float pumpFullDeltaC = 12.0f;
 
   // einfache Heizkurve: Soll-Vorlauf = base + slope * (20 - Aussentemperatur)
   float heatingCurveBaseC = 25.0f;
@@ -591,9 +628,11 @@ struct HeatingCircuitRuntime {
   bool closing = false;
   float flowTemperatureC = NAN;
   float returnTemperatureC = NAN;
+  float spreadTemperatureC = NAN;
   float roomTemperatureC = NAN;
   float outsideTemperatureC = NAN;
   float targetFlowTemperatureC = NAN;
+  uint8_t pumpPercent = 0;
   int16_t estimatedMixerPositionPercent = 50;
   uint32_t lastMixerActionMs = 0;
 };
@@ -722,6 +761,19 @@ struct AppContext {
 
   bool sdAvailable = false;
   bool pumpWasEnabled = false;
+
+  bool networkInitialized = false;
+  bool networkApActive = false;
+  bool networkStaConfigured = false;
+  bool networkStaConnected = false;
+  bool networkStaConnectAttemptActive = false;
+  bool networkStaEverConnected = false;
+  uint8_t networkWifiMode = 0;
+  uint8_t networkStaStatus = 0;
+  int32_t networkStaRssi = 0;
+  uint32_t networkLastStaReconnectAttemptMs = 0;
+  uint32_t networkStaConnectedSinceMs = 0;
+  uint32_t networkStaDisconnectedSinceMs = 0;
 
   uint32_t stateEnteredAtMs = 0;
   uint32_t lastSampleAtMs = 0;

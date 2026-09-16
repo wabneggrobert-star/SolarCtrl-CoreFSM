@@ -12,5 +12,17 @@ namespace Pumps {
   bool safetyForceHeatDumpForSource(AppContext& ctx, HeatSourceRole sourceRole, float pwmPercent);
   bool safetyForceNightCooling(AppContext& ctx, float pwmPercent);
 
+  // Spezialanforderung der Ofenlogik: Die Pumpe wird weiterhin im Pumpenmenue
+  // konfiguriert. Das Ofenmodul entscheidet nur, ob Waerme abgefuehrt werden soll.
+  // Diese Funktion setzt den passend konfigurierten Pumpenausgang und ggf. den
+  // PWM-Kanal gemaess Pumpenmenue.
+  bool applyOvenPumpRequest(AppContext& ctx, bool run, float ovenTemperatureC, float targetTemperatureC, bool targetValid);
+  int8_t configuredOvenPumpIndex(const AppContext& ctx);
+
+  // Heizkreispumpen werden zentral im Pumpenmenue konfiguriert.
+  // Eine Pumpe gehoert zu HKx, wenn Quelle = HKx Vorlauf und Ziel = HKx Ruecklauf ist.
+  int8_t configuredHeatingCircuitPumpIndex(const AppContext& ctx, uint8_t circuitIndex);
+  bool applyHeatingCircuitPumpRequest(AppContext& ctx, uint8_t circuitIndex, bool run, uint8_t percent, float flowTemperatureC, float returnTemperatureC, bool returnValid);
+
 
 }

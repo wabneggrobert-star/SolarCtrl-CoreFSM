@@ -9,6 +9,8 @@ namespace {
   Adafruit_PWMServoDriver g_pwm = Adafruit_PWMServoDriver(PCA9685_ADDR);
   bool g_started = false;
   uint8_t g_dutyPercent[16] = {0};
+  uint8_t g_effectivePercent[16] = {0};
+  bool g_effectiveValid[16] = {false};
 
   uint16_t dutyPercentToCounts(uint8_t percent) {
     if (percent >= 100) return 4095;
@@ -38,8 +40,17 @@ bool begin() {
   g_pwm.setPWMFreq(PCA9685_PWM_FREQ);
   delay(10);
 
+  for (uint8_t ch = 0; ch < 16; ch++) {
+    g_dutyPercent[ch] = 0;
+    g_effectivePercent[ch] = 0;
+    g_effectiveValid[ch] = false;
+  }
+
   g_started = true;
-  allOff();
+
+  // Noch keinen Pegel anhand eines geratenen Profils setzen. Der Aufrufer
+  // hat zu diesem Zeitpunkt bereits die Config geladen und ruft direkt
+  // danach allOff(config) mit den echten SOLAR-/HEATING-Profilen auf.
 
   Serial.print("PCA9685 PWM begin 0x");
   Serial.print(PCA9685_ADDR, HEX);
@@ -63,8 +74,19 @@ void setDuty(uint8_t channel, uint8_t percent, PwmProfile profile) {
   g_dutyPercent[channel] = percent;
 
   // HEATING = direkte Logik, SOLAR = elektrisch invertiert.
-  // Falls deine Platine genau umgekehrt reagiert, nur diese Zeile tauschen.
+  // SOLAR: logisch EIN/100% ergibt physikalisch 0%/LOW.
   uint8_t effectivePercent = (profile == PwmProfile::SOLAR) ? (100 - percent) : percent;
+
+  // Wichtiger Schutz fuer Schaltausgaenge: Wenn derselbe physikalische
+  // Sollwert bereits am PCA9685 anliegt, nicht erneut schreiben. Damit kann
+  // die Runtime ihren Sollzustand zyklisch bestaetigen, ohne alle paar
+  // Sekunden einen Schaltimpuls/Takt am Ausgang zu erzeugen.
+  if (g_effectiveValid[channel] && g_effectivePercent[channel] == effectivePercent) {
+    return;
+  }
+
+  g_effectivePercent[channel] = effectivePercent;
+  g_effectiveValid[channel] = true;
 
   if (effectivePercent == 0) {
     g_pwm.setPWM(channel, 0, 0);
@@ -92,7 +114,28 @@ uint8_t getDuty(uint8_t channel) {
 void allOff() {
   if (!g_started) return;
 
+  // Boot-Fallback, solange die SD-Konfiguration noch nicht geladen ist.
+  // Im laufenden System immer allOff(config) verwenden.
   for (uint8_t ch = 0; ch < 16; ch++) {
+    setDuty(ch, 0, PwmProfile::SOLAR);
+  }
+}
+
+void allOff(const ConfigData& config) {
+  if (!g_started) return;
+
+  // Jeder verwendbare PO-Kanal wird logisch AUS geschaltet. Die elektrische
+  // Pegellage ergibt sich aus dem jeweiligen Profil:
+  //   SOLAR   -> logisch AUS = physikalisch 100 % / HIGH
+  //   HEATING -> logisch AUS = physikalisch   0 % / LOW
+  // Damit ist ein globales All-Off nicht mehr auf ein einziges Profil festgelegt.
+  for (uint8_t ch = 0; ch < PWM_OUTPUT_COUNT; ch++) {
+    setDuty(ch, 0, config.pwmOutputs[ch].profile);
+  }
+
+  // Nicht konfigurierte PCA-Kanaele ausserhalb des aktuell freigegebenen
+  // PO-Bereichs behalten den bisherigen Boot-Fallback.
+  for (uint8_t ch = PWM_OUTPUT_COUNT; ch < 16; ch++) {
     setDuty(ch, 0, PwmProfile::SOLAR);
   }
 }

@@ -40,7 +40,10 @@ bool begin() {
     g_initialized = true;
   }
 
-  close();
+  // Keine rohe 0-Grad-Stellung erzwingen. Die fachlich sichere Stellung
+  // gehoert zur Ofenkalibrierung (0 % Oeffnung -> servoClosedAngle) und wird
+  // direkt danach von OvenControl gesetzt. So gibt es auch beim Start keinen
+  // kurzen Sprung ausserhalb des kalibrierten Arbeitsbereichs.
 
   Serial.print("ServoDriver::begin OK GPIO");
   Serial.println(OVEN_SERVO_PIN);

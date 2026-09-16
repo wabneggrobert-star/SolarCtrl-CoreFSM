@@ -16,6 +16,9 @@ private:
   AppContext ctx_;
 
   void changeState(SystemState next);
+  void ensureSoftAp();
+  void startStaConnect();
+  void serviceNetwork();
 
   void stateInitHw();
   void stateInitSd();

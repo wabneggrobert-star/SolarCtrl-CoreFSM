@@ -16,6 +16,7 @@
 #include "feature_servo_driver.h"
 #include "feature_valves.h"
 #include "feature_pump_routing.h"
+#include "feature_pumps.h"
 #include "feature_heating_circuits.h"
 #include "feature_heat_sources_max31865.h"
 #include "feature_alarms.h"
@@ -70,6 +71,8 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
   static uint32_t s_commissioningTestUntilMs = 0;
   static constexpr uint32_t COMMISSIONING_TEST_TIMEOUT_MS = 10UL * 60UL * 1000UL;
 
+  void allOutputsOffSafe();
+
   void activateCommissioningTestMode() {
     g_commissioningTestActive = true;
     g_commissioningTestStartedMs = millis();
@@ -80,16 +83,29 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
   }
 
   void deactivateCommissioningTestMode() {
-    if (s_ctx) {
-      RelayOutputs::allOff(*s_ctx);
+    // Wichtig: Nur der echte aktive Testmodus darf beim Beenden Ausgänge abschalten.
+    // Einige Browser/Seiten senden beim Verlassen vorsorglich active=0. Wenn der
+    // Testmodus dabei gar nicht aktiv war, darf das den Automatikbetrieb nicht stören.
+    if (!g_commissioningTestActive) {
+      g_commissioningTestStartedMs = 0;
+      s_commissioningTestUntilMs = 0;
+      return;
     }
-    PwmDriver::allOff();
+
+    allOutputsOffSafe();
+
+    // Die Zusatzheizung cached ihre zuletzt gesetzten Sollzustaende. Da der
+    // Testmodus Ausgaenge direkt ueberschreiben darf, muss dieser Cache beim
+    // Ruecksprung in den Automatikbetrieb verworfen werden. Sonst kann die
+    // Logik z. B. weiterhin "Pumpe EIN" glauben, obwohl das Test-All-Off den
+    // realen Ausgang gerade ausgeschaltet hat.
+    AuxHeater::resumeAfterTestMode();
 
     g_commissioningTestActive = false;
     g_commissioningTestStartedMs = 0;
     s_commissioningTestUntilMs = 0;
 
-    Serial.println("INBETRIEBNAHME TESTMODUS AUS - ALLE AUSGAENGE AUS");
+    Serial.println("INBETRIEBNAHME TESTMODUS AUS - TESTAUSGAENGE AUS, AUTOMATIK NEU BEWERTET");
     Serial.flush();
   }
 
@@ -110,6 +126,7 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
   String jsonFloat(float v, uint8_t decimals);
   String jsonEscape(const char* value);
   String ipToString(const IPAddress& ip);
+  String wifiStatusToText(wl_status_t status);
   void handleAlarmsJson();
   void handleAlarmsAck();
   void handleAlarmsClearHistory();
@@ -190,6 +207,14 @@ void handleStatusJson() {
   json += "\"faultText\":\"" + String(s_ctx->diag.faultText) + "\",";
   json += "\"activeSinkRole\":\"" + activeSinkKey + "\",";
   json += "\"activeSink\":\"" + activeSinkLabel + "\"";
+  json += ",\"ovenEnabled\":" + String(s_ctx->config.oven.enabled ? "true" : "false");
+  json += ",\"ovenActive\":" + String(OvenControl::active() ? "true" : "false");
+  json += ",\"ovenSafety\":" + String(SafetyManager::status().ovenOvertemperatureActive ? "true" : "false");
+  json += ",\"ovenState\":\"" + String(OvenControl::stateText()) + "\"";
+  json += ",\"ovenTemperatureC\":" + jsonFloat(OvenControl::ovenTemperatureC(), 1);
+  json += ",\"ovenServoAngle\":" + String(OvenControl::servoAngle());
+  json += ",\"ovenServoOpeningPercent\":" + String(OvenControl::servoOpeningPercent());
+  json += ",\"ovenPumpActive\":" + String(OvenControl::pumpActive() ? "true" : "false");
   json += "}";
 
   server.send(200, "application/json", json);
@@ -204,9 +229,18 @@ void handleDs18b20Json() {
     return;
   }
 
-  SinkSensor::refreshInventoryTemps(s_ctx->ds18b20);
+  const bool doScan = server.hasArg("scan") && server.arg("scan") == "1";
+  if (doScan) {
+    SinkSensor::scanBus(s_ctx->ds18b20);
+  } else {
+    SinkSensor::refreshInventoryTemps(s_ctx->ds18b20);
+  }
 
-  String json = "{ \"devices\": [";
+  String json = "{";
+  json += "\"count\":" + String(s_ctx->ds18b20.count) + ",";
+  json += "\"max\":" + String(MAX_DS18B20_SENSORS) + ",";
+  json += "\"scanned\":" + String(doScan ? "true" : "false") + ",";
+  json += "\"devices\": [";
 
   for (uint8_t i = 0; i < s_ctx->ds18b20.count; i++) {
     if (i > 0) json += ",";
@@ -285,8 +319,30 @@ void handleAssignmentsJson() {
 
     Ds18Role role = SensorRoles::fromKey(roleKey);
 
-    if (role == Ds18Role::NONE || !SensorRoles::isAssignable(role)) {
+    if (!SensorRoles::isAssignable(role)) {
       server.send(400, "text/plain", "Ungueltige oder fuer DS18 nicht erlaubte Rolle");
+      return;
+    }
+
+    // Rolle "none" bedeutet: diesen Sensor aus der Rollentabelle entfernen.
+    // Gleichzeitig erlauben wir das Umlegen eines Sensors von z.B. Puffer Top
+    // auf HK1 Vorlauf ohne vorherigen Werksreset.
+    Ds18Role oldRoleForAddress = Ds18Role::NONE;
+    for (uint8_t i = 0; i < s_ctx->assignments.count; i++) {
+      const Ds18RoleAssignment& existing = s_ctx->assignments.items[i];
+      if (!existing.assigned) continue;
+      if (String(existing.addressText) == address) {
+        oldRoleForAddress = existing.role;
+        break;
+      }
+    }
+
+    if (role == Ds18Role::NONE) {
+      if (oldRoleForAddress != Ds18Role::NONE) {
+        SensorAssignments::removeRole(s_ctx->assignments, oldRoleForAddress);
+      }
+      Storage::saveSensorAssignments(s_ctx->assignments);
+      server.send(200, "text/plain", "OK");
       return;
     }
 
@@ -298,11 +354,10 @@ void handleAssignmentsJson() {
         server.send(409, "text/plain", "Diese Sensorrolle ist bereits einem anderen DS18B20 zugeordnet");
         return;
       }
+    }
 
-      if (String(existing.addressText) == address && existing.role != role) {
-        server.send(409, "text/plain", "Dieser DS18B20 ist bereits einer anderen Rolle zugeordnet");
-        return;
-      }
+    if (oldRoleForAddress != Ds18Role::NONE && oldRoleForAddress != role) {
+      SensorAssignments::removeRole(s_ctx->assignments, oldRoleForAddress);
     }
 
     if (!SensorAssignments::assignRoleByAddressText(
@@ -573,15 +628,26 @@ void handleNetworkJson() {
     return;
   }
 
-  const bool staConnected = (WiFi.status() == WL_CONNECTED);
+  const wl_status_t staStatus = WiFi.status();
+  const bool staConnected = (staStatus == WL_CONNECTED);
+  const bool apActive = s_ctx->networkApActive || !(WiFi.softAPIP()[0] == 0 && WiFi.softAPIP()[1] == 0 && WiFi.softAPIP()[2] == 0 && WiFi.softAPIP()[3] == 0);
   String json = "{";
   json += "\"apSsid\":\"" + jsonEscape(s_ctx->config.apName) + "\",";
+  json += "\"apActive\":" + String(apActive ? "true" : "false") + ",";
   json += "\"apIp\":\"" + ipToString(WiFi.softAPIP()) + "\",";
+  json += "\"wifiMode\":" + String((int)WiFi.getMode()) + ",";
   json += "\"staEnabled\":" + String(s_ctx->config.staEnabled ? "true" : "false") + ",";
+  json += "\"staConfigured\":" + String(s_ctx->networkStaConfigured ? "true" : "false") + ",";
   json += "\"staSsid\":\"" + jsonEscape(s_ctx->config.staSsid) + "\",";
   json += "\"staConnected\":" + String(staConnected ? "true" : "false") + ",";
+  json += "\"staStatus\":" + String((int)staStatus) + ",";
+  json += "\"staStatusText\":\"" + jsonEscape(wifiStatusToText(staStatus).c_str()) + "\",";
   json += "\"staIp\":\"" + String(staConnected ? ipToString(WiFi.localIP()) : "") + "\",";
   json += "\"staRssi\":" + String(staConnected ? String(WiFi.RSSI()) : "null") + ",";
+  json += "\"staEverConnected\":" + String(s_ctx->networkStaEverConnected ? "true" : "false") + ",";
+  json += "\"staReconnectActive\":" + String(s_ctx->networkStaConnectAttemptActive ? "true" : "false") + ",";
+  json += "\"lastStaReconnectAttemptMs\":" + String(s_ctx->networkLastStaReconnectAttemptMs) + ",";
+  json += "\"staDisconnectedSinceMs\":" + String(s_ctx->networkStaDisconnectedSinceMs) + ",";
   json += "\"hostName\":\"" + jsonEscape(s_ctx->config.hostName) + "\",";
   json += "\"macSta\":\"" + WiFi.macAddress() + "\",";
   json += "\"macAp\":\"" + WiFi.softAPmacAddress() + "\"";
@@ -801,11 +867,73 @@ bool outputRefAssigned(OutputKind kind, uint8_t index) {
   return kind != OutputKind::NONE && index != PIN_UNUSED;
 }
 
+uint8_t clampToUint8(int value, int minimum, int maximum) {
+  if (value < minimum) return (uint8_t)minimum;
+  if (value > maximum) return (uint8_t)maximum;
+  return (uint8_t)value;
+}
+
+String outputRefValue(OutputKind kind, uint8_t index) {
+  if (!outputRefAssigned(kind, index)) return "none:255";
+  return outputRefKindToKey(kind) + ":" + String(index);
+}
+
+Ds18Role heatingCircuitFlowRole(uint8_t circuitIndex) {
+  switch (circuitIndex) {
+    case 0: return Ds18Role::HK1_FLOW;
+    case 1: return Ds18Role::HK2_FLOW;
+    case 2: return Ds18Role::HK3_FLOW;
+    case 3: return Ds18Role::HK4_FLOW;
+    default: return Ds18Role::NONE;
+  }
+}
+
+Ds18Role heatingCircuitReturnRole(uint8_t circuitIndex) {
+  switch (circuitIndex) {
+    case 0: return Ds18Role::HK1_RETURN;
+    case 1: return Ds18Role::HK2_RETURN;
+    case 2: return Ds18Role::HK3_RETURN;
+    case 3: return Ds18Role::HK4_RETURN;
+    default: return Ds18Role::NONE;
+  }
+}
+
+int8_t heatingCircuitRouteIndex(const PumpConfig& pump) {
+  if (pump.sourceType != PumpSourceType::SENSOR_ROLE) return -1;
+  for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+    if (pump.sourceSensorRole == heatingCircuitFlowRole(i) &&
+        pump.sinkRole == heatingCircuitReturnRole(i)) {
+      return (int8_t)i;
+    }
+  }
+  return -1;
+}
+
+int8_t partialHeatingCircuitRouteIndex(const PumpConfig& pump) {
+  if (pump.sourceType != PumpSourceType::SENSOR_ROLE) return -1;
+
+  for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+    if (pump.sourceSensorRole == heatingCircuitFlowRole(i) ||
+        pump.sinkRole == heatingCircuitReturnRole(i)) {
+      return (int8_t)i;
+    }
+  }
+  return -1;
+}
+
 bool sameOutputRef(OutputKind aKind, uint8_t aIndex, OutputKind bKind, uint8_t bIndex) {
   return outputRefAssigned(aKind, aIndex) &&
          outputRefAssigned(bKind, bIndex) &&
          aKind == bKind &&
          aIndex == bIndex;
+}
+
+OutputRef ovenPumpOutputRef(const OvenConfig& oven) {
+  // Legacy: direkte Ofenpumpe ist abgeloest. Echte Ofenpumpe wird im Pumpenmenue
+  // als Pumpe mit Quelle Ofen konfiguriert. Diese Funktion dient nur noch dazu,
+  // einen alten Relay-Ausgang beim Speichern freizugeben.
+  if (oven.pumpRelay != PIN_UNUSED) return OutputRef{OutputKind::RELAY, oven.pumpRelay};
+  return OutputRef{};
 }
 
 bool outputExistsAndMatchesFunction(const AppContext& ctx, OutputKind kind, uint8_t index, RelayFunction requiredFunction, bool allowPwmMode) {
@@ -844,11 +972,28 @@ bool outputIsUsedByHeatingCircuit(const AppContext& ctx, OutputKind kind, uint8_
       usage = "HK" + String(i + 1) + " Mischer ZU";
       return true;
     }
-    if (sameOutputRef(hk.pumpOutput.kind, hk.pumpOutput.index, kind, index)) {
-      usage = "HK" + String(i + 1) + " Pumpe";
-      return true;
-    }
+    // Heizkreis-Pumpen werden ab jetzt zentral im Pumpenmenue belegt.
+    // Alte hk.pumpOutput-Felder bleiben nur zur Migration/Freigabe erhalten
+    // und duerfen keine Ausgangsbelegung mehr blockieren.
   }
+  return false;
+}
+
+bool outputIsUsedByAuxHeater(const AppContext& ctx, OutputKind kind, uint8_t index, String& usage) {
+  if (!outputRefAssigned(kind, index)) return false;
+
+  const AuxHeaterConfig& aux = ctx.config.auxHeater;
+  if (!aux.enabled) return false;
+
+  if (sameOutputRef(aux.pumpOutput.kind, aux.pumpOutput.index, kind, index)) {
+    usage = "Zusatzheizung Pumpe";
+    return true;
+  }
+
+  if (sameOutputRef(aux.heaterOutput1.kind, aux.heaterOutput1.index, kind, index)) { usage = "Zusatzheizung Heizstab 1"; return true; }
+  if (sameOutputRef(aux.heaterOutput2.kind, aux.heaterOutput2.index, kind, index)) { usage = "Zusatzheizung Heizstab 2"; return true; }
+  if (sameOutputRef(aux.heaterOutput3.kind, aux.heaterOutput3.index, kind, index)) { usage = "Zusatzheizung Heizstab 3"; return true; }
+
   return false;
 }
 
@@ -869,17 +1014,14 @@ bool outputIsUsedByLegacyConsumers(const AppContext& ctx, OutputKind kind, uint8
 
     const AuxHeaterConfig& aux = ctx.config.auxHeater;
     if (!ignoreAuxHeater && aux.enabled) {
-      if (aux.pumpRelay == index) { usage = "Zusatzheizung Pumpe"; return true; }
-      if (aux.heaterRelay1 == index) { usage = "Zusatzheizung Heizstab 1"; return true; }
-      if (aux.heaterRelay2 == index) { usage = "Zusatzheizung Heizstab 2"; return true; }
-      if (aux.heaterRelay3 == index) { usage = "Zusatzheizung Heizstab 3"; return true; }
+      if (sameOutputRef(aux.pumpOutput.kind, aux.pumpOutput.index, kind, index)) { usage = "Zusatzheizung Pumpe"; return true; }
+      if (sameOutputRef(aux.heaterOutput1.kind, aux.heaterOutput1.index, kind, index)) { usage = "Zusatzheizung Heizstab 1"; return true; }
+      if (sameOutputRef(aux.heaterOutput2.kind, aux.heaterOutput2.index, kind, index)) { usage = "Zusatzheizung Heizstab 2"; return true; }
+      if (sameOutputRef(aux.heaterOutput3.kind, aux.heaterOutput3.index, kind, index)) { usage = "Zusatzheizung Heizstab 3"; return true; }
     }
 
-    const OvenConfig& oven = ctx.config.oven;
-    if (!ignoreOven && oven.enabled && oven.pumpRelay == index) {
-      usage = "Ofenpumpe";
-      return true;
-    }
+    // Ofenpumpe wird nicht mehr direkt im Ofenmodul belegt, sondern als
+    // normale Pumpe mit Quelle "Ofen" im Pumpenmenue.
   }
 
   if (kind == OutputKind::PWM_OUTPUT) {
@@ -892,6 +1034,17 @@ bool outputIsUsedByLegacyConsumers(const AppContext& ctx, OutputKind kind, uint8
         return true;
       }
     }
+
+    const AuxHeaterConfig& aux = ctx.config.auxHeater;
+    if (!ignoreAuxHeater && aux.enabled) {
+      if (sameOutputRef(aux.pumpOutput.kind, aux.pumpOutput.index, kind, index)) { usage = "Zusatzheizung Pumpe"; return true; }
+      if (sameOutputRef(aux.heaterOutput1.kind, aux.heaterOutput1.index, kind, index)) { usage = "Zusatzheizung Heizstab 1"; return true; }
+      if (sameOutputRef(aux.heaterOutput2.kind, aux.heaterOutput2.index, kind, index)) { usage = "Zusatzheizung Heizstab 2"; return true; }
+      if (sameOutputRef(aux.heaterOutput3.kind, aux.heaterOutput3.index, kind, index)) { usage = "Zusatzheizung Heizstab 3"; return true; }
+    }
+
+    // Ofenpumpe wird nicht mehr direkt im Ofenmodul belegt, sondern als
+    // normale Pumpe mit Quelle "Ofen" im Pumpenmenue.
   }
 
   return false;
@@ -933,7 +1086,9 @@ bool validatePwmOutputModeChange(const AppContext& ctx, uint8_t index, const Pwm
 
   const bool usedAsSwitchOutput =
       outputIsUsedByHeatingCircuit(ctx, OutputKind::PWM_OUTPUT, index, -1, usage) ||
-      outputIsUsedByValves(ctx, OutputKind::PWM_OUTPUT, index, -1, usage);
+      outputIsUsedByValves(ctx, OutputKind::PWM_OUTPUT, index, -1, usage) ||
+      outputIsUsedByAuxHeater(ctx, OutputKind::PWM_OUTPUT, index, usage) ||
+      outputIsUsedByLegacyConsumers(ctx, OutputKind::PWM_OUTPUT, index, -1, usage, true, false);
 
   if (usedAsSwitchOutput) {
     if (!candidate.enabled ||
@@ -946,7 +1101,7 @@ bool validatePwmOutputModeChange(const AppContext& ctx, uint8_t index, const Pwm
   }
 
   if ((!candidate.enabled || candidate.mode == PwmOutputMode::SWITCH) &&
-      outputIsUsedByLegacyConsumers(ctx, OutputKind::PWM_OUTPUT, index, -1, usage)) {
+      outputIsUsedByLegacyConsumers(ctx, OutputKind::PWM_OUTPUT, index, -1, usage, true, false)) {
     server.send(409, "text/plain", pwmOutputHardwareLabel(index) + " ist bereits als PWM-Ausgang belegt: " + usage);
     return false;
   }
@@ -984,18 +1139,6 @@ bool validateHeatingCircuitOutputConfig(const AppContext& ctx, const HeatingCirc
     return false;
   }
 
-  if (sameOutputRef(candidate.mixerOpenOutput.kind, candidate.mixerOpenOutput.index,
-                    candidate.pumpOutput.kind, candidate.pumpOutput.index)) {
-    server.send(409, "text/plain", "Mischer AUF und Heizkreispumpe dürfen nicht derselbe Ausgang sein");
-    return false;
-  }
-
-  if (sameOutputRef(candidate.mixerCloseOutput.kind, candidate.mixerCloseOutput.index,
-                    candidate.pumpOutput.kind, candidate.pumpOutput.index)) {
-    server.send(409, "text/plain", "Mischer ZU und Heizkreispumpe dürfen nicht derselbe Ausgang sein");
-    return false;
-  }
-
   if (!outputExistsAndMatchesFunction(ctx, candidate.mixerOpenOutput.kind, candidate.mixerOpenOutput.index, RelayFunction::MIXER, false)) {
     server.send(409, "text/plain", "Mischer AUF muss ein Ausgang mit Funktion Mischer sein");
     return false;
@@ -1006,24 +1149,8 @@ bool validateHeatingCircuitOutputConfig(const AppContext& ctx, const HeatingCirc
     return false;
   }
 
-  if (candidate.pumpMode == HeatingCircuitPumpMode::SWITCHED &&
-      !outputExistsAndMatchesFunction(ctx, candidate.pumpOutput.kind, candidate.pumpOutput.index, RelayFunction::PUMP_ENABLE, false)) {
-    server.send(409, "text/plain", "Schaltpumpe muss ein Ausgang mit Funktion Pump Enable sein");
-    return false;
-  }
-
-  if (candidate.pumpMode == HeatingCircuitPumpMode::PWM &&
-      !(candidate.pumpOutput.kind == OutputKind::PWM_OUTPUT &&
-        candidate.pumpOutput.index < PWM_OUTPUT_COUNT &&
-        ctx.config.pwmOutputs[candidate.pumpOutput.index].enabled &&
-        ctx.config.pwmOutputs[candidate.pumpOutput.index].mode == PwmOutputMode::PWM)) {
-    server.send(409, "text/plain", "PWM-Pumpe muss einen PO-Ausgang im Modus PWM verwenden");
-    return false;
-  }
-
   if (!validateSingleOutputFreeForUse(ctx, candidate.mixerOpenOutput.kind, candidate.mixerOpenOutput.index, "HK" + String(circuitIndex + 1) + " Mischer AUF", circuitIndex)) return false;
   if (!validateSingleOutputFreeForUse(ctx, candidate.mixerCloseOutput.kind, candidate.mixerCloseOutput.index, "HK" + String(circuitIndex + 1) + " Mischer ZU", circuitIndex)) return false;
-  if (!validateSingleOutputFreeForUse(ctx, candidate.pumpOutput.kind, candidate.pumpOutput.index, "HK" + String(circuitIndex + 1) + " Pumpe", circuitIndex)) return false;
 
   return true;
 }
@@ -1035,45 +1162,45 @@ bool validateAuxHeaterOutputConfig(const AppContext& ctx, const AuxHeaterConfig&
     return true;
   }
 
-  if (candidate.pumpRelay != PIN_UNUSED) {
-    if (!outputExistsAndMatchesFunction(ctx, OutputKind::RELAY, candidate.pumpRelay, RelayFunction::PUMP_ENABLE, false)) {
-      server.send(409, "text/plain", "Zusatzheizung-Pumpe muss ein Ausgang mit Funktion Pump Enable sein");
+  if (outputRefAssigned(candidate.pumpOutput.kind, candidate.pumpOutput.index)) {
+    if (!outputExistsAndMatchesFunction(ctx, candidate.pumpOutput.kind, candidate.pumpOutput.index, RelayFunction::PUMP_ENABLE, false)) {
+      server.send(409, "text/plain", "Zusatzheizung-Pumpe muss ein Ausgang mit Funktion Pump Enable sein. Bei PO-Ausgaengen muss der Modus Schaltausgang sein.");
       return false;
     }
-    if (!validateSingleOutputFreeForUse(ctx, OutputKind::RELAY, candidate.pumpRelay,
+    if (!validateSingleOutputFreeForUse(ctx, candidate.pumpOutput.kind, candidate.pumpOutput.index,
                                         "Zusatzheizung Pumpe", -1, -1, true, false)) {
       return false;
     }
   }
 
-  const uint8_t heaterRelays[3] = {
-    candidate.heaterRelay1,
-    candidate.heaterRelay2,
-    candidate.heaterRelay3
+  const OutputRef heaterOutputs[3] = {
+    candidate.heaterOutput1,
+    candidate.heaterOutput2,
+    candidate.heaterOutput3
   };
 
   for (uint8_t i = 0; i < 3; i++) {
-    const uint8_t relay = heaterRelays[i];
-    if (relay == PIN_UNUSED) continue;
+    const OutputRef& out = heaterOutputs[i];
+    if (!outputRefAssigned(out.kind, out.index)) continue;
 
-    if (!outputExistsAndMatchesFunction(ctx, OutputKind::RELAY, relay, RelayFunction::HEATER_ROD, false)) {
-      server.send(409, "text/plain", "Heizstab Stufe " + String(i + 1) + " muss ein Ausgang mit Funktion Heizstab sein");
+    if (!outputExistsAndMatchesFunction(ctx, out.kind, out.index, RelayFunction::HEATER_ROD, false)) {
+      server.send(409, "text/plain", "Heizstab Stufe " + String(i + 1) + " muss ein Ausgang mit Funktion Heizstab sein. Bei PO-Ausgaengen muss der Modus Schaltausgang sein.");
       return false;
     }
 
     for (uint8_t j = i + 1; j < 3; j++) {
-      if (relay == heaterRelays[j] && heaterRelays[j] != PIN_UNUSED) {
+      if (sameOutputRef(out.kind, out.index, heaterOutputs[j].kind, heaterOutputs[j].index)) {
         server.send(409, "text/plain", "Heizstab-Ausgaenge duerfen nicht doppelt verwendet werden");
         return false;
       }
     }
 
-    if (candidate.pumpRelay != PIN_UNUSED && relay == candidate.pumpRelay) {
+    if (sameOutputRef(out.kind, out.index, candidate.pumpOutput.kind, candidate.pumpOutput.index)) {
       server.send(409, "text/plain", "Zusatzheizung-Pumpe und Heizstab duerfen nicht derselbe Ausgang sein");
       return false;
     }
 
-    if (!validateSingleOutputFreeForUse(ctx, OutputKind::RELAY, relay,
+    if (!validateSingleOutputFreeForUse(ctx, out.kind, out.index,
                                         "Zusatzheizung Heizstab " + String(i + 1),
                                         -1, -1, true, false)) {
       return false;
@@ -1084,26 +1211,13 @@ bool validateAuxHeaterOutputConfig(const AppContext& ctx, const AuxHeaterConfig&
 }
 
 bool validateOvenOutputConfig(const AppContext& ctx, const OvenConfig& candidate) {
-  if (!candidate.enabled) {
-    return true;
-  }
-
-  if (candidate.pumpRelay == PIN_UNUSED) {
-    return true;
-  }
-
-  if (!outputExistsAndMatchesFunction(ctx, OutputKind::RELAY, candidate.pumpRelay, RelayFunction::PUMP_ENABLE, false)) {
-    server.send(409, "text/plain", "Ofenpumpenrelais muss als Pump Enable konfiguriert sein");
-    return false;
-  }
-
-  if (!validateSingleOutputFreeForUse(ctx, OutputKind::RELAY, candidate.pumpRelay,
-                                      "Ofenpumpe", -1, -1, false, true)) {
-    return false;
-  }
-
+  (void)ctx;
+  (void)candidate;
+  // Die Ofenpumpe wird ab diesem Stand im Pumpenmenue als Pumpe mit Quelle
+  // "Ofen" konfiguriert. Das Ofenmenue validiert keine eigene Ausgangsbelegung mehr.
   return true;
 }
+
 
   void handleRelayConfig() {
     if (!serviceSessionValid()) {
@@ -1268,6 +1382,19 @@ bool validateOvenOutputConfig(const AppContext& ctx, const OvenConfig& candidate
 
   String ipToString(const IPAddress& ip) {
     return String(ip[0]) + "." + String(ip[1]) + "." + String(ip[2]) + "." + String(ip[3]);
+  }
+
+
+  String wifiStatusToText(wl_status_t status) {
+    switch (status) {
+      case WL_CONNECTED: return "verbunden";
+      case WL_NO_SSID_AVAIL: return "SSID nicht gefunden";
+      case WL_CONNECT_FAILED: return "Verbindung fehlgeschlagen";
+      case WL_CONNECTION_LOST: return "Verbindung verloren";
+      case WL_DISCONNECTED: return "getrennt";
+      case WL_IDLE_STATUS: return "wartet";
+      default: return String("Status ") + String((int)status);
+    }
   }
 
   String feedbackInputLabel(uint8_t ordinal, uint8_t gpio) {
@@ -1447,6 +1574,44 @@ int feedbackPinUsedBy(const AppContext& ctx, uint8_t feedbackPin, int ignorePump
         const int feedbackUsedBy = feedbackPinUsedBy(ctx, candidate.feedbackPin, pumpIndex);
         if (feedbackUsedBy >= 0) {
           error = "Feedback-Eingang bereits von Pumpe " + String(feedbackUsedBy + 1) + " verwendet";
+          return false;
+        }
+      }
+    }
+
+    if (candidate.enabled && candidate.mode != PumpMode::OFF &&
+        candidate.sourceType == PumpSourceType::SENSOR_ROLE) {
+      const int8_t fullHk = heatingCircuitRouteIndex(candidate);
+      const int8_t partialHk = partialHeatingCircuitRouteIndex(candidate);
+
+      if (partialHk >= 0 && fullHk < 0) {
+        error = "Heizkreis-Pumpe muss Quelle HKx Vorlauf und Ziel HKx Ruecklauf desselben Heizkreises verwenden";
+        return false;
+      }
+
+      if (fullHk >= 0) {
+        for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+          if (i == pumpIndex) continue;
+          const PumpConfig& other = ctx.config.pumps[i];
+          if (!other.enabled || other.mode == PumpMode::OFF) continue;
+          if (heatingCircuitRouteIndex(other) == fullHk) {
+            error = "Es darf nur eine Pumpe fuer HK" + String((int)fullHk + 1) + " konfiguriert sein";
+            return false;
+          }
+        }
+      }
+    }
+
+    if (candidate.enabled && candidate.mode != PumpMode::OFF &&
+        candidate.sourceType == PumpSourceType::HEAT_SOURCE_ROLE &&
+        candidate.sourceRole == HeatSourceRole::ALT_SOURCE_OVEN) {
+      for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+        if (i == pumpIndex) continue;
+        const PumpConfig& other = ctx.config.pumps[i];
+        if (!other.enabled || other.mode == PumpMode::OFF) continue;
+        if (other.sourceType == PumpSourceType::HEAT_SOURCE_ROLE &&
+            other.sourceRole == HeatSourceRole::ALT_SOURCE_OVEN) {
+          error = "Es darf nur eine Pumpe mit Quelle Ofen konfiguriert sein";
           return false;
         }
       }
@@ -1798,6 +1963,22 @@ server.send(200, "text/plain", "OK");
     }
 
     const OvenConfig& cfg = s_ctx->config.oven;
+    const int8_t ovenPumpIndex = Pumps::configuredOvenPumpIndex(*s_ctx);
+    const PumpConfig* ovenPump = (ovenPumpIndex >= 0) ? &s_ctx->config.pumps[(uint8_t)ovenPumpIndex] : nullptr;
+
+    String ovenPumpLabel;
+    if (ovenPump) {
+      ovenPumpLabel = "Pumpe " + String((int)ovenPumpIndex + 1) + " / " + pumpModeLabel(ovenPump->mode);
+      if (ovenPump->mode == PumpMode::PWM) {
+        ovenPumpLabel += " / Enable ";
+        ovenPumpLabel += relayHardwareLabel(ovenPump->relayIndex);
+        ovenPumpLabel += " / PWM ";
+        ovenPumpLabel += pwmOutputHardwareLabel(ovenPump->pwmChannel);
+      } else {
+        ovenPumpLabel += " / ";
+        ovenPumpLabel += relayHardwareLabel(ovenPump->relayIndex);
+      }
+    }
 
     String json = "{";
 
@@ -1806,6 +1987,10 @@ server.send(200, "text/plain", "OK");
     json += jsonFloat(OvenControl::ovenTemperatureC(), 1);
     json += ",\"servoAngle\":";
     json += String(OvenControl::servoAngle());
+    json += ",\"servoOpeningPercent\":";
+    json += String(OvenControl::servoOpeningPercent());
+    json += ",\"targetTemperatureReached\":";
+    json += (OvenControl::targetTemperatureReached() ? "true" : "false");
     json += ",\"pumpActive\":";
     json += OvenControl::pumpActive() ? "true" : "false";
     json += ",\"state\":\"";
@@ -1817,13 +2002,22 @@ server.send(200, "text/plain", "OK");
     json += OvenControl::autoStarted() ? "true" : "false";
     json += ",\"peakTemperatureC\":";
     json += jsonFloat(OvenControl::peakTemperatureC(), 1);
+    json += ",\"ovenPumpConfigured\":";
+    json += ovenPump ? "true" : "false";
+    json += ",\"ovenPumpIndex\":";
+    json += ovenPump ? String(ovenPumpIndex) : String(-1);
+    json += ",\"ovenPumpLabel\":";
+    if (ovenPump) json += "\"" + jsonEscape(ovenPumpLabel.c_str()) + "\"";
+    else json += "null";
+    json += ",\"ovenPumpPwmPercent\":";
+    json += ovenPump ? jsonFloat(ovenPump->lastPwmPercent, 1) : String("null");
     json += "}";
 
     json += ",\"config\":{";
     json += "\"enabled\":";
     json += cfg.enabled ? "true" : "false";
-    json += ",\"pumpRelay\":";
-    json += String(cfg.pumpRelay);
+    json += ",\"ovenPumpIndex\":";
+    json += ovenPump ? String(ovenPumpIndex) : String(-1);
     json += ",\"targetSinkRole\":";
     json += String((int)cfg.targetSinkRole);
     json += ",\"autoStartEnabled\":";
@@ -1854,6 +2048,24 @@ server.send(200, "text/plain", "OK");
     json += String(cfg.servoMaximumAngle);
     json += ",\"servoBaseAngle\":";
     json += String(cfg.servoBaseAngle);
+    json += ",\"servoClosedAngle\":";
+    json += String(cfg.servoClosedAngle);
+    json += ",\"servoOpenAngle\":";
+    json += String(cfg.servoOpenAngle);
+    json += ",\"servoStandbyOpeningPercent\":";
+    json += String(cfg.servoStandbyOpeningPercent);
+    json += ",\"servoStartOpeningPercent\":";
+    json += String(cfg.servoStartOpeningPercent);
+    json += ",\"servoMinimumOpeningPercent\":";
+    json += String(cfg.servoMinimumOpeningPercent);
+    json += ",\"servoMaximumOpeningPercent\":";
+    json += String(cfg.servoMaximumOpeningPercent);
+    json += ",\"servoStepPercent\":";
+    json += String(cfg.servoStepPercent);
+    json += ",\"servoDeadbandC\":";
+    json += jsonFloat(cfg.servoDeadbandC, 1);
+    json += ",\"burnoutVentMinutes\":";
+    json += String(cfg.burnoutVentMinutes);
     json += ",\"pidKp\":";
     json += jsonFloat(cfg.pidKp, 3);
     json += ",\"pidKi\":";
@@ -1865,24 +2077,6 @@ server.send(200, "text/plain", "OK");
     json += ",\"sinkRoles\":[";
     bool firstSink = true;
     appendActiveDs18RoleOptions(json, *s_ctx, firstSink);
-    json += "]";
-
-    json += ",\"pumpRelays\":[";
-    bool firstPumpRelay = true;
-    for (uint8_t i = 0; i < RELAY_COUNT; i++) {
-      const RelayOutputConfig& relay = s_ctx->config.relays[i];
-      if (!relay.enabled) continue;
-      if (relay.function != RelayFunction::PUMP_ENABLE) continue;
-
-      if (!firstPumpRelay) json += ",";
-      firstPumpRelay = false;
-
-      json += "{\"value\":";
-      json += String(i);
-      json += ",\"label\":\"";
-      json += relayHardwareLabel(i);
-      json += " - Pump Enable\"}";
-    }
     json += "]";
 
     json += "}";
@@ -1907,8 +2101,10 @@ server.send(200, "text/plain", "OK");
     if (server.hasArg("enabled"))
       cfg.enabled = (server.arg("enabled").toInt() != 0);
 
-    if (server.hasArg("pumpRelay"))
-      cfg.pumpRelay = (uint8_t)server.arg("pumpRelay").toInt();
+    // Ofenpumpe wird im Pumpenmenue ueber Quelle "Ofen" konfiguriert.
+    // Alte direkte Ofenpumpen-Felder werden beim Speichern bereinigt, damit
+    // keine zweite Ausgangsbelegung bestehen bleibt.
+    cfg.pumpRelay = PIN_UNUSED;
 
     if (server.hasArg("targetSinkRole"))
       cfg.targetSinkRole = (Ds18Role)server.arg("targetSinkRole").toInt();
@@ -1955,6 +2151,41 @@ server.send(200, "text/plain", "OK");
     if (server.hasArg("servoBaseAngle"))
       cfg.servoBaseAngle = (uint8_t)server.arg("servoBaseAngle").toInt();
 
+    if (server.hasArg("servoClosedAngle"))
+      cfg.servoClosedAngle = (uint8_t)server.arg("servoClosedAngle").toInt();
+
+    if (server.hasArg("servoOpenAngle"))
+      cfg.servoOpenAngle = (uint8_t)server.arg("servoOpenAngle").toInt();
+
+    if (server.hasArg("servoStandbyOpeningPercent"))
+      cfg.servoStandbyOpeningPercent = (uint8_t)server.arg("servoStandbyOpeningPercent").toInt();
+
+    if (server.hasArg("servoStartOpeningPercent"))
+      cfg.servoStartOpeningPercent = (uint8_t)server.arg("servoStartOpeningPercent").toInt();
+
+    if (server.hasArg("servoMinimumOpeningPercent"))
+      cfg.servoMinimumOpeningPercent = (uint8_t)server.arg("servoMinimumOpeningPercent").toInt();
+
+    if (server.hasArg("servoMaximumOpeningPercent"))
+      cfg.servoMaximumOpeningPercent = (uint8_t)server.arg("servoMaximumOpeningPercent").toInt();
+
+    if (server.hasArg("servoStepPercent"))
+      cfg.servoStepPercent = (uint8_t)server.arg("servoStepPercent").toInt();
+
+    if (server.hasArg("servoDeadbandC"))
+      cfg.servoDeadbandC = server.arg("servoDeadbandC").toFloat();
+
+    if (server.hasArg("burnoutVentMinutes"))
+      cfg.burnoutVentMinutes = (uint16_t)server.arg("burnoutVentMinutes").toInt();
+
+    cfg.servoStandbyOpeningPercent = clampToUint8(cfg.servoStandbyOpeningPercent, 0, 100);
+    cfg.servoStartOpeningPercent = clampToUint8(cfg.servoStartOpeningPercent, 0, 100);
+    cfg.servoMinimumOpeningPercent = clampToUint8(cfg.servoMinimumOpeningPercent, 0, 100);
+    cfg.servoMaximumOpeningPercent = clampToUint8(cfg.servoMaximumOpeningPercent, 0, 100);
+    cfg.servoStepPercent = clampToUint8(cfg.servoStepPercent, 1, 100);
+    cfg.servoClosedAngle = clampToUint8(cfg.servoClosedAngle, 0, 180);
+    cfg.servoOpenAngle = clampToUint8(cfg.servoOpenAngle, 0, 180);
+
     if (server.hasArg("pidKp"))
       cfg.pidKp = server.arg("pidKp").toFloat();
 
@@ -1969,6 +2200,7 @@ if (!validateOvenOutputConfig(*s_ctx, candidate)) {
 }
 
 OvenConfig old = s_ctx->config.oven;
+const OutputRef oldPumpOutput = ovenPumpOutputRef(old);
 
 s_ctx->config.oven = candidate;
 
@@ -1977,6 +2209,15 @@ if (!OutputValidation::validateAll(*s_ctx, validationError)) {
   s_ctx->config.oven = old;
   server.send(409, "text/plain", validationError);
   return;
+}
+
+if (outputRefAssigned(oldPumpOutput.kind, oldPumpOutput.index)) {
+  if (oldPumpOutput.kind == OutputKind::RELAY && oldPumpOutput.index < RELAY_COUNT) {
+    RelayOutputs::set(*s_ctx, oldPumpOutput.index, false);
+  } else if (oldPumpOutput.kind == OutputKind::PWM_OUTPUT && oldPumpOutput.index < PWM_OUTPUT_COUNT) {
+    const PwmOutputConfig& po = s_ctx->config.pwmOutputs[oldPumpOutput.index];
+    PwmDriver::setSwitch(oldPumpOutput.index, false, po.profile);
+  }
 }
 
 Storage::saveConfig(s_ctx->config);
@@ -2590,7 +2831,14 @@ server.send(200, "text/plain", "OK");
       json += "\"enabled\":" + String(cfg.enabled ? "true" : "false") + ",";
       json += "\"mixerOpenLabel\":\"" + testOutputRefLabel(cfg.mixerOpenOutput) + "\",";
       json += "\"mixerCloseLabel\":\"" + testOutputRefLabel(cfg.mixerCloseOutput) + "\",";
-      json += "\"pumpLabel\":\"" + testOutputRefLabel(cfg.pumpOutput) + "\",";
+      const int8_t hkPumpIndex = Pumps::configuredHeatingCircuitPumpIndex(*s_ctx, i);
+      String hkPumpLabel = "Keine zentrale HK-Pumpe";
+      if (hkPumpIndex >= 0) {
+        const PumpConfig& hp = s_ctx->config.pumps[(uint8_t)hkPumpIndex];
+        hkPumpLabel = "Pumpe " + String((int)hkPumpIndex + 1) + " / " + pumpModeLabel(hp.mode) + " / Enable " + relayHardwareLabel(hp.relayIndex);
+        if (hp.mode == PumpMode::PWM) hkPumpLabel += " / PWM " + pwmOutputHardwareLabel(hp.pwmChannel);
+      }
+      json += "\"pumpLabel\":\"" + jsonEscape(hkPumpLabel.c_str()) + "\",";
       json += "\"pumpMode\":" + String((int)cfg.pumpMode) + ",";
       json += "\"active\":" + String(rt.active ? "true" : "false") + ",";
       json += "\"pumpActive\":" + String(rt.pumpActive ? "true" : "false") + ",";
@@ -2809,7 +3057,8 @@ server.send(200, "text/plain", "OK");
       testSetOutputRef(*s_ctx, cfg.mixerOpenOutput, false, 0);
       testSetOutputRef(*s_ctx, cfg.mixerCloseOutput, on, percent);
     } else if (output == "pump") {
-      testSetOutputRef(*s_ctx, cfg.pumpOutput, on, percent);
+      server.send(409, "text/plain", "Heizkreispumpe wird zentral im Pumpenmenue konfiguriert. Bitte die Pumpe dort oder im Pumpen/Routing-Test testen.");
+      return;
     } else {
       server.send(400, "text/plain", "ungueltiger Ausgang");
       return;
@@ -2820,11 +3069,22 @@ server.send(200, "text/plain", "OK");
 
   void allOutputsOffSafe() {
     if (!s_ctx) return;
-    RelayOutputs::allOff(*s_ctx);
-    PwmDriver::allOff();
-    ServoDriver::close();
-    Valves::allOff(*s_ctx);
+
+    // Zuerst die Modul-Runtimes in einen eindeutig AUS-Zustand bringen.
     HeatingCircuits::allOff(*s_ctx);
+    Pumps::allOff(*s_ctx);
+    Valves::allOff(*s_ctx);
+
+    // Danach die Hardware global absichern. PCA-Schaltausgaenge muessen dabei
+    // ihr jeweiliges Profil beruecksichtigen; ein fixes SOLAR-Profil waere fuer
+    // HEATING-Ausgaenge elektrisch nicht zwingend AUS.
+    RelayOutputs::allOff(*s_ctx);
+    PwmDriver::allOff(s_ctx->config);
+
+    // Der Servo darf nicht auf den elektrischen Winkel 0 Grad gezwungen werden.
+    // Verwendet wird die konfigurierte Standby-/Safety-Oeffnung, z. B. 0 %
+    // Oeffnung -> 45 Grad bei der aktuellen Ofenkalibrierung.
+    OvenControl::applyStandbyServoPosition(*s_ctx);
   }
 
   void handleTestAllOff() {
@@ -3156,18 +3416,69 @@ namespace {
     for (uint8_t i = 0; i < RELAY_COUNT; i++) {
       const RelayOutputConfig& r = s_ctx->config.relays[i];
       if (!r.enabled) continue;
+
+      String usage;
+      const bool locked = outputUsageLabel(*s_ctx, OutputKind::RELAY, i, usage);
+
       if (!first) json += ",";
       first = false;
-      json += "{\"kind\":\"relay\",\"index\":" + String(i) + ",\"label\":\"" + relayHardwareLabel(i) + "\",\"function\":\"" + String(RelayOutputs::functionToKey(r.function)) + "\",\"mode\":\"switch\"}";
+      json += "{\"kind\":\"relay\",\"index\":" + String(i) + ",\"label\":\"" + relayHardwareLabel(i) + "\",\"function\":\"" + String(RelayOutputs::functionToKey(r.function)) + "\",\"mode\":\"switch\"";
+      json += ",\"locked\":" + String(locked ? "true" : "false");
+      json += ",\"usedBy\":";
+      if (locked) json += "\"" + jsonEscape(usage.c_str()) + "\""; else json += "null";
+      json += "}";
     }
     for (uint8_t i = 0; i < PWM_OUTPUT_COUNT; i++) {
       const PwmOutputConfig& po = s_ctx->config.pwmOutputs[i];
       if (!po.enabled) continue;
+
+      String usage;
+      const bool locked = outputUsageLabel(*s_ctx, OutputKind::PWM_OUTPUT, i, usage);
+
       if (!first) json += ",";
       first = false;
-      json += "{\"kind\":\"pwm\",\"index\":" + String(i) + ",\"label\":\"" + pwmOutputHardwareLabel(i) + "\",\"mode\":\"" + pwmOutputModeToKey(po.mode) + "\",\"function\":\"" + String(RelayOutputs::functionToKey(po.function)) + "\"}";
+      json += "{\"kind\":\"pwm\",\"index\":" + String(i) + ",\"label\":\"" + pwmOutputHardwareLabel(i) + "\",\"mode\":\"" + pwmOutputModeToKey(po.mode) + "\",\"function\":\"" + String(RelayOutputs::functionToKey(po.function)) + "\"";
+      json += ",\"locked\":" + String(locked ? "true" : "false");
+      json += ",\"usedBy\":";
+      if (locked) json += "\"" + jsonEscape(usage.c_str()) + "\""; else json += "null";
+      json += "}";
     }
     json += "]";
+  }
+
+
+  String heatingCircuitSensorTemperatureOnly(Ds18Role role) {
+    if (role == Ds18Role::NONE) return String("-");
+
+    float tempC = NAN;
+    bool valid = false;
+    if (s_ctx && SensorAssignments::readByRole(s_ctx->assignments, role, tempC, valid) && valid && !isnan(tempC)) {
+      return String(tempC, 1) + " °C";
+    }
+
+    return String("-");
+  }
+
+
+  String heatingCircuitSensorSummary(Ds18Role role) {
+    if (role == Ds18Role::NONE) return String("-");
+
+    String label = SensorRoles::toLabel(role);
+    float tempC = NAN;
+    bool valid = false;
+    if (s_ctx && SensorAssignments::readByRole(s_ctx->assignments, role, tempC, valid) && valid && !isnan(tempC)) {
+      label += ": ";
+      label += String(tempC, 1);
+      label += " °C";
+      return label;
+    }
+
+    if (s_ctx && SensorAssignments::hasRole(s_ctx->assignments, role)) {
+      label += ": ungueltig";
+    } else {
+      label += ": nicht zugeordnet";
+    }
+    return label;
   }
 
   void appendAllAssignableDs18RolesJson(String& json, const char* fieldName) {
@@ -3205,16 +3516,47 @@ namespace {
       json += "\"mixerOpenOutputIndex\":" + String(cfg.mixerOpenOutput.index) + ",";
       json += "\"mixerCloseOutputKind\":\"" + outputKindToKey(cfg.mixerCloseOutput.kind) + "\",";
       json += "\"mixerCloseOutputIndex\":" + String(cfg.mixerCloseOutput.index) + ",";
-      json += "\"pumpMode\":" + String((int)cfg.pumpMode) + ",";
+      json += "\"pumpMode\":" + String((int)cfg.pumpMode) + ","; // Legacy, nicht mehr im HK-Menue editierbar
       json += "\"pumpOutputKind\":\"" + outputKindToKey(cfg.pumpOutput.kind) + "\",";
       json += "\"pumpOutputIndex\":" + String(cfg.pumpOutput.index) + ",";
-      json += "\"pumpMinPercent\":" + String(cfg.pumpMinPercent) + ",";
-      json += "\"pumpMaxPercent\":" + String(cfg.pumpMaxPercent) + ",";
-      json += "\"flowSensorRole\":" + String((int)cfg.flowSensorRole) + ",";
-      json += "\"returnSensorRole\":" + String((int)cfg.returnSensorRole) + ",";
-      json += "\"roomSensorRole\":" + String((int)cfg.roomSensorRole) + ",";
+      json += "\"pumpMinPercent\":" + String(cfg.pumpMinPercent) + ","; // Legacy
+      json += "\"pumpMaxPercent\":" + String(cfg.pumpMaxPercent) + ","; // Legacy
+      json += "\"pumpTargetDeltaC\":" + String(cfg.pumpTargetDeltaC, 2) + ",";
+      json += "\"pumpFullDeltaC\":" + String(cfg.pumpFullDeltaC, 2) + ",";
+      const int8_t hkPumpIndex = Pumps::configuredHeatingCircuitPumpIndex(*s_ctx, i);
+      json += "\"detectedPumpIndex\":" + String(hkPumpIndex) + ",";
+      if (hkPumpIndex >= 0) {
+        const PumpConfig& hp = s_ctx->config.pumps[(uint8_t)hkPumpIndex];
+        String hpLabel = "Pumpe " + String((int)hkPumpIndex + 1) + " / " + pumpModeLabel(hp.mode);
+        hpLabel += " / " + String(SensorRoles::toLabel(hp.sourceSensorRole));
+        hpLabel += " -> " + String(SensorRoles::toLabel(hp.sinkRole));
+        hpLabel += " / Enable " + relayHardwareLabel(hp.relayIndex);
+        if (hp.mode == PumpMode::PWM) {
+          hpLabel += " / PWM " + pwmOutputHardwareLabel(hp.pwmChannel);
+          hpLabel += " / " + String(hp.minPwmPercent, 0) + "-" + String(hp.maxPwmPercent, 0) + "%";
+        }
+        json += "\"detectedPumpLabel\":\"" + jsonEscape(hpLabel.c_str()) + "\",";
+      } else {
+        json += "\"detectedPumpLabel\":\"Keine Heizkreispumpe im Pumpenmenue gefunden\",";
+      }
+      const Ds18Role effectiveFlowRole = HeatingCircuits::effectiveFlowSensorRole(i, cfg);
+      const Ds18Role effectiveReturnRole = HeatingCircuits::effectiveReturnSensorRole(i, cfg);
+      const Ds18Role effectiveRoomRole = HeatingCircuits::effectiveRoomSensorRole(i, cfg);
+      const Ds18Role effectiveOutsideRole = HeatingCircuits::effectiveOutsideSensorRole(cfg);
+      json += "\"flowSensorRole\":" + String((int)effectiveFlowRole) + ",";
+      json += "\"returnSensorRole\":" + String((int)effectiveReturnRole) + ",";
+      json += "\"configuredFlowSensorRole\":" + String((int)cfg.flowSensorRole) + ",";
+      json += "\"configuredReturnSensorRole\":" + String((int)cfg.returnSensorRole) + ",";
+      json += "\"roomSensorRole\":" + String((int)effectiveRoomRole) + ",";
+      json += "\"configuredRoomSensorRole\":" + String((int)cfg.roomSensorRole) + ",";
       json += "\"bufferReferenceRole\":" + String((int)cfg.bufferReferenceRole) + ",";
-      json += "\"outsideSensorRole\":" + String((int)cfg.outsideSensorRole) + ",";
+      json += "\"outsideSensorRole\":" + String((int)effectiveOutsideRole) + ",";
+      json += "\"configuredOutsideSensorRole\":" + String((int)cfg.outsideSensorRole) + ",";
+      json += "\"autoFlowSensorLabel\":\"" + jsonEscape(heatingCircuitSensorTemperatureOnly(effectiveFlowRole).c_str()) + "\",";
+      json += "\"autoReturnSensorLabel\":\"" + jsonEscape(heatingCircuitSensorTemperatureOnly(effectiveReturnRole).c_str()) + "\",";
+      json += "\"autoRoomSensorLabel\":\"" + jsonEscape(heatingCircuitSensorSummary(effectiveRoomRole).c_str()) + "\",";
+      json += "\"autoOutsideSensorLabel\":\"" + jsonEscape(heatingCircuitSensorTemperatureOnly(effectiveOutsideRole).c_str()) + "\",";
+      json += "\"roomControlEnabled\":" + String(cfg.roomControlEnabled ? "true" : "false") + ",";
       json += "\"fixedFlowTemperatureC\":" + String(cfg.fixedFlowTemperatureC, 2) + ",";
       json += "\"maximumFlowTemperatureC\":" + String(cfg.maximumFlowTemperatureC, 2) + ",";
       json += "\"minimumFlowTemperatureC\":" + String(cfg.minimumFlowTemperatureC, 2) + ",";
@@ -3232,7 +3574,12 @@ namespace {
       json += "\"active\":" + String(rt.active ? "true" : "false") + ",";
       json += "\"pumpActive\":" + String(rt.pumpActive ? "true" : "false") + ",";
       json += "\"flowTemperatureC\":" + jsonFloat(rt.flowTemperatureC, 2) + ",";
+      json += "\"returnTemperatureC\":" + jsonFloat(rt.returnTemperatureC, 2) + ",";
+      json += "\"roomTemperatureC\":" + jsonFloat(rt.roomTemperatureC, 2) + ",";
+      json += "\"outsideTemperatureC\":" + jsonFloat(rt.outsideTemperatureC, 2) + ",";
       json += "\"targetFlowTemperatureC\":" + jsonFloat(rt.targetFlowTemperatureC, 2) + ",";
+      json += "\"spreadTemperatureC\":" + jsonFloat(rt.spreadTemperatureC, 2) + ",";
+      json += "\"pumpPercent\":" + String(rt.pumpPercent) + ",";
       json += "\"mixerPosition\":" + String(rt.estimatedMixerPositionPercent);
       json += "}";
       json += "}";
@@ -3262,6 +3609,12 @@ namespace {
 
     HeatingCircuitConfig candidate = s_ctx->config.heatingCircuits[idx];
 
+    // Heizkreispumpen werden ab diesem Stand ausschliesslich im Pumpenmenue
+    // konfiguriert: Quelle HKx Vorlauf, Ziel HKx Ruecklauf. Die alten Felder
+    // werden beim Speichern des Heizkreises freigegeben und nicht mehr genutzt.
+    candidate.pumpMode = HeatingCircuitPumpMode::NONE;
+    candidate.pumpOutput = OutputRef{};
+
     candidate.enabled = server.arg("enabled").toInt() != 0;
     if (server.hasArg("mixerType")) candidate.mixerType = (server.arg("mixerType").toInt() == 1) ? HeatingCircuitMixerType::THERMAL : HeatingCircuitMixerType::THREE_POINT;
     if (server.hasArg("controlMode")) candidate.controlMode = (server.arg("controlMode").toInt() == 1) ? HeatingCircuitControlMode::WEATHER_COMPENSATED : HeatingCircuitControlMode::FIXED_FLOW;
@@ -3269,11 +3622,8 @@ namespace {
     if (server.hasArg("mixerOpenOutputIndex")) candidate.mixerOpenOutput.index = (uint8_t)server.arg("mixerOpenOutputIndex").toInt();
     if (server.hasArg("mixerCloseOutputKind")) candidate.mixerCloseOutput.kind = outputKindFromKey(server.arg("mixerCloseOutputKind"));
     if (server.hasArg("mixerCloseOutputIndex")) candidate.mixerCloseOutput.index = (uint8_t)server.arg("mixerCloseOutputIndex").toInt();
-    if (server.hasArg("pumpMode")) candidate.pumpMode = (HeatingCircuitPumpMode)server.arg("pumpMode").toInt();
-    if (server.hasArg("pumpOutputKind")) candidate.pumpOutput.kind = outputKindFromKey(server.arg("pumpOutputKind"));
-    if (server.hasArg("pumpOutputIndex")) candidate.pumpOutput.index = (uint8_t)server.arg("pumpOutputIndex").toInt();
-    if (server.hasArg("pumpMinPercent")) candidate.pumpMinPercent = (uint8_t)server.arg("pumpMinPercent").toInt();
-    if (server.hasArg("pumpMaxPercent")) candidate.pumpMaxPercent = (uint8_t)server.arg("pumpMaxPercent").toInt();
+    if (server.hasArg("pumpTargetDeltaC")) candidate.pumpTargetDeltaC = server.arg("pumpTargetDeltaC").toFloat();
+    if (server.hasArg("pumpFullDeltaC")) candidate.pumpFullDeltaC = server.arg("pumpFullDeltaC").toFloat();
     if (server.hasArg("flowSensorRole")) candidate.flowSensorRole = (Ds18Role)server.arg("flowSensorRole").toInt();
     if (server.hasArg("returnSensorRole")) candidate.returnSensorRole = (Ds18Role)server.arg("returnSensorRole").toInt();
     if (server.hasArg("roomSensorRole")) candidate.roomSensorRole = (Ds18Role)server.arg("roomSensorRole").toInt();
@@ -3282,6 +3632,7 @@ namespace {
     if (server.hasArg("fixedFlowTemperatureC")) candidate.fixedFlowTemperatureC = server.arg("fixedFlowTemperatureC").toFloat();
     if (server.hasArg("maximumFlowTemperatureC")) candidate.maximumFlowTemperatureC = server.arg("maximumFlowTemperatureC").toFloat();
     if (server.hasArg("minimumFlowTemperatureC")) candidate.minimumFlowTemperatureC = server.arg("minimumFlowTemperatureC").toFloat();
+    candidate.roomControlEnabled = server.hasArg("roomControlEnabled") && server.arg("roomControlEnabled").toInt() != 0;
     if (server.hasArg("roomTargetTemperatureC")) candidate.roomTargetTemperatureC = server.arg("roomTargetTemperatureC").toFloat();
     if (server.hasArg("roomInfluenceK")) candidate.roomInfluenceK = server.arg("roomInfluenceK").toFloat();
     if (server.hasArg("heatingCurveBaseC")) candidate.heatingCurveBaseC = server.arg("heatingCurveBaseC").toFloat();
@@ -3292,6 +3643,9 @@ namespace {
     if (server.hasArg("mixerFullTravelMs")) candidate.mixerFullTravelMs = (uint32_t)server.arg("mixerFullTravelMs").toInt();
     if (server.hasArg("mixerPulseMs")) candidate.mixerPulseMs = (uint32_t)server.arg("mixerPulseMs").toInt();
     if (server.hasArg("mixerPauseMs")) candidate.mixerPauseMs = (uint32_t)server.arg("mixerPauseMs").toInt();
+
+if (candidate.pumpTargetDeltaC < 0.5f) candidate.pumpTargetDeltaC = 0.5f;
+if (candidate.pumpFullDeltaC <= candidate.pumpTargetDeltaC) candidate.pumpFullDeltaC = candidate.pumpTargetDeltaC + 1.0f;
 
 if (!validateHeatingCircuitOutputConfig(*s_ctx, candidate, idx)) {
   return;
@@ -3307,6 +3661,11 @@ if (!OutputValidation::validateAll(*s_ctx, validationError)) {
   server.send(409, "text/plain", validationError);
   return;
 }
+
+HeatingCircuits::releaseRemovedOutputs(*s_ctx, old, candidate);
+s_ctx->heatingCircuitRuntime[idx].pumpActive = false;
+s_ctx->heatingCircuitRuntime[idx].opening = false;
+s_ctx->heatingCircuitRuntime[idx].closing = false;
 
 Storage::saveConfig(s_ctx->config);
 server.send(200, "text/plain", "OK");
@@ -3334,14 +3693,56 @@ void handleAuxHeaterJson() {
   json += ",\"sinkRole\":\"";
   json += SensorRoles::toKey(cfg.sinkRole);
   json += "\"";
+  const OutputRef activePumpOutput = outputRefAssigned(cfg.pumpOutput.kind, cfg.pumpOutput.index)
+                                      ? cfg.pumpOutput
+                                      : OutputRef{OutputKind::RELAY, cfg.pumpRelay};
+  const uint8_t legacyPumpRelay = (activePumpOutput.kind == OutputKind::RELAY) ? activePumpOutput.index : PIN_UNUSED;
+
   json += ",\"pumpRelay\":";
-  json += String(cfg.pumpRelay);
+  json += String(legacyPumpRelay);
+  json += ",\"pumpOutputKind\":\"";
+  json += outputRefKindToKey(activePumpOutput.kind);
+  json += "\",\"pumpOutputIndex\":";
+  json += String(activePumpOutput.index);
+  json += ",\"pumpOutputValue\":\"";
+  json += outputRefValue(activePumpOutput.kind, activePumpOutput.index);
+  json += "\"";
+
+  const uint8_t legacyRelay1 = (cfg.heaterOutput1.kind == OutputKind::RELAY) ? cfg.heaterOutput1.index : PIN_UNUSED;
+  const uint8_t legacyRelay2 = (cfg.heaterOutput2.kind == OutputKind::RELAY) ? cfg.heaterOutput2.index : PIN_UNUSED;
+  const uint8_t legacyRelay3 = (cfg.heaterOutput3.kind == OutputKind::RELAY) ? cfg.heaterOutput3.index : PIN_UNUSED;
+
   json += ",\"heaterRelay1\":";
-  json += String(cfg.heaterRelay1);
+  json += String(legacyRelay1);
   json += ",\"heaterRelay2\":";
-  json += String(cfg.heaterRelay2);
+  json += String(legacyRelay2);
   json += ",\"heaterRelay3\":";
-  json += String(cfg.heaterRelay3);
+  json += String(legacyRelay3);
+
+  json += ",\"heaterOutput1Kind\":\"";
+  json += outputRefKindToKey(cfg.heaterOutput1.kind);
+  json += "\",\"heaterOutput1Index\":";
+  json += String(cfg.heaterOutput1.index);
+  json += ",\"heaterOutput1Value\":\"";
+  json += outputRefValue(cfg.heaterOutput1.kind, cfg.heaterOutput1.index);
+  json += "\"";
+
+  json += ",\"heaterOutput2Kind\":\"";
+  json += outputRefKindToKey(cfg.heaterOutput2.kind);
+  json += "\",\"heaterOutput2Index\":";
+  json += String(cfg.heaterOutput2.index);
+  json += ",\"heaterOutput2Value\":\"";
+  json += outputRefValue(cfg.heaterOutput2.kind, cfg.heaterOutput2.index);
+  json += "\"";
+
+  json += ",\"heaterOutput3Kind\":\"";
+  json += outputRefKindToKey(cfg.heaterOutput3.kind);
+  json += "\",\"heaterOutput3Index\":";
+  json += String(cfg.heaterOutput3.index);
+  json += ",\"heaterOutput3Value\":\"";
+  json += outputRefValue(cfg.heaterOutput3.kind, cfg.heaterOutput3.index);
+  json += "\"";
+
   json += ",\"preRunSeconds\":";
   json += String(cfg.preRunMs / 1000UL);
   json += ",\"cooldownSeconds\":";
@@ -3353,8 +3754,9 @@ void handleAuxHeaterJson() {
   appendActiveDs18RoleOptions(json, *s_ctx, firstSink);
   json += "]";
 
-  json += ",\"pumpRelays\":[";
+  json += ",\"pumpOutputs\":[";
   bool firstPump = true;
+
   for (uint8_t i = 0; i < RELAY_COUNT; i++) {
     const RelayOutputConfig& r = s_ctx->config.relays[i];
     if (!r.enabled || r.function != RelayFunction::PUMP_ENABLE) continue;
@@ -3363,9 +3765,12 @@ void handleAuxHeaterJson() {
 
     String usage;
     const bool busy = outputIsUsedByLegacyConsumers(*s_ctx, OutputKind::RELAY, i, -1, usage, true, false) ||
-                      outputIsUsedByHeatingCircuit(*s_ctx, OutputKind::RELAY, i, -1, usage);
+                      outputIsUsedByHeatingCircuit(*s_ctx, OutputKind::RELAY, i, -1, usage) ||
+                      outputIsUsedByValves(*s_ctx, OutputKind::RELAY, i, -1, usage);
 
-    json += "{\"value\":";
+    json += "{\"value\":\"";
+    json += outputRefValue(OutputKind::RELAY, i);
+    json += "\",\"kind\":\"relay\",\"index\":";
     json += String(i);
     json += ",\"label\":\"";
     json += relayHardwareLabel(i);
@@ -3378,10 +3783,55 @@ void handleAuxHeaterJson() {
     json += String(busy ? "true" : "false");
     json += "}";
   }
+
+  for (uint8_t i = 0; i < PWM_OUTPUT_COUNT; i++) {
+    const PwmOutputConfig& po = s_ctx->config.pwmOutputs[i];
+    if (!po.enabled || po.mode != PwmOutputMode::SWITCH || po.function != RelayFunction::PUMP_ENABLE) continue;
+    if (!firstPump) json += ",";
+    firstPump = false;
+
+    String usage;
+    const bool busy = outputIsUsedByLegacyConsumers(*s_ctx, OutputKind::PWM_OUTPUT, i, -1, usage, true, false) ||
+                      outputIsUsedByHeatingCircuit(*s_ctx, OutputKind::PWM_OUTPUT, i, -1, usage) ||
+                      outputIsUsedByValves(*s_ctx, OutputKind::PWM_OUTPUT, i, -1, usage);
+
+    json += "{\"value\":\"";
+    json += outputRefValue(OutputKind::PWM_OUTPUT, i);
+    json += "\",\"kind\":\"pwm\",\"index\":";
+    json += String(i);
+    json += ",\"label\":\"";
+    json += pwmOutputHardwareLabel(i);
+    json += " / PO-Schaltausgang";
+    if (busy) {
+      json += " (belegt: ";
+      json += usage;
+      json += ")";
+    }
+    json += "\",\"used\":";
+    json += String(busy ? "true" : "false");
+    json += "}";
+  }
   json += "]";
 
-  json += ",\"heaterRelays\":[";
+  // Legacy-Feld fuer alte JS-Versionen: echte Relaisliste bleibt erhalten.
+  json += ",\"pumpRelays\":[";
+  bool firstLegacyPump = true;
+  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
+    const RelayOutputConfig& r = s_ctx->config.relays[i];
+    if (!r.enabled || r.function != RelayFunction::PUMP_ENABLE) continue;
+    if (!firstLegacyPump) json += ",";
+    firstLegacyPump = false;
+    json += "{\"value\":";
+    json += String(i);
+    json += ",\"label\":\"";
+    json += relayHardwareLabel(i);
+    json += "\",\"used\":false}";
+  }
+  json += "]";
+
+  json += ",\"heaterOutputs\":[";
   bool firstHeater = true;
+
   for (uint8_t i = 0; i < RELAY_COUNT; i++) {
     const RelayOutputConfig& r = s_ctx->config.relays[i];
     if (!r.enabled || r.function != RelayFunction::HEATER_ROD) continue;
@@ -3390,9 +3840,12 @@ void handleAuxHeaterJson() {
 
     String usage;
     const bool busy = outputIsUsedByLegacyConsumers(*s_ctx, OutputKind::RELAY, i, -1, usage, true, false) ||
-                      outputIsUsedByHeatingCircuit(*s_ctx, OutputKind::RELAY, i, -1, usage);
+                      outputIsUsedByHeatingCircuit(*s_ctx, OutputKind::RELAY, i, -1, usage) ||
+                      outputIsUsedByValves(*s_ctx, OutputKind::RELAY, i, -1, usage);
 
-    json += "{\"value\":";
+    json += "{\"value\":\"";
+    json += outputRefValue(OutputKind::RELAY, i);
+    json += "\",\"kind\":\"relay\",\"index\":";
     json += String(i);
     json += ",\"label\":\"";
     json += relayHardwareLabel(i);
@@ -3404,6 +3857,50 @@ void handleAuxHeaterJson() {
     json += "\",\"used\":";
     json += String(busy ? "true" : "false");
     json += "}";
+  }
+
+  for (uint8_t i = 0; i < PWM_OUTPUT_COUNT; i++) {
+    const PwmOutputConfig& po = s_ctx->config.pwmOutputs[i];
+    if (!po.enabled || po.mode != PwmOutputMode::SWITCH || po.function != RelayFunction::HEATER_ROD) continue;
+    if (!firstHeater) json += ",";
+    firstHeater = false;
+
+    String usage;
+    const bool busy = outputIsUsedByLegacyConsumers(*s_ctx, OutputKind::PWM_OUTPUT, i, -1, usage, true, false) ||
+                      outputIsUsedByHeatingCircuit(*s_ctx, OutputKind::PWM_OUTPUT, i, -1, usage) ||
+                      outputIsUsedByValves(*s_ctx, OutputKind::PWM_OUTPUT, i, -1, usage);
+
+    json += "{\"value\":\"";
+    json += outputRefValue(OutputKind::PWM_OUTPUT, i);
+    json += "\",\"kind\":\"pwm\",\"index\":";
+    json += String(i);
+    json += ",\"label\":\"";
+    json += pwmOutputHardwareLabel(i);
+    json += " / PO-Schaltausgang";
+    if (busy) {
+      json += " (belegt: ";
+      json += usage;
+      json += ")";
+    }
+    json += "\",\"used\":";
+    json += String(busy ? "true" : "false");
+    json += "}";
+  }
+  json += "]";
+
+  // Legacy-Feld fuer alte JS-Versionen: echte Relaisliste bleibt erhalten.
+  json += ",\"heaterRelays\":[";
+  bool firstLegacyHeater = true;
+  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
+    const RelayOutputConfig& r = s_ctx->config.relays[i];
+    if (!r.enabled || r.function != RelayFunction::HEATER_ROD) continue;
+    if (!firstLegacyHeater) json += ",";
+    firstLegacyHeater = false;
+    json += "{\"value\":";
+    json += String(i);
+    json += ",\"label\":\"";
+    json += relayHardwareLabel(i);
+    json += "\",\"used\":false}";
   }
   json += "]";
 
@@ -3428,11 +3925,56 @@ void handleAuxHeaterSave() {
   if (server.hasArg("minimumTemperatureC")) candidate.minimumTemperatureC = server.arg("minimumTemperatureC").toFloat();
   if (server.hasArg("targetTemperatureC")) candidate.targetTemperatureC = server.arg("targetTemperatureC").toFloat();
   if (server.hasArg("hysteresisC")) candidate.hysteresisC = server.arg("hysteresisC").toFloat();
-  if (server.hasArg("sinkRole")) candidate.sinkRole = SensorRoles::fromKey(server.arg("sinkRole"));
-  if (server.hasArg("pumpRelay")) candidate.pumpRelay = (uint8_t)server.arg("pumpRelay").toInt();
-  if (server.hasArg("heaterRelay1")) candidate.heaterRelay1 = (uint8_t)server.arg("heaterRelay1").toInt();
-  if (server.hasArg("heaterRelay2")) candidate.heaterRelay2 = (uint8_t)server.arg("heaterRelay2").toInt();
-  if (server.hasArg("heaterRelay3")) candidate.heaterRelay3 = (uint8_t)server.arg("heaterRelay3").toInt();
+  if (server.hasArg("sinkRole")) {
+    const String sinkArg = server.arg("sinkRole");
+    candidate.sinkRole = (sinkArg == "none" || sinkArg == "255") ? Ds18Role::NONE : SensorRoles::fromKey(sinkArg);
+  }
+
+  auto readOutputRefArg = [](const String& kindArg, const String& indexArg) -> OutputRef {
+    OutputRef ref;
+    ref.kind = outputKindFromKey(kindArg);
+    ref.index = (uint8_t)indexArg.toInt();
+    if (ref.kind == OutputKind::NONE || ref.index == PIN_UNUSED) {
+      ref.kind = OutputKind::NONE;
+      ref.index = PIN_UNUSED;
+    }
+    return ref;
+  };
+
+  auto readLegacyRelayRef = [](const String& arg) -> OutputRef {
+    const uint8_t index = (uint8_t)arg.toInt();
+    if (index == PIN_UNUSED) return OutputRef{};
+    return OutputRef{OutputKind::RELAY, index};
+  };
+
+  if (server.hasArg("pumpOutputKind") && server.hasArg("pumpOutputIndex")) {
+    candidate.pumpOutput = readOutputRefArg(server.arg("pumpOutputKind"), server.arg("pumpOutputIndex"));
+  } else if (server.hasArg("pumpRelay")) {
+    candidate.pumpOutput = readLegacyRelayRef(server.arg("pumpRelay"));
+  }
+  candidate.pumpRelay = (candidate.pumpOutput.kind == OutputKind::RELAY) ? candidate.pumpOutput.index : PIN_UNUSED;
+
+  if (server.hasArg("heaterOutput1Kind") && server.hasArg("heaterOutput1Index")) {
+    candidate.heaterOutput1 = readOutputRefArg(server.arg("heaterOutput1Kind"), server.arg("heaterOutput1Index"));
+  } else if (server.hasArg("heaterRelay1")) {
+    candidate.heaterOutput1 = readLegacyRelayRef(server.arg("heaterRelay1"));
+  }
+
+  if (server.hasArg("heaterOutput2Kind") && server.hasArg("heaterOutput2Index")) {
+    candidate.heaterOutput2 = readOutputRefArg(server.arg("heaterOutput2Kind"), server.arg("heaterOutput2Index"));
+  } else if (server.hasArg("heaterRelay2")) {
+    candidate.heaterOutput2 = readLegacyRelayRef(server.arg("heaterRelay2"));
+  }
+
+  if (server.hasArg("heaterOutput3Kind") && server.hasArg("heaterOutput3Index")) {
+    candidate.heaterOutput3 = readOutputRefArg(server.arg("heaterOutput3Kind"), server.arg("heaterOutput3Index"));
+  } else if (server.hasArg("heaterRelay3")) {
+    candidate.heaterOutput3 = readLegacyRelayRef(server.arg("heaterRelay3"));
+  }
+
+  candidate.heaterRelay1 = (candidate.heaterOutput1.kind == OutputKind::RELAY) ? candidate.heaterOutput1.index : PIN_UNUSED;
+  candidate.heaterRelay2 = (candidate.heaterOutput2.kind == OutputKind::RELAY) ? candidate.heaterOutput2.index : PIN_UNUSED;
+  candidate.heaterRelay3 = (candidate.heaterOutput3.kind == OutputKind::RELAY) ? candidate.heaterOutput3.index : PIN_UNUSED;
   if (server.hasArg("preRunSeconds")) candidate.preRunMs = (uint32_t)server.arg("preRunSeconds").toInt() * 1000UL;
   if (server.hasArg("cooldownSeconds")) candidate.cooldownMs = (uint32_t)server.arg("cooldownSeconds").toInt() * 1000UL;
 

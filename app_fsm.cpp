@@ -38,6 +38,16 @@ namespace {
     ctx.control.diffC = NAN;
     ctx.control.protectionMode = ProtectionMode::NONE;
   }
+
+  static constexpr uint32_t WIFI_STA_RECONNECT_INTERVAL_MS = 30000UL;
+  static constexpr uint32_t WIFI_AP_HEALTH_INTERVAL_MS = 10000UL;
+
+  uint32_t g_lastSoftApCheckMs = 0;
+
+  bool validSoftApIp() {
+    IPAddress ip = WiFi.softAPIP();
+    return !(ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
+  }
 }
 
 AppFSM::AppFSM() {
@@ -125,6 +135,9 @@ void AppFSM::loop() {
       break;
   }
 
+  if (ctx_.networkInitialized) {
+    serviceNetwork();
+  }
   Alarms::process(ctx_);
 }
 
@@ -141,10 +154,9 @@ void AppFSM::stateInitHw() {
   Serial.print("Relais-PCF: ");
   Serial.println(relayOk ? "OK" : "FEHLER/NICHT GEFUNDEN");
 
-  bool pwmOk = PwmDriver::begin();
-  Serial.print("PCA9685: ");
-  Serial.println(pwmOk ? "OK" : "FEHLER/NICHT GEFUNDEN");
-  OvenControl::begin(ctx_);
+  // PCA9685 und Ofen-Servo werden erst nach LOAD_CONFIG initialisiert.
+  // Beide benoetigen die gespeicherten Profil-/Kalibrierwerte, damit es beim
+  // Booten keinen kurzen falschen Ausgangspegel bzw. Servo-Winkel gibt.
   HeatingCircuits::begin(ctx_);
   changeState(SystemState::INIT_SD);
 }
@@ -179,15 +191,124 @@ void AppFSM::stateLoadConfig() {
   Storage::loadSensorAssignments(ctx_.assignments);
   HeatSourceStorage::loadAssignments(ctx_.heatSourceAssignments);
 
+  // Profil-/kalibrierungsabhaengige Hardware erst jetzt initialisieren,
+  // nachdem die SD-Konfiguration geladen wurde.
+  bool pwmOk = PwmDriver::begin();
+  Serial.print("PCA9685: ");
+  Serial.println(pwmOk ? "OK" : "FEHLER/NICHT GEFUNDEN");
+  if (pwmOk) {
+    PwmDriver::allOff(ctx_.config);
+  }
+
+  OvenControl::begin(ctx_);
+
   ctx_.diag.bootCount++;
   Storage::saveDiagnostics(ctx_.diag);
 
   changeState(SystemState::INIT_NETWORK);
 }
 
+void AppFSM::ensureSoftAp() {
+  const uint32_t now = millis();
+  if (g_lastSoftApCheckMs != 0 && (uint32_t)(now - g_lastSoftApCheckMs) < WIFI_AP_HEALTH_INTERVAL_MS) {
+    return;
+  }
+  g_lastSoftApCheckMs = now;
+
+  auto mode = WiFi.getMode();
+  ctx_.networkWifiMode = static_cast<uint8_t>(mode);
+
+  if (mode != WIFI_AP_STA) {
+    Serial.println("WLAN-Modus wurde korrigiert: WIFI_AP_STA");
+    WiFi.mode(WIFI_AP_STA);
+  }
+
+  const char* ssid = ctx_.config.apName[0] ? ctx_.config.apName : DEFAULT_AP_SSID;
+  const char* pass = ctx_.config.apPassword[0] ? ctx_.config.apPassword : DEFAULT_AP_PASSWORD;
+
+  if (!validSoftApIp()) {
+    Serial.println("SoftAP nicht aktiv - starte SoftAP erneut");
+    WiFi.softAP(ssid, pass);
+  }
+
+  ctx_.networkApActive = validSoftApIp();
+}
+
+void AppFSM::startStaConnect() {
+  if (!ctx_.config.staEnabled || !ctx_.config.staSsid[0]) {
+    ctx_.networkStaConfigured = false;
+    ctx_.networkStaConnectAttemptActive = false;
+    return;
+  }
+
+  ensureSoftAp();
+
+  const char* hostName = ctx_.config.hostName[0] ? ctx_.config.hostName : DEFAULT_HOSTNAME;
+  WiFi.setHostname(hostName);
+
+  Serial.print("Starte nicht-blockierenden WLAN-Client-Verbindungsversuch: ");
+  Serial.println(ctx_.config.staSsid);
+
+  if (ctx_.config.staPassword[0]) {
+    WiFi.begin(ctx_.config.staSsid, ctx_.config.staPassword);
+  } else {
+    WiFi.begin(ctx_.config.staSsid);
+  }
+
+  ctx_.networkStaConfigured = true;
+  ctx_.networkStaConnectAttemptActive = true;
+  ctx_.networkLastStaReconnectAttemptMs = millis();
+}
+
+void AppFSM::serviceNetwork() {
+  ensureSoftAp();
+
+  const bool staConfigured = ctx_.config.staEnabled && ctx_.config.staSsid[0];
+  ctx_.networkStaConfigured = staConfigured;
+  ctx_.networkWifiMode = static_cast<uint8_t>(WiFi.getMode());
+  ctx_.networkStaStatus = static_cast<uint8_t>(WiFi.status());
+
+  if (!staConfigured) {
+    ctx_.networkStaConnected = false;
+    ctx_.networkStaConnectAttemptActive = false;
+    ctx_.networkStaRssi = 0;
+    ctx_.networkStaDisconnectedSinceMs = 0;
+    Alarms::clear("wifi_sta_disconnected");
+    return;
+  }
+
+  const uint32_t now = millis();
+  const bool connected = (WiFi.status() == WL_CONNECTED);
+  ctx_.networkStaConnected = connected;
+
+  if (connected) {
+    ctx_.networkStaEverConnected = true;
+    ctx_.networkStaConnectAttemptActive = false;
+    ctx_.networkStaRssi = WiFi.RSSI();
+    ctx_.networkStaDisconnectedSinceMs = 0;
+    if (ctx_.networkStaConnectedSinceMs == 0) ctx_.networkStaConnectedSinceMs = now;
+    Alarms::clear("wifi_sta_disconnected");
+    return;
+  }
+
+  ctx_.networkStaConnectedSinceMs = 0;
+  ctx_.networkStaRssi = 0;
+  if (ctx_.networkStaDisconnectedSinceMs == 0) ctx_.networkStaDisconnectedSinceMs = now;
+
+  Alarms::raise("wifi_sta_disconnected", Alarms::Severity::WARNING, "WLAN-Client ist nicht verbunden; SoftAP bleibt aktiv", true);
+
+  if (ctx_.networkLastStaReconnectAttemptMs == 0 ||
+      (uint32_t)(now - ctx_.networkLastStaReconnectAttemptMs) >= WIFI_STA_RECONNECT_INTERVAL_MS) {
+    startStaConnect();
+  }
+}
+
 void AppFSM::stateInitNetwork() {
   Serial.println("INIT_NETWORK gestartet");
 
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(false);
   WiFi.mode(WIFI_AP_STA);
 
   const char* ssid = ctx_.config.apName[0] ? ctx_.config.apName : DEFAULT_AP_SSID;
@@ -207,34 +328,14 @@ void AppFSM::stateInitNetwork() {
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
 
+  ctx_.networkInitialized = true;
+  ctx_.networkApActive = validSoftApIp();
+  g_lastSoftApCheckMs = 0;
+  ensureSoftAp();
+
   if (ctx_.config.staEnabled && ctx_.config.staSsid[0]) {
-    Serial.print("Verbinde mit WLAN: ");
-    Serial.println(ctx_.config.staSsid);
-
-    if (ctx_.config.staPassword[0]) {
-      WiFi.begin(ctx_.config.staSsid, ctx_.config.staPassword);
-    } else {
-      WiFi.begin(ctx_.config.staSsid);
-    }
-
-    uint32_t startMs = millis();
-    while (WiFi.status() != WL_CONNECTED && (uint32_t)(millis() - startMs) < WIFI_STA_CONNECT_TIMEOUT_MS) {
-      delay(250);
-      Serial.print('.');
-    }
-    Serial.println();
-
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.print("WLAN verbunden. STA IP: ");
-      Serial.println(WiFi.localIP());
-      Serial.print("Hostname: ");
-      Serial.println(hostName);
-      Serial.print("RSSI: ");
-      Serial.println(WiFi.RSSI());
-    } else {
-      Serial.println("WLAN-Verbindung fehlgeschlagen. SoftAP bleibt aktiv.");
-      WiFi.disconnect(false);
-    }
+    startStaConnect();
+    Serial.println("WLAN-Client-Verbindung laeuft nicht-blockierend im Hintergrund.");
   } else {
     Serial.println("WLAN-Client deaktiviert. Nur SoftAP aktiv.");
   }

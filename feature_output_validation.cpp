@@ -110,6 +110,47 @@ bool sameOutputRef(const OutputRef& a, const OutputRef& b) {
   return a.kind == b.kind && a.index == b.index;
 }
 
+Ds18Role heatingCircuitFlowRole(uint8_t circuitIndex) {
+  switch (circuitIndex) {
+    case 0: return Ds18Role::HK1_FLOW;
+    case 1: return Ds18Role::HK2_FLOW;
+    case 2: return Ds18Role::HK3_FLOW;
+    case 3: return Ds18Role::HK4_FLOW;
+    default: return Ds18Role::NONE;
+  }
+}
+
+Ds18Role heatingCircuitReturnRole(uint8_t circuitIndex) {
+  switch (circuitIndex) {
+    case 0: return Ds18Role::HK1_RETURN;
+    case 1: return Ds18Role::HK2_RETURN;
+    case 2: return Ds18Role::HK3_RETURN;
+    case 3: return Ds18Role::HK4_RETURN;
+    default: return Ds18Role::NONE;
+  }
+}
+
+int8_t heatingCircuitPumpRouteIndex(const PumpConfig& pump) {
+  if (pump.sourceType != PumpSourceType::SENSOR_ROLE) return -1;
+  for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+    if (pump.sourceSensorRole == heatingCircuitFlowRole(i) &&
+        pump.sinkRole == heatingCircuitReturnRole(i)) {
+      return (int8_t)i;
+    }
+  }
+  return -1;
+}
+
+int8_t partialHeatingCircuitRouteIndex(const PumpConfig& pump) {
+  if (pump.sourceType != PumpSourceType::SENSOR_ROLE) return -1;
+  for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+    const bool sourceIsFlow = pump.sourceSensorRole == heatingCircuitFlowRole(i);
+    const bool sinkIsReturn = pump.sinkRole == heatingCircuitReturnRole(i);
+    if (sourceIsFlow || sinkIsReturn) return (int8_t)i;
+  }
+  return -1;
+}
+
 bool validateHeatingCircuitInternal(
     const HeatingCircuitConfig& hk,
     uint8_t index,
@@ -122,22 +163,6 @@ bool validateHeatingCircuitInternal(
     error += String(index + 1);
     error += ": Mischer AUF und Mischer ZU verwenden denselben Ausgang ";
     error += outputLabel(hk.mixerOpenOutput.kind, hk.mixerOpenOutput.index);
-    return false;
-  }
-
-  if (sameOutputRef(hk.mixerOpenOutput, hk.pumpOutput)) {
-    error = "HK";
-    error += String(index + 1);
-    error += ": Mischer AUF und Pumpe verwenden denselben Ausgang ";
-    error += outputLabel(hk.mixerOpenOutput.kind, hk.mixerOpenOutput.index);
-    return false;
-  }
-
-  if (sameOutputRef(hk.mixerCloseOutput, hk.pumpOutput)) {
-    error = "HK";
-    error += String(index + 1);
-    error += ": Mischer ZU und Pumpe verwenden denselben Ausgang ";
-    error += outputLabel(hk.mixerCloseOutput.kind, hk.mixerCloseOutput.index);
     return false;
   }
 
@@ -223,21 +248,71 @@ bool validateConfig(const ConfigData& cfg, String& error) {
     }
   }
 
+  // Heizkreispumpen: Hardware ist zentral im Pumpenmenue.
+  // Gueltig ist nur Quelle HKx Vorlauf -> Ziel HKx Ruecklauf, beide fuer denselben Heizkreis.
+  uint8_t hkPumpCount[MAX_HEATING_CIRCUITS] = {0};
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    const PumpConfig& pump = cfg.pumps[i];
+    if (!pump.enabled || pump.mode == PumpMode::OFF) continue;
+    if (pump.sourceType != PumpSourceType::SENSOR_ROLE) continue;
+
+    const int8_t fullHk = heatingCircuitPumpRouteIndex(pump);
+    const int8_t partialHk = partialHeatingCircuitRouteIndex(pump);
+
+    if (partialHk >= 0 && fullHk < 0) {
+      error = "Pumpe ";
+      error += String(i + 1);
+      error += ": Heizkreis-Pumpe muss Quelle HKx Vorlauf und Ziel HKx Ruecklauf desselben Heizkreises verwenden";
+      return false;
+    }
+
+    if (fullHk >= 0) {
+      hkPumpCount[(uint8_t)fullHk]++;
+      if (hkPumpCount[(uint8_t)fullHk] > 1) {
+        error = "HK";
+        error += String((int)fullHk + 1);
+        error += ": Es darf nur eine Pumpe mit Quelle HK";
+        error += String((int)fullHk + 1);
+        error += " Vorlauf und Ziel HK";
+        error += String((int)fullHk + 1);
+        error += " Ruecklauf geben";
+        return false;
+      }
+    }
+  }
+
   // Zusatzheizung / E-Kessel
   const AuxHeaterConfig& aux = cfg.auxHeater;
 
   if (aux.enabled) {
-    if (!addOutput(relaySlots, pwmSlots, OutputKind::RELAY, aux.pumpRelay, "Zusatzheizung Pumpe", error)) return false;
-    if (!addOutput(relaySlots, pwmSlots, OutputKind::RELAY, aux.heaterRelay1, "Zusatzheizung Heizstab Stufe 1", error)) return false;
-    if (!addOutput(relaySlots, pwmSlots, OutputKind::RELAY, aux.heaterRelay2, "Zusatzheizung Heizstab Stufe 2", error)) return false;
-    if (!addOutput(relaySlots, pwmSlots, OutputKind::RELAY, aux.heaterRelay3, "Zusatzheizung Heizstab Stufe 3", error)) return false;
+    if (!addOutputRef(relaySlots, pwmSlots, aux.pumpOutput, "Zusatzheizung Pumpe", error)) return false;
+    if (!addOutputRef(relaySlots, pwmSlots, aux.heaterOutput1, "Zusatzheizung Heizstab Stufe 1", error)) return false;
+    if (!addOutputRef(relaySlots, pwmSlots, aux.heaterOutput2, "Zusatzheizung Heizstab Stufe 2", error)) return false;
+    if (!addOutputRef(relaySlots, pwmSlots, aux.heaterOutput3, "Zusatzheizung Heizstab Stufe 3", error)) return false;
   }
 
-  // Ofen
+  // Ofenpumpe: Die Hardware wird zentral im Pumpenmenue konfiguriert.
+  // Das Ofenmodul darf keinen eigenen Ausgang mehr besitzen, sondern fordert
+  // die Pumpe mit Quelle ALT_SOURCE_OVEN an.
   const OvenConfig& oven = cfg.oven;
+  uint8_t ovenPumpCount = 0;
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    const PumpConfig& pump = cfg.pumps[i];
+    if (!pump.enabled || pump.mode == PumpMode::OFF) continue;
+    if (pump.sourceType == PumpSourceType::HEAT_SOURCE_ROLE &&
+        pump.sourceRole == HeatSourceRole::ALT_SOURCE_OVEN) {
+      ovenPumpCount++;
+    }
+  }
 
-  if (oven.enabled) {
-    if (!addOutput(relaySlots, pwmSlots, OutputKind::RELAY, oven.pumpRelay, "Ofenpumpe", error)) return false;
+  if (oven.enabled && ovenPumpCount == 0) {
+    error = "Ofensteuerung aktiviert, aber keine Pumpe mit Quelle Ofen im Pumpenmenue konfiguriert";
+    return false;
+  }
+
+  if (ovenPumpCount > 1) {
+    error = "Es darf nur eine Pumpe mit Quelle Ofen konfiguriert sein";
+    return false;
   }
 
   // Heizkreise
@@ -252,7 +327,6 @@ bool validateConfig(const ConfigData& cfg, String& error) {
 
     if (!addOutputRef(relaySlots, pwmSlots, hk.mixerOpenOutput, "HK" + String(i + 1) + " Mischer AUF", error)) return false;
     if (!addOutputRef(relaySlots, pwmSlots, hk.mixerCloseOutput, "HK" + String(i + 1) + " Mischer ZU", error)) return false;
-    if (!addOutputRef(relaySlots, pwmSlots, hk.pumpOutput, "HK" + String(i + 1) + " Pumpe", error)) return false;
   }
 
   // Valve V2
