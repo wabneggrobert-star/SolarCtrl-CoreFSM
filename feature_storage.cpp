@@ -9,6 +9,7 @@
 #include <SD.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 
 namespace {
   bool g_sdAvailable = false;
@@ -259,6 +260,14 @@ namespace {
     cfg.ovenOvertemperatureOnC = 85.0f;
     cfg.ovenOvertemperatureOffC = 78.0f;
 
+    cfg.energyMeter.enabled = false;
+    cfg.energyMeter.feedbackInputIndex = PIN_UNUSED;
+    cfg.energyMeter.pulsesPerLiter = 450.0f;
+    cfg.energyMeter.flowSensorRole = Ds18Role::NONE;
+    cfg.energyMeter.returnSensorRole = Ds18Role::NONE;
+    cfg.energyMeter.energyFactorWhPerLiterK = DEFAULT_ENERGY_FACTOR_GLYCOL_WH_PER_L_K;
+    cfg.energyMeter.logIntervalMs = DEFAULT_ENERGY_LOG_INTERVAL_MS;
+
     // MAX31865 Kanal-Defaults
     cfg.max1.enabled = true;
     cfg.max1.offsetC = 0.0f;
@@ -301,7 +310,7 @@ namespace {
       cfg.pumps[i].relayIndex = PIN_UNUSED;
       cfg.pumps[i].pwmChannel = (i < 5) ? PUMP_PWM_CHANNELS[i] : PIN_UNUSED;
       cfg.pumps[i].pwmProfile = PwmProfile::SOLAR;
-      cfg.pumps[i].feedbackPin =(i < FEEDBACK_INPUT_COUNT) ? i : PIN_UNUSED;
+      cfg.pumps[i].feedbackPin = (i < FEEDBACK_INPUT_COUNT) ? FEEDBACK_INPUT_PINS[i] : PIN_UNUSED;
       cfg.pumps[i].valveIndex = PIN_UNUSED;
       cfg.pumps[i].minPwmPercent = 10.0f;
       cfg.pumps[i].maxPwmPercent = 100.0f;
@@ -489,6 +498,21 @@ bool loadConfig(ConfigData& cfg) {
 
   v = valueOf(text, "solarCollectorType");
   if (v.length()) cfg.solarCollectorType = (v.toInt() == 1) ? SolarCollectorType::EVACUATED_TUBE : SolarCollectorType::FLAT_PLATE;
+
+  v = valueOf(text, "energyMeterEnabled");
+  if (v.length()) cfg.energyMeter.enabled = (v.toInt() != 0);
+  v = valueOf(text, "energyMeterFeedbackInputIndex");
+  if (v.length()) cfg.energyMeter.feedbackInputIndex = (uint8_t)v.toInt();
+  v = valueOf(text, "energyMeterPulsesPerLiter");
+  if (v.length()) cfg.energyMeter.pulsesPerLiter = v.toFloat();
+  v = valueOf(text, "energyMeterFlowSensorRole");
+  if (v.length()) cfg.energyMeter.flowSensorRole = ds18RoleFromInt(v.toInt());
+  v = valueOf(text, "energyMeterReturnSensorRole");
+  if (v.length()) cfg.energyMeter.returnSensorRole = ds18RoleFromInt(v.toInt());
+  v = valueOf(text, "energyMeterFactorWhPerLiterK");
+  if (v.length()) cfg.energyMeter.energyFactorWhPerLiterK = v.toFloat();
+  v = valueOf(text, "energyMeterLogIntervalMs");
+  if (v.length()) cfg.energyMeter.logIntervalMs = (uint32_t)v.toInt();
 
   v = valueOf(text, "frostEnabled");
   if (v.length()) cfg.frostEnabled = (v.toInt() != 0);
@@ -1015,6 +1039,14 @@ bool saveConfig(const ConfigData& cfg) {
   text += "solarHydraulicType=" + String((int)cfg.solarHydraulicType) + "\n";
   text += "solarCollectorType=" + String((int)cfg.solarCollectorType) + "\n";
 
+  text += "energyMeterEnabled=" + String(cfg.energyMeter.enabled ? 1 : 0) + "\n";
+  text += "energyMeterFeedbackInputIndex=" + String(cfg.energyMeter.feedbackInputIndex) + "\n";
+  text += "energyMeterPulsesPerLiter=" + String(cfg.energyMeter.pulsesPerLiter, 4) + "\n";
+  text += "energyMeterFlowSensorRole=" + String(ds18RoleToInt(cfg.energyMeter.flowSensorRole)) + "\n";
+  text += "energyMeterReturnSensorRole=" + String(ds18RoleToInt(cfg.energyMeter.returnSensorRole)) + "\n";
+  text += "energyMeterFactorWhPerLiterK=" + String(cfg.energyMeter.energyFactorWhPerLiterK, 5) + "\n";
+  text += "energyMeterLogIntervalMs=" + String(cfg.energyMeter.logIntervalMs) + "\n";
+
   text += "frostEnabled=" + String(cfg.frostEnabled ? 1 : 0) + "\n";
   text += "frostCollectorOnC=" + String(cfg.frostCollectorOnC, 2) + "\n";
   text += "frostCollectorOffC=" + String(cfg.frostCollectorOffC, 2) + "\n";
@@ -1383,6 +1415,44 @@ bool saveSensorAssignments(const SensorAssignmentTable& table) {
   }
 
   return writeFileText(FILE_SENSOR_ASSIGNMENTS, text);
+}
+
+bool loadEnergyMeterRuntime(EnergyMeterRuntime& runtime) {
+  runtime.totalPulses = 0;
+  runtime.totalVolumeLiters = 0.0;
+  runtime.totalEnergyKWh = 0.0;
+  const String text = readFileText(FILE_ENERGY_METER_RUNTIME);
+  if (text.isEmpty()) return false;
+  String v = valueOf(text, "totalPulses");
+  if (v.length()) runtime.totalPulses = (uint32_t)strtoul(v.c_str(), nullptr, 10);
+  v = valueOf(text, "totalVolumeLiters");
+  if (v.length()) runtime.totalVolumeLiters = strtod(v.c_str(), nullptr);
+  v = valueOf(text, "totalEnergyKWh");
+  if (v.length()) runtime.totalEnergyKWh = strtod(v.c_str(), nullptr);
+  return true;
+}
+
+bool saveEnergyMeterRuntime(const EnergyMeterRuntime& runtime) {
+  String text;
+  text += "totalPulses=" + String(runtime.totalPulses) + "\n";
+  text += "totalVolumeLiters=" + String(runtime.totalVolumeLiters, 6) + "\n";
+  text += "totalEnergyKWh=" + String(runtime.totalEnergyKWh, 6) + "\n";
+  return writeFileText(FILE_ENERGY_METER_RUNTIME, text);
+}
+
+void resetEnergyMeterRuntime(EnergyMeterRuntime& runtime) {
+  runtime.totalPulses = 0;
+  runtime.totalVolumeLiters = 0.0;
+  runtime.totalEnergyKWh = 0.0;
+  runtime.flowLitersPerMinute = 0.0f;
+  runtime.flowTemperatureC = NAN;
+  runtime.returnTemperatureC = NAN;
+  runtime.deltaTemperatureK = NAN;
+  runtime.thermalPowerKw = 0.0f;
+  runtime.temperatureValid = false;
+  runtime.lastProcessMs = millis();
+  runtime.lastTemperatureSampleMs = 0;
+  runtime.lastLogMs = 0;
 }
 
 void resetConfig(ConfigData& cfg) {

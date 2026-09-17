@@ -45,12 +45,8 @@ namespace {
   }
 
 uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
-
-  if (pumpIndex >= FEEDBACK_INPUT_COUNT) {
-    return PIN_UNUSED;
-  }
-
-  return pumpIndex;
+  if (pumpIndex >= FEEDBACK_INPUT_COUNT) return PIN_UNUSED;
+  return FEEDBACK_INPUT_PINS[pumpIndex];
 }
 
   void setPwmPercent(const PumpConfig& pump, float percent) {

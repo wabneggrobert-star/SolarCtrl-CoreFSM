@@ -20,15 +20,15 @@ static const RoleMap roleMap[] = {
   {Ds18Role::BUFFER_MID, "buffer_mid", "Puffer Mitte", true},
   {Ds18Role::BUFFER_BOTTOM, "buffer_bottom", "Puffer Bottom", true},
 
-  // Alte Kollektor-/Quellenrollen fuer DS18 werden nicht mehr neu angeboten.
-  {Ds18Role::FLOW_COLLECTOR_1, "flow_collector_1", "ALT: Vorlauf Kollektor 1", false},
-  {Ds18Role::FLOW_COLLECTOR_2, "flow_collector_2", "ALT: Vorlauf Kollektor 2", false},
-  {Ds18Role::FLOW_COLLECTOR_3, "flow_collector_3", "ALT: Vorlauf Kollektor 3", false},
-  {Ds18Role::FLOW_ALT_SOURCE, "flow_alt_source", "ALT: Vorlauf Alternative Quelle", false},
-  {Ds18Role::RETURN_COLLECTOR_1, "return_collector_1", "ALT: Ruecklauf Kollektor 1", false},
-  {Ds18Role::RETURN_COLLECTOR_2, "return_collector_2", "ALT: Ruecklauf Kollektor 2", false},
-  {Ds18Role::RETURN_COLLECTOR_3, "return_collector_3", "ALT: Ruecklauf Kollektor 3", false},
-  {Ds18Role::RETURN_ALT_SOURCE, "return_alt_source", "ALT: Ruecklauf Alternative Quelle", false},
+  // Durchfluss-/Waermemengenmessung: DS18-Rollen fuer Vorlauf/Ruecklauf sind wieder zuweisbar.
+  {Ds18Role::FLOW_COLLECTOR_1, "flow_collector_1", "Vorlauf Kollektor 1", true},
+  {Ds18Role::FLOW_COLLECTOR_2, "flow_collector_2", "Vorlauf Kollektor 2", true},
+  {Ds18Role::FLOW_COLLECTOR_3, "flow_collector_3", "Vorlauf Kollektor 3", true},
+  {Ds18Role::FLOW_ALT_SOURCE, "flow_alt_source", "Vorlauf alternative Quelle / Ofen", true},
+  {Ds18Role::RETURN_COLLECTOR_1, "return_collector_1", "Ruecklauf Kollektor 1", true},
+  {Ds18Role::RETURN_COLLECTOR_2, "return_collector_2", "Ruecklauf Kollektor 2", true},
+  {Ds18Role::RETURN_COLLECTOR_3, "return_collector_3", "Ruecklauf Kollektor 3", true},
+  {Ds18Role::RETURN_ALT_SOURCE, "return_alt_source", "Ruecklauf alternative Quelle / Ofen", true},
 
   {Ds18Role::CIRCULATION, "circulation", "Zirkulation", true},
   {Ds18Role::SWIMMINGPOOL, "swimmingpool", "Swimmingpool", true},

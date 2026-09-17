@@ -21,6 +21,7 @@
 #include "feature_heat_sources_max31865.h"
 #include "feature_alarms.h"
 #include "feature_aux_heater.h"
+#include "feature_energy_meter.h"
 #include <WebServer.h>
 #include <SD.h>
 #include <WiFi.h>
@@ -137,6 +138,7 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
     if (path.endsWith(".css")) return "text/css";
     if (path.endsWith(".js")) return "application/javascript";
     if (path.endsWith(".json")) return "application/json";
+    if (path.endsWith(".csv")) return "text/csv";
     return "text/plain";
   }
 
@@ -216,6 +218,11 @@ void handleStatusJson() {
   json += ",\"ovenServoAngle\":" + String(OvenControl::servoAngle());
   json += ",\"ovenServoOpeningPercent\":" + String(OvenControl::servoOpeningPercent());
   json += ",\"ovenPumpActive\":" + String(OvenControl::pumpActive() ? "true" : "false");
+  json += ",\"energyMeterEnabled\":" + String(s_ctx->config.energyMeter.enabled ? "true" : "false");
+  json += ",\"energyTotalKWh\":" + String(s_ctx->energyMeter.totalEnergyKWh, 3);
+  json += ",\"energyPowerKw\":" + String(s_ctx->energyMeter.thermalPowerKw, 3);
+  json += ",\"energyFlowLMin\":" + String(s_ctx->energyMeter.flowLitersPerMinute, 2);
+  json += ",\"energyVolumeLiters\":" + String(s_ctx->energyMeter.totalVolumeLiters, 1);
   json += "}";
 
   server.send(200, "application/json", json);
@@ -524,6 +531,142 @@ void handlePlantJson() {
 
   server.send(200, "application/json", json);
 }
+int pumpUsingFeedbackGpio(const AppContext& ctx, uint8_t gpio) {
+  if (gpio == PIN_UNUSED) return -1;
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    const PumpConfig& pump = ctx.config.pumps[i];
+    if (!pump.enabled || pump.mode != PumpMode::PWM) continue;
+    if (pump.feedbackPin == gpio) return i;
+  }
+  return -1;
+}
+
+bool energyMeterUsesFeedbackGpio(const AppContext& ctx, uint8_t gpio) {
+  if (!ctx.config.energyMeter.enabled) return false;
+  const uint8_t configuredGpio = EnergyMeter::gpioForFeedbackInput(ctx.config.energyMeter.feedbackInputIndex);
+  return configuredGpio != PIN_UNUSED && configuredGpio == gpio;
+}
+
+void handleEnergyMeterJson() {
+  if (!s_ctx) {
+    server.send(500, "application/json", "{\"error\":\"no_context\"}");
+    return;
+  }
+
+  const EnergyMeterConfig& cfg = s_ctx->config.energyMeter;
+  const EnergyMeterRuntime& rt = s_ctx->energyMeter;
+  String json = "{";
+  json += "\"enabled\":" + String(cfg.enabled ? "true" : "false") + ",";
+  json += "\"feedbackInputIndex\":" + String(cfg.feedbackInputIndex) + ",";
+  json += "\"feedbackGpio\":" + String(EnergyMeter::gpioForFeedbackInput(cfg.feedbackInputIndex)) + ",";
+  json += "\"pulsesPerLiter\":" + String(cfg.pulsesPerLiter, 4) + ",";
+  json += "\"frequencyFactorHzPerLMin\":" + String(cfg.pulsesPerLiter / 60.0f, 5) + ",";
+  json += "\"flowSensorRole\":\"" + String(SensorRoles::toKey(cfg.flowSensorRole)) + "\",";
+  json += "\"returnSensorRole\":\"" + String(SensorRoles::toKey(cfg.returnSensorRole)) + "\",";
+  json += "\"energyFactorWhPerLiterK\":" + String(cfg.energyFactorWhPerLiterK, 5) + ",";
+  json += "\"logIntervalMs\":" + String(cfg.logIntervalMs) + ",";
+  json += "\"csvPath\":\"" + String(FILE_ENERGY_METER_LOG) + "\",";
+  json += "\"runtime\":{";
+  json += "\"feedbackAttached\":" + String(rt.feedbackAttached ? "true" : "false") + ",";
+  json += "\"temperatureValid\":" + String(rt.temperatureValid ? "true" : "false") + ",";
+  json += "\"totalPulses\":" + String(rt.totalPulses) + ",";
+  json += "\"totalVolumeLiters\":" + String(rt.totalVolumeLiters, 3) + ",";
+  json += "\"totalEnergyKWh\":" + String(rt.totalEnergyKWh, 5) + ",";
+  json += "\"flowLitersPerMinute\":" + String(rt.flowLitersPerMinute, 3) + ",";
+  json += "\"flowTemperatureC\":" + jsonFloat(rt.flowTemperatureC, 2) + ",";
+  json += "\"returnTemperatureC\":" + jsonFloat(rt.returnTemperatureC, 2) + ",";
+  json += "\"deltaTemperatureK\":" + jsonFloat(rt.deltaTemperatureK, 2) + ",";
+  json += "\"thermalPowerKw\":" + String(rt.thermalPowerKw, 3);
+  json += "},";
+
+  json += "\"feedbackInputs\":[";
+  for (uint8_t i = 0; i < FEEDBACK_INPUT_COUNT; i++) {
+    if (i > 0) json += ",";
+    const uint8_t gpio = FEEDBACK_INPUT_PINS[i];
+    const int usedByPump = pumpUsingFeedbackGpio(*s_ctx, gpio);
+    json += "{";
+    json += "\"index\":" + String(i) + ",";
+    json += "\"gpio\":" + String(gpio) + ",";
+    json += "\"label\":\"FB" + String(i) + " (GPIO " + String(gpio) + ")\",";
+    json += "\"usedByPump\":" + String(usedByPump);
+    json += "}";
+  }
+  json += "],";
+
+  json += "\"sensorRoles\":[";
+  bool first = true;
+  for (int i = 1; i <= (int)Ds18Role::HK4_RETURN; i++) {
+    const Ds18Role role = (Ds18Role)i;
+    if (!first) json += ",";
+    first = false;
+    json += "{";
+    json += "\"key\":\"" + String(SensorRoles::toKey(role)) + "\",";
+    json += "\"label\":\"" + String(SensorRoles::toLabel(role)) + "\",";
+    json += "\"assigned\":" + String(SensorAssignments::hasRole(s_ctx->assignments, role) ? "true" : "false");
+    json += "}";
+  }
+  json += "]";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleEnergyMeterSave() {
+  if (!s_ctx) {
+    server.send(500, "text/plain", "Kein Kontext");
+    return;
+  }
+
+  EnergyMeterConfig candidate = s_ctx->config.energyMeter;
+  candidate.enabled = server.hasArg("enabled") && server.arg("enabled").toInt() != 0;
+  if (server.hasArg("feedbackInputIndex")) {
+    const int idx = server.arg("feedbackInputIndex").toInt();
+    candidate.feedbackInputIndex = (idx >= 0 && idx < FEEDBACK_INPUT_COUNT) ? (uint8_t)idx : PIN_UNUSED;
+  }
+  if (server.hasArg("pulsesPerLiter")) candidate.pulsesPerLiter = server.arg("pulsesPerLiter").toFloat();
+  if (server.hasArg("flowSensorRole")) candidate.flowSensorRole = SensorRoles::fromKey(server.arg("flowSensorRole"));
+  if (server.hasArg("returnSensorRole")) candidate.returnSensorRole = SensorRoles::fromKey(server.arg("returnSensorRole"));
+  if (server.hasArg("energyFactorWhPerLiterK")) candidate.energyFactorWhPerLiterK = server.arg("energyFactorWhPerLiterK").toFloat();
+
+  if (candidate.enabled) {
+    if (candidate.feedbackInputIndex == PIN_UNUSED || candidate.feedbackInputIndex >= FEEDBACK_INPUT_COUNT) {
+      server.send(400, "text/plain", "Feedback-Eingang fuer Flowmeter fehlt");
+      return;
+    }
+    if (candidate.pulsesPerLiter <= 0.0f || candidate.pulsesPerLiter > 1000000.0f) {
+      server.send(400, "text/plain", "Impulse pro Liter muessen groesser 0 sein");
+      return;
+    }
+    if (candidate.flowSensorRole == Ds18Role::NONE || candidate.returnSensorRole == Ds18Role::NONE ||
+        candidate.flowSensorRole == candidate.returnSensorRole) {
+      server.send(400, "text/plain", "Vorlauf- und Ruecklaufsensor muessen gesetzt und verschieden sein");
+      return;
+    }
+    if (!SensorAssignments::hasRole(s_ctx->assignments, candidate.flowSensorRole) ||
+        !SensorAssignments::hasRole(s_ctx->assignments, candidate.returnSensorRole)) {
+      server.send(409, "text/plain", "Vorlauf- oder Ruecklaufsensor ist aktuell keinem DS18B20 zugeordnet");
+      return;
+    }
+    if (candidate.energyFactorWhPerLiterK <= 0.0f || candidate.energyFactorWhPerLiterK > 2.0f) {
+      server.send(400, "text/plain", "Waermetraegerfaktor ungueltig");
+      return;
+    }
+    const uint8_t gpio = EnergyMeter::gpioForFeedbackInput(candidate.feedbackInputIndex);
+    const int usedByPump = pumpUsingFeedbackGpio(*s_ctx, gpio);
+    if (usedByPump >= 0) {
+      server.send(409, "text/plain", "Feedback-Eingang wird bereits von Pumpe " + String(usedByPump + 1) + " verwendet");
+      return;
+    }
+  }
+
+  s_ctx->config.energyMeter = candidate;
+  if (!Storage::saveConfig(s_ctx->config)) {
+    server.send(500, "text/plain", "Energiezaehler konnte nicht gespeichert werden");
+    return;
+  }
+  EnergyMeter::reconfigure(*s_ctx);
+  server.send(200, "text/plain", "OK");
+}
+
 void handleHeatSourcesJson() {
   if (!s_ctx) {
     server.send(500, "application/json", "{\"error\":\"no_context\"}");
@@ -1577,6 +1720,10 @@ int feedbackPinUsedBy(const AppContext& ctx, uint8_t feedbackPin, int ignorePump
           error = "Feedback-Eingang bereits von Pumpe " + String(feedbackUsedBy + 1) + " verwendet";
           return false;
         }
+        if (energyMeterUsesFeedbackGpio(ctx, candidate.feedbackPin)) {
+          error = "Feedback-Eingang wird vom Energiezaehler verwendet";
+          return false;
+        }
       }
     }
 
@@ -1783,14 +1930,15 @@ int feedbackPinUsedBy(const AppContext& ctx, uint8_t feedbackPin, int ignorePump
 
     json += "],\"feedbackPins\":[";
     first = true;
-    const uint8_t feedbackPins[] = {PIN_UNUSED, 35, 36, 39, 32, 33, 34};
-    for (uint8_t fp = 0; fp < sizeof(feedbackPins) / sizeof(feedbackPins[0]); fp++) {
-      const uint8_t pin = feedbackPins[fp];
-      if (!first) json += ",";
-      first = false;
-      String label = (pin == PIN_UNUSED) ? String("kein Feedback") : feedbackInputLabel(fp - 1, pin);
-      json += "{\"index\":" + String(pin) + ",\"label\":\"" + label + "\",\"usedBy\":" + String(feedbackPinUsedBy(*s_ctx, pin, -1)) + "}";
+    json += "{\"index\":255,\"label\":\"kein Feedback\",\"usedBy\":-1,\"energyMeterUsed\":false}";
+    first = false;
+    for (uint8_t fp = 0; fp < FEEDBACK_INPUT_COUNT; fp++) {
+      const uint8_t pin = FEEDBACK_INPUT_PINS[fp];
+      json += ",";
+      const String label = feedbackInputLabel(fp, pin);
+      json += "{\"index\":" + String(pin) + ",\"label\":\"" + label + "\",\"usedBy\":" + String(feedbackPinUsedBy(*s_ctx, pin, -1)) + ",\"energyMeterUsed\":" + String(energyMeterUsesFeedbackGpio(*s_ctx, pin) ? "true" : "false") + "}";
     }
+
 
     json += "],\"heatSources\":[";
     bool firstHs = true;
@@ -3159,6 +3307,9 @@ server.send(200, "text/plain", "OK");
     Storage::resetConfig(s_ctx->config);
     Storage::resetDiagnostics(s_ctx->diag);
     Storage::resetMaintenance(s_ctx->maintenance);
+    Storage::resetEnergyMeterRuntime(s_ctx->energyMeter);
+    Storage::saveEnergyMeterRuntime(s_ctx->energyMeter);
+    EnergyMeter::reconfigure(*s_ctx);
     Alarms::resetAll();
     Alarms::recordInfo("factory_reset", clearSensorLinks
       ? "Werkseinstellungen ausgefuehrt, Sensor- und Waermequellen-Zuordnung geloescht"
@@ -4053,6 +4204,8 @@ void begin(AppContext& ctx) {
   server.on("/service-save-safety", HTTP_POST, handleSafetySave);
   server.on("/api/aux-heater", HTTP_GET, handleAuxHeaterJson);
   server.on("/service-save-aux-heater", HTTP_POST, handleAuxHeaterSave);
+  server.on("/api/energy-meter", HTTP_GET, handleEnergyMeterJson);
+  server.on("/service-save-energy-meter", HTTP_POST, handleEnergyMeterSave);
   server.onNotFound(handleStatic);
 
   server.begin();

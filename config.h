@@ -141,6 +141,11 @@ static constexpr uint8_t DEFAULT_STAGNATION_PUMP_PERCENT     = 100;
 // ======================================================
 static constexpr uint32_t DEFAULT_SAMPLE_INTERVAL_MS       = 2000;
 static constexpr uint32_t DEFAULT_RUNTIME_SAVE_INTERVAL_MS = 60000;
+
+// Energiezaehler
+static constexpr uint32_t DEFAULT_ENERGY_LOG_INTERVAL_MS = 60000UL;
+static constexpr float DEFAULT_ENERGY_FACTOR_GLYCOL_WH_PER_L_K = 1.00f;
+static constexpr float DEFAULT_ENERGY_FACTOR_WATER_WH_PER_L_K = 1.163f;
 static constexpr uint32_t FAULT_RETRY_INTERVAL_MS          = 5000;
 static constexpr uint32_t SENSOR_CONVERSION_WAIT_MS        = 800;
 static constexpr uint32_t UI_SESSION_TIMEOUT_MS            = 300000;
@@ -153,3 +158,5 @@ static constexpr const char* FILE_DIAGNOSTICS             = "/runtime/diagnostic
 static constexpr const char* FILE_MAINTENANCE             = "/runtime/maintenance.cfg";
 static constexpr const char* FILE_SENSOR_ASSIGNMENTS      = "/config/sensors.cfg";
 static constexpr const char* FILE_HEAT_SOURCE_ASSIGNMENTS = "/config/heat_sources.cfg";
+static constexpr const char* FILE_ENERGY_METER_RUNTIME      = "/runtime/energy_meter.cfg";
+static constexpr const char* FILE_ENERGY_METER_LOG          = "/logs/energy_meter.csv";

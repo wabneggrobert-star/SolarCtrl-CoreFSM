@@ -640,6 +640,32 @@ struct HeatingCircuitRuntime {
 
 static constexpr uint8_t MAX_VALVES = 10;
 
+// ===================== Energiezaehler =====================
+struct EnergyMeterConfig {
+  bool enabled = false;
+  uint8_t feedbackInputIndex = PIN_UNUSED;
+  float pulsesPerLiter = 450.0f;
+  Ds18Role flowSensorRole = Ds18Role::NONE;
+  Ds18Role returnSensorRole = Ds18Role::NONE;
+  float energyFactorWhPerLiterK = 1.00f;
+  uint32_t logIntervalMs = 60000UL;
+};
+
+struct EnergyMeterRuntime {
+  bool feedbackAttached = false;
+  bool temperatureValid = false;
+  uint32_t totalPulses = 0;
+  double totalVolumeLiters = 0.0;
+  double totalEnergyKWh = 0.0;
+  float flowLitersPerMinute = 0.0f;
+  float flowTemperatureC = NAN;
+  float returnTemperatureC = NAN;
+  float deltaTemperatureK = NAN;
+  float thermalPowerKw = 0.0f;
+  uint32_t lastProcessMs = 0;
+  uint32_t lastTemperatureSampleMs = 0;
+  uint32_t lastLogMs = 0;
+};
 
 // ===================== Konfiguration =====================
 struct ConfigData {
@@ -706,6 +732,7 @@ struct ConfigData {
   OvenConfig oven;
   HeatingCircuitConfig heatingCircuits[MAX_HEATING_CIRCUITS];
   ValveConfig valves[MAX_VALVES];
+  EnergyMeterConfig energyMeter;
 };
 
 // ===================== Diagnose =====================
@@ -784,5 +811,6 @@ struct AppContext {
 
   CommissioningState commissioning;
   HeatingCircuitRuntime heatingCircuitRuntime[MAX_HEATING_CIRCUITS];
+  EnergyMeterRuntime energyMeter;
 };
 

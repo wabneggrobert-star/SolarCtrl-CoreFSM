@@ -18,6 +18,7 @@
 #include "feature_heating_circuits.h"
 #include "feature_alarms.h"
 #include "feature_output_validation.h"
+#include "feature_energy_meter.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -188,6 +189,7 @@ void AppFSM::stateLoadConfig() {
   Storage::loadConfig(ctx_.config);
   Storage::loadDiagnostics(ctx_.diag);
   Storage::loadMaintenance(ctx_.maintenance);
+  Storage::loadEnergyMeterRuntime(ctx_.energyMeter);
   Storage::loadSensorAssignments(ctx_.assignments);
   HeatSourceStorage::loadAssignments(ctx_.heatSourceAssignments);
 
@@ -201,6 +203,7 @@ void AppFSM::stateLoadConfig() {
   }
 
   OvenControl::begin(ctx_);
+  EnergyMeter::begin(ctx_);
 
   ctx_.diag.bootCount++;
   Storage::saveDiagnostics(ctx_.diag);
@@ -462,6 +465,8 @@ void AppFSM::stateSelfTest() {
     yield();
   }
 
+  EnergyMeter::process(ctx_);
+
   Ds18Role sinkRole = SensorAssignments::activeSinkRole(ctx_.config);
   SensorAssignments::readByRole(
     ctx_.assignments,
@@ -526,6 +531,8 @@ void AppFSM::stateValidateSensors() {
   if (!HeatSourcesMax::cycleComplete(ctx_)) {
     return;
   }
+
+  EnergyMeter::process(ctx_);
 
   Ds18Role sinkRole = SensorAssignments::activeSinkRole(ctx_.config);
   SensorAssignments::readByRole(
@@ -676,6 +683,7 @@ void AppFSM::stateUpdateRuntime() {
 
   Storage::saveDiagnostics(ctx_.diag);
   Storage::saveMaintenance(ctx_.maintenance);
+  EnergyMeter::saveRuntime(ctx_);
 
   changeState(SystemState::IDLE);
 }
