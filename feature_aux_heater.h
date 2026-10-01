@@ -12,4 +12,7 @@ void allOff(AppContext& ctx);
 void resumeAfterTestMode();
 bool heatingActive();
 bool cooldownActive();
+bool pumpActive();
+uint8_t activeStageCount();
+const char* stateText();
 }

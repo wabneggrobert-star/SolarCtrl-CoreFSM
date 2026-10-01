@@ -2,13 +2,16 @@
 
 #include "config.h"
 #include "feature_energy_conflicts.h"
+#include "feature_ml_optimizer.h"
 #include "feature_pump_routing.h"
 #include "feature_relay_outputs.h"
 #include "feature_pwm_pca9685.h"
 #include "feature_sensor_assignments.h"
 #include "feature_valves.h"
+#include "feature_time.h"
 
 #include <Arduino.h>
+#include <SD.h>
 #include <math.h>
 
 namespace {
@@ -18,6 +21,96 @@ namespace {
   };
 
   PidState pid[MAX_PUMPS];
+
+  // Feldtest-Diagnose: PWM-Regelverlauf fuer spaetere PID-Analyse.
+  // Bewusst nur Logging; die eigentliche Pumpenregelung wird nicht veraendert.
+  constexpr const char* PWM_TRACE_PATH = "/logs/pwm_trace.csv";
+  constexpr uint32_t PWM_TRACE_INTERVAL_MS = 5000UL;
+  uint32_t pwmTraceLastMs[MAX_PUMPS] = {};
+
+  float effectiveTargetDiffForTrace(const PumpConfig& p) {
+    float target = p.targetDiff;
+    if (p.activeTargetIndex < PUMP_ROUTE_TARGET_COUNT) {
+      const PumpRouteTargetConfig& t = p.targets[p.activeTargetIndex];
+      if (t.enabled && t.targetDiffOverride > 0.0f) target = t.targetDiffOverride;
+    }
+    return target;
+  }
+
+  float effectiveHysteresisForTrace(const PumpConfig& p) {
+    float hyst = p.hysteresis;
+    if (p.activeTargetIndex < PUMP_ROUTE_TARGET_COUNT) {
+      const PumpRouteTargetConfig& t = p.targets[p.activeTargetIndex];
+      if (t.enabled && t.hysteresisOverride > 0.0f) hyst = t.hysteresisOverride;
+    }
+    return hyst;
+  }
+
+  void logPwmTrace(AppContext& ctx) {
+    const uint32_t nowMs = millis();
+
+    bool needsWrite = false;
+    for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+      const PumpConfig& p = ctx.config.pumps[i];
+      if (!p.enabled || p.mode != PumpMode::PWM) continue;
+      if (pwmTraceLastMs[i] == 0 || (uint32_t)(nowMs - pwmTraceLastMs[i]) >= PWM_TRACE_INTERVAL_MS) {
+        needsWrite = true;
+        break;
+      }
+    }
+    if (!needsWrite) return;
+
+    if (!SD.exists("/logs")) SD.mkdir("/logs");
+    const bool fresh = !SD.exists(PWM_TRACE_PATH);
+    File f = SD.open(PWM_TRACE_PATH, FILE_APPEND);
+    if (!f) return;
+
+    if (fresh) {
+      f.println("timestamp,uptime_ms,pump_index,state,active_target,source_c,sink_c,diff_c,target_diff_c,start_diff_c,hysteresis_c,pwm_pct,min_pwm_pct,max_pwm_pct,pid_kp,pid_ki,pid_kd,pid_error,pid_integral");
+    }
+
+    const String timestamp = TimeService::isoTimestamp();
+
+    for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+      const PumpConfig& p = ctx.config.pumps[i];
+      if (!p.enabled || p.mode != PumpMode::PWM) continue;
+      if (pwmTraceLastMs[i] != 0 && (uint32_t)(nowMs - pwmTraceLastMs[i]) < PWM_TRACE_INTERVAL_MS) continue;
+
+      const float targetDiff = effectiveTargetDiffForTrace(p);
+      const float hysteresis = effectiveHysteresisForTrace(p);
+      const float error = isfinite(p.lastDiffC) ? (p.lastDiffC - targetDiff) : NAN;
+
+      f.print(timestamp); f.print(',');
+      f.print(nowMs); f.print(',');
+      f.print(i); f.print(',');
+      f.print(p.state ? 1 : 0); f.print(',');
+      if (p.activeTargetIndex < PUMP_ROUTE_TARGET_COUNT) f.print(p.activeTargetIndex);
+      else f.print(-1);
+      f.print(',');
+      if (isfinite(p.lastSourceC)) f.print(p.lastSourceC, 2);
+      f.print(',');
+      if (isfinite(p.lastSinkC)) f.print(p.lastSinkC, 2);
+      f.print(',');
+      if (isfinite(p.lastDiffC)) f.print(p.lastDiffC, 2);
+      f.print(',');
+      f.print(targetDiff, 2); f.print(',');
+      f.print(p.startDiff, 2); f.print(',');
+      f.print(hysteresis, 2); f.print(',');
+      f.print(p.lastPwmPercent, 1); f.print(',');
+      f.print(p.minPwmPercent, 1); f.print(',');
+      f.print(p.maxPwmPercent, 1); f.print(',');
+      f.print(p.pidKp, 4); f.print(',');
+      f.print(p.pidKi, 4); f.print(',');
+      f.print(p.pidKd, 4); f.print(',');
+      if (isfinite(error)) f.print(error, 2);
+      f.print(',');
+      f.println(pid[i].integral, 4);
+
+      pwmTraceLastMs[i] = nowMs;
+    }
+
+    f.close();
+  }
 
   float clampFloat(float v, float minV, float maxV) {
     if (v < minV) return minV;
@@ -306,10 +399,63 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
   }
 
 
+  bool isStorageSensorRole(Ds18Role role) {
+    switch (role) {
+      case Ds18Role::SINK_BOILER_TOP:
+      case Ds18Role::SINK_BUFFER_TOP:
+      case Ds18Role::BOILER_BOTTOM:
+      case Ds18Role::BUFFER_HIGH:
+      case Ds18Role::BUFFER_MID:
+      case Ds18Role::BUFFER_BOTTOM:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  bool ensureValveTarget(AppContext& ctx, uint8_t pumpIndex, PumpConfig& pump, uint8_t targetIndex) {
+    if (pump.valveIndex == PIN_UNUSED || !Valves::isConfigured(ctx, pump.valveIndex)) {
+      return true;
+    }
+    if (targetIndex >= PUMP_ROUTE_TARGET_COUNT) return false;
+
+    const ValvePosition wanted = targetIndex == 1 ? ValvePosition::B : ValvePosition::A;
+    if (Valves::currentPosition(pump.valveIndex) == wanted && !Valves::isMoving(pump.valveIndex)) {
+      pump.activeTargetIndex = targetIndex;
+      pump.valvePendingTargetIndex = PIN_UNUSED;
+      return true;
+    }
+
+    if (!Valves::requestPosition(ctx, pump.valveIndex, wanted)) return false;
+    pump.valvePendingTargetIndex = targetIndex;
+
+    if (Valves::isMoving(pump.valveIndex)) {
+      stopPumpZeroPercent(ctx, pumpIndex, pump);
+      Serial.print("SAFETY SPEICHERKUEHLUNG P");
+      Serial.print(pumpIndex + 1);
+      Serial.print(": Ventil faehrt auf Ziel ");
+      Serial.println(targetIndex == 1 ? "B" : "A");
+      Serial.flush();
+      return false;
+    }
+
+    pump.activeTargetIndex = targetIndex;
+    pump.valvePendingTargetIndex = PIN_UNUSED;
+    return true;
+  }
+
+
   void forcePumpOff(AppContext& ctx, uint8_t i) {
     if (!validPumpIndex(i)) return;
 
     PumpConfig& p = ctx.config.pumps[i];
+
+    // Pump Enable AUS beendet den aktuellen Valve-V2 Ladezyklus. Beim
+    // naechsten regulaeren Start muss die Zielprioritaet A/B neu bewertet
+    // werden. Eine laufende Ventilfahrt verwendet stopPumpZeroPercent() und
+    // landet bewusst nicht hier, damit ihr Pending-Ziel erhalten bleibt.
+    PumpRouting::closeAllTargets(ctx, i);
+
     resetPumpRuntime(p);
     pid[i] = {};
 
@@ -317,15 +463,15 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
       RelayOutputs::set(ctx, p.relayIndex, false);
     }
 
-    float safetyPercent = 0.0f;
-
-    if (p.mode == PumpMode::PWM) {
-      if (p.pwmProfile == PwmProfile::HEATING) {
-        safetyPercent = 100.0f;
-      }
-      }
-
-      setPwmPercent(p, safetyPercent);
+    // setPwmPercent() arbeitet mit LOGISCHER Pumpenleistung:
+    // 0 % bedeutet fuer beide UPM3-Profile sicher AUS. Die unterschiedliche
+    // elektrische Kennlinie von SOLAR/HEATING sowie die PCB-Invertierung
+    // werden ausschliesslich zentral in PwmDriver::setDuty() umgesetzt.
+    //
+    // Wichtig: HEATING darf hier NICHT auf 100 % gesetzt werden. Auf der
+    // invertierenden SolarCtrl-PCB wuerde das am UPM3-Profil A 0 % Eingang
+    // ergeben und damit maximale Drehzahl statt AUS.
+    setPwmPercent(p, 0.0f);
 }
 
   void updatePumpFeedback(PumpConfig& p) {
@@ -529,6 +675,9 @@ void process(AppContext& ctx) {
         float error = p.lastDiffC - effectiveTargetDiff;
         pwmPercent = computePID(i, p, error);
         pwmPercent = clampFloat(pwmPercent, p.minPwmPercent, p.maxPwmPercent);
+        // ML darf nur innerhalb der vom Nutzer gesetzten Pumpengrenzen feinoptimieren.
+        // Bei nicht aktivem/ungueltigem Modell wird der Wert unveraendert zurueckgegeben.
+        pwmPercent = MlOptimizer::adjustSolarPumpPwm(ctx, i, pwmPercent);
       }
     }
 
@@ -562,6 +711,13 @@ void process(AppContext& ctx) {
 
     RelayOutputs::set(ctx, p.relayIndex, relayOn);
 
+    // Ein regulaeres Pump-Enable-AUS beendet ebenfalls den Ladezyklus. Das ist
+    // insbesondere bei RELAY/PWM-Abschaltung durch die Differenzregelung
+    // wichtig: Der naechste Pumpenstart soll A/B wieder frisch bewerten.
+    if (!relayOn) {
+      PumpRouting::closeAllTargets(ctx, i);
+    }
+
     if (relayOn && p.mode == PumpMode::PWM) {
       setPwmPercent(p, pwmPercent);
       p.lastPwmPercent = pwmPercent;
@@ -584,6 +740,10 @@ void process(AppContext& ctx) {
 
   ctx.control.relayEnable = anyRelayOn;
   ctx.control.pwmPercent = (uint8_t)clampFloat(maxPwm, 0.0f, 100.0f);
+
+  // Diagnose-Logging erst nach dem kompletten Pumpenlauf, damit der CSV-Datensatz
+  // exakt den fuer diesen Zyklus berechneten Runtime-/PWM-Zustand enthaelt.
+  logPwmTrace(ctx);
 }
 
 int8_t configuredOvenPumpIndex(const AppContext& ctx) {
@@ -935,6 +1095,243 @@ bool safetyForceNightCooling(AppContext& ctx, float pwmPercent) {
   ctx.control.pwmPercent = (uint8_t)clampFloat(maxPwm, 0.0f, 100.0f);
 
   return anyHandled;
+}
+
+
+uint8_t safetyForceStorageCooling(AppContext& ctx, float criticalTemperatureC, float minimumDeltaC, float pwmPercent) {
+  uint8_t runningCount = 0;
+  // Normal control did not run in this safety cycle; discard stale reservations
+  // before selecting emergency cooling routes.
+  EnergyConflicts::clear(ctx);
+  pwmPercent = clampFloat(pwmPercent, 0.0f, 100.0f);
+  minimumDeltaC = minimumDeltaC < 1.0f ? 1.0f : minimumDeltaC;
+
+  // 1) Direct configured transfer paths: hot storage sensor -> cooler configured sink.
+  // Example: buffer top -> boiler top. Normal min/target delta is deliberately
+  // bypassed here, but hardware assignment, measured temperatures and sink max
+  // remain respected.
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    PumpConfig& pump = ctx.config.pumps[i];
+    if (!pump.enabled || pump.mode == PumpMode::OFF) continue;
+    if (pump.sourceType != PumpSourceType::SENSOR_ROLE) continue;
+    if (!isStorageSensorRole(pump.sourceSensorRole)) continue;
+    if (!pumpEnableRelayReady(ctx, pump)) continue;
+
+    float sourceC = NAN;
+    bool sourceValid = false;
+    if (!pumpSourceTemp(ctx, pump, sourceC, sourceValid) || !sourceValid || isnan(sourceC)) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    // Only a genuinely critical/hot source may drive emergency heat dump.
+    if (sourceC < criticalTemperatureC) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    PumpRouting::RouteResult route = PumpRouting::resolveHeatDumpCoolestTarget(ctx, i, sourceC, sourceValid);
+    if (!route.active || !route.sinkValid || isnan(route.sinkC) || route.diffC < minimumDeltaC) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    const OutputRef valveOutput = (pump.valveIndex != PIN_UNUSED && Valves::isConfigured(ctx, pump.valveIndex))
+      ? Valves::outputRef(ctx, pump.valveIndex)
+      : OutputRef{};
+    if (!EnergyConflicts::canActivateRoute(ctx, i, pump.sourceRole, route.sinkRole, pump.relayIndex, valveOutput)) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    if (route.valveMoving) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    EnergyConflicts::reserveRoute(ctx, i, pump.sourceRole, route.sinkRole, pump.relayIndex, valveOutput);
+    RelayOutputs::set(ctx, pump.relayIndex, true);
+    pump.state = true;
+    pump.lastSourceC = sourceC;
+    pump.lastSinkC = route.sinkC;
+    pump.lastDiffC = route.diffC;
+    pump.lastPwmPercent = pwmPercent;
+    if (pump.mode == PumpMode::PWM && pump.pwmChannel != PIN_UNUSED) setPwmPercent(pump, pwmPercent);
+
+    Serial.print("SAFETY SPEICHERKUEHLUNG P");
+    Serial.print(i + 1);
+    Serial.print(" | Speicher="); Serial.print(sourceC);
+    Serial.print(" C | Ziel="); Serial.print(route.sinkC);
+    Serial.print(" C | Delta="); Serial.print(route.diffC);
+    Serial.print(" K | PWM="); Serial.println(pwmPercent);
+    Serial.flush();
+    runningCount++;
+  }
+
+  // 2) A configured solar loop can be used as a cooler heat sink. The pump keeps
+  // its normal hydraulic direction; heat transfer simply reverses when the
+  // connected storage is hotter than the collector. Only the hot configured
+  // storage target is selected; this avoids cooling an unrelated cool target.
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    PumpConfig& pump = ctx.config.pumps[i];
+    if (!pump.enabled || pump.mode == PumpMode::OFF || !isSolarCollectorPump(pump)) continue;
+    if (!pumpEnableRelayReady(ctx, pump)) continue;
+
+    float collectorC = NAN;
+    bool collectorValid = false;
+    if (!pumpSourceTemp(ctx, pump, collectorC, collectorValid) || !collectorValid || isnan(collectorC)) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    int8_t hotTargetIndex = -1;
+    Ds18Role hotSinkRole = Ds18Role::NONE;
+    float hotStorageC = NAN;
+
+    const bool hasValve = pump.valveIndex != PIN_UNUSED && Valves::isConfigured(ctx, pump.valveIndex);
+    if (hasValve) {
+      for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
+        const PumpRouteTargetConfig& target = pump.targets[t];
+        if (!target.enabled || !isStorageSensorRole(target.sinkRole)) continue;
+        float sinkC = NAN; bool sinkValid = false;
+        if (!sensorSourceTempByRole(ctx, target.sinkRole, sinkC, sinkValid) || !sinkValid) continue;
+        if (sinkC < criticalTemperatureC) continue;
+        if ((sinkC - collectorC) < minimumDeltaC) continue;
+        if (hotTargetIndex < 0 || sinkC > hotStorageC) {
+          hotTargetIndex = (int8_t)t;
+          hotSinkRole = target.sinkRole;
+          hotStorageC = sinkC;
+        }
+      }
+    } else if (isStorageSensorRole(pump.sinkRole)) {
+      float sinkC = NAN; bool sinkValid = false;
+      if (sensorSourceTempByRole(ctx, pump.sinkRole, sinkC, sinkValid) && sinkValid &&
+          sinkC >= criticalTemperatureC && (sinkC - collectorC) >= minimumDeltaC) {
+        hotTargetIndex = 0;
+        hotSinkRole = pump.sinkRole;
+        hotStorageC = sinkC;
+      }
+    }
+
+    if (hotTargetIndex < 0 || hotSinkRole == Ds18Role::NONE) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    const OutputRef valveOutput = hasValve ? Valves::outputRef(ctx, pump.valveIndex) : OutputRef{};
+    if (!EnergyConflicts::canActivateRoute(ctx, i, pump.sourceRole, hotSinkRole, pump.relayIndex, valveOutput)) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    if (hasValve && !ensureValveTarget(ctx, i, pump, (uint8_t)hotTargetIndex)) continue;
+
+    EnergyConflicts::reserveRoute(ctx, i, pump.sourceRole, hotSinkRole, pump.relayIndex, valveOutput);
+    RelayOutputs::set(ctx, pump.relayIndex, true);
+    pump.state = true;
+    pump.lastSourceC = collectorC;
+    pump.lastSinkC = hotStorageC;
+    pump.lastDiffC = collectorC - hotStorageC; // negative = reverse heat flow, intentional
+    pump.lastPwmPercent = pwmPercent;
+    if (pump.mode == PumpMode::PWM && pump.pwmChannel != PIN_UNUSED) setPwmPercent(pump, pwmPercent);
+
+    Serial.print("SAFETY SOLAR-RUECKKUEHLUNG P");
+    Serial.print(i + 1);
+    Serial.print(" | Speicher="); Serial.print(hotStorageC);
+    Serial.print(" C | Kollektor="); Serial.print(collectorC);
+    Serial.print(" C | Delta="); Serial.print(hotStorageC - collectorC);
+    Serial.print(" K | PWM="); Serial.println(pwmPercent);
+    Serial.flush();
+    runningCount++;
+  }
+
+  // 3) Auch eine konfigurierte, deutlich kuehlere alternative Waermequelle
+  // (insbesondere der wassergefuehrte Ofen) darf im kritischen Speicherfall
+  // als Not-Waermesenke genutzt werden. Die Hydraulik bleibt unveraendert;
+  // durch den grossen negativen Temperaturgradienten fliesst Waerme vom
+  // Speicher zur kuehleren Quelle. Nur explizit konfigurierte Pumpenpfade
+  // werden verwendet und nur wenn die Quellentemperatur gueltig ist.
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    PumpConfig& pump = ctx.config.pumps[i];
+    if (!pump.enabled || pump.mode == PumpMode::OFF) continue;
+    if (pump.sourceType != PumpSourceType::HEAT_SOURCE_ROLE) continue;
+    if (pump.sourceRole != HeatSourceRole::ALT_SOURCE_OVEN &&
+        pump.sourceRole != HeatSourceRole::ALT_SOURCE_OTHER) continue;
+    if (!pumpEnableRelayReady(ctx, pump)) continue;
+
+    float sourceC = NAN;
+    bool sourceValid = false;
+    if (!pumpSourceTemp(ctx, pump, sourceC, sourceValid) || !sourceValid || isnan(sourceC)) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    int8_t hotTargetIndex = -1;
+    Ds18Role hotSinkRole = Ds18Role::NONE;
+    float hotStorageC = NAN;
+    const bool hasValve = pump.valveIndex != PIN_UNUSED && Valves::isConfigured(ctx, pump.valveIndex);
+
+    if (hasValve) {
+      for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
+        const PumpRouteTargetConfig& target = pump.targets[t];
+        if (!target.enabled || !isStorageSensorRole(target.sinkRole)) continue;
+        float sinkC = NAN;
+        bool sinkValid = false;
+        if (!sensorSourceTempByRole(ctx, target.sinkRole, sinkC, sinkValid) || !sinkValid || isnan(sinkC)) continue;
+        if (sinkC < criticalTemperatureC) continue;
+        if ((sinkC - sourceC) < minimumDeltaC) continue;
+        if (hotTargetIndex < 0 || sinkC > hotStorageC) {
+          hotTargetIndex = (int8_t)t;
+          hotSinkRole = target.sinkRole;
+          hotStorageC = sinkC;
+        }
+      }
+    } else if (isStorageSensorRole(pump.sinkRole)) {
+      float sinkC = NAN;
+      bool sinkValid = false;
+      if (sensorSourceTempByRole(ctx, pump.sinkRole, sinkC, sinkValid) && sinkValid && !isnan(sinkC) &&
+          sinkC >= criticalTemperatureC && (sinkC - sourceC) >= minimumDeltaC) {
+        hotTargetIndex = 0;
+        hotSinkRole = pump.sinkRole;
+        hotStorageC = sinkC;
+      }
+    }
+
+    if (hotTargetIndex < 0 || hotSinkRole == Ds18Role::NONE) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    const OutputRef valveOutput = hasValve ? Valves::outputRef(ctx, pump.valveIndex) : OutputRef{};
+    if (!EnergyConflicts::canActivateRoute(ctx, i, pump.sourceRole, hotSinkRole, pump.relayIndex, valveOutput)) {
+      stopPumpZeroPercent(ctx, i, pump);
+      continue;
+    }
+
+    if (hasValve && !ensureValveTarget(ctx, i, pump, (uint8_t)hotTargetIndex)) continue;
+
+    EnergyConflicts::reserveRoute(ctx, i, pump.sourceRole, hotSinkRole, pump.relayIndex, valveOutput);
+    RelayOutputs::set(ctx, pump.relayIndex, true);
+    pump.state = true;
+    pump.lastSourceC = sourceC;
+    pump.lastSinkC = hotStorageC;
+    pump.lastDiffC = sourceC - hotStorageC; // negativ = beabsichtigte Rueckkuehlung
+    pump.lastPwmPercent = pwmPercent;
+    if (pump.mode == PumpMode::PWM && pump.pwmChannel != PIN_UNUSED) setPwmPercent(pump, pwmPercent);
+
+    Serial.print(pump.sourceRole == HeatSourceRole::ALT_SOURCE_OVEN
+      ? "SAFETY OFEN-RUECKKUEHLUNG P"
+      : "SAFETY QUELLEN-RUECKKUEHLUNG P");
+    Serial.print(i + 1);
+    Serial.print(" | Speicher="); Serial.print(hotStorageC);
+    Serial.print(" C | Quelle="); Serial.print(sourceC);
+    Serial.print(" C | Delta="); Serial.print(hotStorageC - sourceC);
+    Serial.print(" K | PWM="); Serial.println(pwmPercent);
+    Serial.flush();
+    runningCount++;
+  }
+
+  return runningCount;
 }
 
 bool safetyForceHeatDumpForSource(AppContext& ctx, HeatSourceRole sourceRole, float pwmPercent) {

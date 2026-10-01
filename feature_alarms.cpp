@@ -33,6 +33,7 @@ namespace {
     OutputKind lastKind = OutputKind::NONE;
     uint8_t lastIndex = PIN_UNUSED;
     bool lastState = false;
+    bool muted = false;
     uint32_t lastProcessMs = 0;
   };
 
@@ -311,7 +312,10 @@ void raise(const char* id, Severity severity, const char* message, bool acknowle
   a.count++;
   copyText(a.message, sizeof(a.message), message);
 
-  if (isNew) appendHistoryCsv("RAISE", a);
+  if (isNew) {
+    if (severity == Severity::WARNING || severity == Severity::CRITICAL) g_buzzer.muted = false;
+    appendHistoryCsv("RAISE", a);
+  }
 }
 
 void clear(const char* id) {
@@ -321,6 +325,7 @@ void clear(const char* id) {
   pushHistory(g_active[idx], g_active[idx].clearedAtMs);
   appendHistoryCsv("CLEAR", g_active[idx]);
   g_active[idx] = AlarmRecord{};
+  if (activeCount() == 0) g_buzzer.muted = false;
 }
 
 void recordInfo(const char* id, const char* message) {
@@ -365,6 +370,34 @@ uint8_t acknowledgeAllNonCritical() {
   return count;
 }
 
+void setBuzzerMuted(bool muted) {
+  g_buzzer.muted = muted && activeCount() > 0;
+}
+
+bool buzzerMuted() { return g_buzzer.muted; }
+
+Severity currentSeverity() {
+  Severity best = Severity::INFO;
+  bool found = false;
+  for (uint8_t i = 0; i < MAX_ACTIVE_ALARMS; i++) {
+    const AlarmRecord& a = g_active[i];
+    if (!a.used || !a.active) continue;
+    if (!found || (uint8_t)a.severity > (uint8_t)best) { best = a.severity; found = true; }
+  }
+  return best;
+}
+
+const char* currentMessage() {
+  int bestIdx = -1;
+  Severity best = Severity::INFO;
+  for (uint8_t i = 0; i < MAX_ACTIVE_ALARMS; i++) {
+    const AlarmRecord& a = g_active[i];
+    if (!a.used || !a.active) continue;
+    if (bestIdx < 0 || (uint8_t)a.severity > (uint8_t)best) { bestIdx = i; best = a.severity; }
+  }
+  return bestIdx >= 0 ? g_active[bestIdx].message : "";
+}
+
 void clearHistory() {
   memset(g_history, 0, sizeof(g_history));
   g_nextHistorySlot = 0;
@@ -389,10 +422,12 @@ void process(AppContext& ctx) {
   turnPreviousBuzzerOffIfNeeded(ctx, kind, index);
 
   bool requestedOn = false;
-  if (hasCriticalActive()) {
-    requestedOn = true;
-  } else if (hasUnacknowledgedWarning()) {
-    requestedOn = (millis() % WARNING_BUZZER_PERIOD_MS) < WARNING_BUZZER_ON_MS;
+  if (!g_buzzer.muted) {
+    if (hasCriticalActive()) {
+      requestedOn = true;
+    } else if (hasUnacknowledgedWarning()) {
+      requestedOn = (millis() % WARNING_BUZZER_PERIOD_MS) < WARNING_BUZZER_ON_MS;
+    }
   }
 
   const bool actualOn = readBuzzerOutputState(ctx, kind, index);
@@ -490,6 +525,8 @@ void appendJson(String& json) {
   if (g_buzzer.lastIndex == PIN_UNUSED) json += "null"; else json += String(g_buzzer.lastIndex);
   json += ",\"state\":";
   json += (g_buzzer.lastState ? "true" : "false");
+  json += ",\"muted\":";
+  json += (g_buzzer.muted ? "true" : "false");
   json += ",\"warningPulseMs\":";
   json += String(WARNING_BUZZER_ON_MS);
   json += ",\"warningPeriodMs\":";

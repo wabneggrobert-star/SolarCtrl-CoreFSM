@@ -27,6 +27,7 @@ static constexpr uint8_t PCF8574_ADDR = PCF8574_MAX_ADDR;
 static constexpr uint8_t PCF_BIT_MAX1_CS = 0;   // P0
 static constexpr uint8_t PCF_BIT_MAX2_CS = 1;   // P1
 static constexpr uint8_t PCF_BIT_MAX3_CS = 2;   // P2
+static constexpr uint8_t PCF_BIT_MAX4_CS = 3;   // P3
 
 // ======================================================
 // PCA9685 PWM-Treiber
@@ -160,3 +161,7 @@ static constexpr const char* FILE_SENSOR_ASSIGNMENTS      = "/config/sensors.cfg
 static constexpr const char* FILE_HEAT_SOURCE_ASSIGNMENTS = "/config/heat_sources.cfg";
 static constexpr const char* FILE_ENERGY_METER_RUNTIME      = "/runtime/energy_meter.cfg";
 static constexpr const char* FILE_ENERGY_METER_LOG          = "/logs/energy_meter.csv";
+static constexpr const char* FILE_FORECAST_LOG              = "/logs/forecast.csv";
+static constexpr const char* FILE_FORECAST_LEARNING         = "/runtime/forecast_learning.cfg";
+static constexpr const char* FILE_ML_RUNTIME                = "/runtime/ml_model.cfg";
+static constexpr const char* FILE_ML_LOG                    = "/logs/ml_training.csv";

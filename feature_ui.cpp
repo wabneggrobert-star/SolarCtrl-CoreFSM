@@ -22,6 +22,12 @@
 #include "feature_alarms.h"
 #include "feature_aux_heater.h"
 #include "feature_energy_meter.h"
+#include "feature_mqtt.h"
+#include "feature_time.h"
+#include "feature_forecast.h"
+#include "feature_ml_optimizer.h"
+#include "feature_fluid_properties.h"
+#include "feature_history.h"
 #include <WebServer.h>
 #include <SD.h>
 #include <WiFi.h>
@@ -72,6 +78,12 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
    AppContext* s_ctx = nullptr;
   static uint32_t s_commissioningTestUntilMs = 0;
   static constexpr uint32_t COMMISSIONING_TEST_TIMEOUT_MS = 10UL * 60UL * 1000UL;
+
+  File g_sdUploadFile;
+  String g_sdUploadTargetPath;
+  String g_sdUploadTempPath;
+  String g_sdUploadError;
+  bool g_sdUploadCommitted = false;
 
   void allOutputsOffSafe();
 
@@ -139,6 +151,7 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
     if (path.endsWith(".js")) return "application/javascript";
     if (path.endsWith(".json")) return "application/json";
     if (path.endsWith(".csv")) return "text/csv";
+    if (path.endsWith(".svg")) return "image/svg+xml";
     return "text/plain";
   }
 
@@ -169,6 +182,247 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
     if (serveSdFile("/www" + path)) return;
 
     server.send(404, "text/plain", "Datei nicht gefunden");
+  }
+
+  bool sdWebPathAllowed(const String& rawPath) {
+    String path = rawPath;
+    path.trim();
+    if (!path.startsWith("/")) return false;
+    if (path.indexOf("..") >= 0 || path.indexOf('\\') >= 0) return false;
+    if (path.length() < 2 || path.length() > 120) return false;
+
+    // Konfiguration, Runtime und Logs bleiben absichtlich ausserhalb des Browser-Dateimanagers.
+    if (path == "/config" || path.startsWith("/config/")) return false;
+    if (path == "/runtime" || path.startsWith("/runtime/")) return false;
+    if (path == "/logs" || path.startsWith("/logs/")) return false;
+
+    String lower = path;
+    lower.toLowerCase();
+    return lower.endsWith(".html") || lower.endsWith(".js") || lower.endsWith(".css") ||
+           lower.endsWith(".svg") || lower.endsWith(".png") || lower.endsWith(".jpg") ||
+           lower.endsWith(".jpeg") || lower.endsWith(".webp") || lower.endsWith(".ico") ||
+           lower.endsWith(".txt");
+  }
+
+  bool ensureSdParentDirectory(const String& filePath) {
+    int slash = filePath.lastIndexOf('/');
+    if (slash <= 0) return true;
+    String parent = filePath.substring(0, slash);
+    if (parent.length() == 0 || parent == "/") return true;
+    if (SD.exists(parent)) return true;
+
+    String current;
+    int pos = 1;
+    while (pos < parent.length()) {
+      int next = parent.indexOf('/', pos);
+      String part = next < 0 ? parent.substring(pos) : parent.substring(pos, next);
+      if (part.length()) {
+        current += "/" + part;
+        if (!SD.exists(current) && !SD.mkdir(current)) return false;
+      }
+      if (next < 0) break;
+      pos = next + 1;
+    }
+    return true;
+  }
+
+  void appendSdWebDirectoryJson(String& json, const char* dirPath, bool& first) {
+    File dir = SD.open(dirPath);
+    if (!dir || !dir.isDirectory()) {
+      if (dir) dir.close();
+      return;
+    }
+
+    File entry = dir.openNextFile();
+    while (entry) {
+      if (!entry.isDirectory()) {
+        String name = String(entry.name());
+        String fullPath;
+        if (name.startsWith("/")) {
+          fullPath = name;
+        } else if (String(dirPath) == "/") {
+          fullPath = "/" + name;
+        } else {
+          fullPath = String(dirPath) + "/" + name;
+        }
+
+        if (sdWebPathAllowed(fullPath)) {
+          if (!first) json += ",";
+          first = false;
+          json += "{\"path\":\"" + jsonEscape(fullPath.c_str()) + "\",";
+          json += "\"size\":" + String((uint32_t)entry.size()) + "}";
+        }
+      }
+      entry.close();
+      entry = dir.openNextFile();
+    }
+    dir.close();
+  }
+
+  void handleSdFilesJson() {
+    if (!testSessionValid()) {
+      server.send(403, "application/json", "{\"error\":\"service_pin\"}");
+      return;
+    }
+    if (!s_ctx || !s_ctx->sdAvailable) {
+      server.send(503, "application/json", "{\"error\":\"sd_unavailable\"}");
+      return;
+    }
+
+    String json = "{\"files\":[";
+    bool first = true;
+    appendSdWebDirectoryJson(json, "/", first);
+    appendSdWebDirectoryJson(json, "/www", first);
+    appendSdWebDirectoryJson(json, "/js", first);
+    appendSdWebDirectoryJson(json, "/css", first);
+    appendSdWebDirectoryJson(json, "/img", first);
+    json += "]}";
+    server.send(200, "application/json", json);
+  }
+
+  void handleSdDownload() {
+    if (!testSessionValid()) {
+      server.send(403, "text/plain", "Service-PIN falsch oder fehlt");
+      return;
+    }
+    if (!server.hasArg("path")) {
+      server.send(400, "text/plain", "path fehlt");
+      return;
+    }
+
+    const String path = server.arg("path");
+    if (!sdWebPathAllowed(path)) {
+      server.send(403, "text/plain", "Pfad ist fuer den Web-Dateimanager nicht freigegeben");
+      return;
+    }
+    File file = SD.open(path, FILE_READ);
+    if (!file || file.isDirectory()) {
+      if (file) file.close();
+      server.send(404, "text/plain", "Datei nicht gefunden");
+      return;
+    }
+
+    String filename = path.substring(path.lastIndexOf('/') + 1);
+    server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+    server.streamFile(file, contentType(path));
+    file.close();
+  }
+
+  void resetSdUploadState() {
+    if (g_sdUploadFile) g_sdUploadFile.close();
+    g_sdUploadTargetPath = "";
+    g_sdUploadTempPath = "";
+    g_sdUploadError = "";
+    g_sdUploadCommitted = false;
+  }
+
+  void handleSdUploadStream() {
+    HTTPUpload& upload = server.upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+      resetSdUploadState();
+      if (!testSessionValid()) {
+        g_sdUploadError = "Service-PIN falsch oder fehlt";
+        return;
+      }
+      if (!server.hasArg("path")) {
+        g_sdUploadError = "path fehlt";
+        return;
+      }
+
+      g_sdUploadTargetPath = server.arg("path");
+      if (!sdWebPathAllowed(g_sdUploadTargetPath)) {
+        g_sdUploadError = "Pfad ist fuer den Web-Dateimanager nicht freigegeben";
+        return;
+      }
+      if (!ensureSdParentDirectory(g_sdUploadTargetPath)) {
+        g_sdUploadError = "Zielordner konnte nicht angelegt werden";
+        return;
+      }
+
+      g_sdUploadTempPath = g_sdUploadTargetPath + ".upload.tmp";
+      if (SD.exists(g_sdUploadTempPath)) SD.remove(g_sdUploadTempPath);
+      g_sdUploadFile = SD.open(g_sdUploadTempPath, FILE_WRITE);
+      if (!g_sdUploadFile) g_sdUploadError = "Temporaere Datei konnte nicht angelegt werden";
+      return;
+    }
+
+    if (upload.status == UPLOAD_FILE_WRITE) {
+      if (g_sdUploadError.length() || !g_sdUploadFile) return;
+      const size_t written = g_sdUploadFile.write(upload.buf, upload.currentSize);
+      if (written != upload.currentSize) g_sdUploadError = "Schreibfehler auf SD-Karte";
+      return;
+    }
+
+    if (upload.status == UPLOAD_FILE_END) {
+      if (g_sdUploadFile) {
+        g_sdUploadFile.flush();
+        g_sdUploadFile.close();
+      }
+      if (g_sdUploadError.length()) return;
+
+      const String backup = g_sdUploadTargetPath + ".bak";
+      if (SD.exists(backup)) SD.remove(backup);
+      const bool hadOriginal = SD.exists(g_sdUploadTargetPath);
+      if (hadOriginal && !SD.rename(g_sdUploadTargetPath, backup)) {
+        g_sdUploadError = "Alte Datei konnte nicht gesichert werden";
+        return;
+      }
+      if (!SD.rename(g_sdUploadTempPath, g_sdUploadTargetPath)) {
+        if (hadOriginal && SD.exists(backup)) SD.rename(backup, g_sdUploadTargetPath);
+        g_sdUploadError = "Neue Datei konnte nicht aktiviert werden";
+        return;
+      }
+
+      g_sdUploadCommitted = true;
+      return;
+    }
+
+    if (upload.status == UPLOAD_FILE_ABORTED) {
+      if (g_sdUploadFile) g_sdUploadFile.close();
+      if (g_sdUploadTempPath.length() && SD.exists(g_sdUploadTempPath)) SD.remove(g_sdUploadTempPath);
+      g_sdUploadError = "Upload abgebrochen";
+    }
+  }
+
+  void handleSdUploadComplete() {
+    if (!g_sdUploadCommitted) {
+      const String message = g_sdUploadError.length() ? g_sdUploadError : "Upload nicht abgeschlossen";
+      if (g_sdUploadTempPath.length() && SD.exists(g_sdUploadTempPath)) SD.remove(g_sdUploadTempPath);
+      server.send(500, "text/plain", message);
+      resetSdUploadState();
+      return;
+    }
+
+    const String resultPath = g_sdUploadTargetPath;
+    resetSdUploadState();
+    server.send(200, "application/json", "{\"ok\":true,\"path\":\"" + jsonEscape(resultPath.c_str()) + "\"}");
+  }
+
+  void handleSdDelete() {
+    if (!testSessionValid()) {
+      server.send(403, "text/plain", "Service-PIN falsch oder fehlt");
+      return;
+    }
+    if (!server.hasArg("path")) {
+      server.send(400, "text/plain", "path fehlt");
+      return;
+    }
+
+    const String path = server.arg("path");
+    if (!sdWebPathAllowed(path)) {
+      server.send(403, "text/plain", "Pfad ist fuer den Web-Dateimanager nicht freigegeben");
+      return;
+    }
+    if (!SD.exists(path)) {
+      server.send(404, "text/plain", "Datei nicht gefunden");
+      return;
+    }
+    if (!SD.remove(path)) {
+      server.send(500, "text/plain", "Datei konnte nicht geloescht werden");
+      return;
+    }
+    server.send(200, "text/plain", "OK");
   }
 
   // ================================
@@ -223,6 +477,12 @@ void handleStatusJson() {
   json += ",\"energyPowerKw\":" + String(s_ctx->energyMeter.thermalPowerKw, 3);
   json += ",\"energyFlowLMin\":" + String(s_ctx->energyMeter.flowLitersPerMinute, 2);
   json += ",\"energyVolumeLiters\":" + String(s_ctx->energyMeter.totalVolumeLiters, 1);
+  json += ",\"mqttEnabled\":" + String(s_ctx->config.mqttEnabled ? "true" : "false");
+  json += ",\"mqttConnected\":" + String(MqttBridge::connected() ? "true" : "false");
+  json += ",\"alarmActiveCount\":" + String(Alarms::activeCount());
+  json += ",\"alarmCritical\":" + String(Alarms::hasCriticalActive() ? "true" : "false");
+  json += ",\"alarmMessage\":\"" + jsonEscape(Alarms::currentMessage()) + "\"";
+  json += ",\"buzzerMuted\":" + String(Alarms::buzzerMuted() ? "true" : "false");
   json += "}";
 
   server.send(200, "application/json", json);
@@ -408,129 +668,464 @@ void handleAssignmentsJson() {
   );
 }
 
+  bool maxChannelEnabled(MaxChannel channel) {
+    if (!s_ctx) return false;
+    switch (channel) {
+      case MaxChannel::CH1: return s_ctx->config.max1.enabled;
+      case MaxChannel::CH2: return s_ctx->config.max2.enabled;
+      case MaxChannel::CH3: return s_ctx->config.max3.enabled;
+      case MaxChannel::CH4: return s_ctx->config.max4.enabled;
+      default: return false;
+    }
+  }
+
+  bool roleBelongsToStorage(Ds18Role role, bool buffer) {
+    if (buffer) {
+      return role == Ds18Role::SINK_BUFFER_TOP ||
+             role == Ds18Role::BUFFER_HIGH ||
+             role == Ds18Role::BUFFER_MID ||
+             role == Ds18Role::BUFFER_BOTTOM;
+    }
+    return role == Ds18Role::SINK_BOILER_TOP ||
+           role == Ds18Role::BOILER_BOTTOM;
+  }
+
+  float configuredStorageMaximumC(bool buffer) {
+    float maximumC = 0.0f;
+
+    // Die fuer Pumpenrouten eingestellte Maximaltemperatur beschreibt die
+    // beabsichtigte obere Ladetemperatur des jeweiligen Speichers. Wenn
+    // mehrere Routen denselben Speicher bedienen, verwenden wir die hoechste
+    // konfigurierte Grenze fuer die Farbdarstellung.
+    for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+      const PumpConfig& pump = s_ctx->config.pumps[i];
+      if (!pump.enabled || pump.mode == PumpMode::OFF) continue;
+
+      for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
+        const PumpRouteTargetConfig& target = pump.targets[t];
+        if (!target.enabled || !roleBelongsToStorage(target.sinkRole, buffer)) continue;
+        if (target.maxTempC > maximumC) maximumC = target.maxTempC;
+      }
+    }
+
+    // Rueckfall fuer Anlagen ohne explizite Routen-Maximaltemperatur.
+    if (maximumC <= 10.0f) maximumC = s_ctx->config.sinkMaxC;
+    if (maximumC <= 10.0f) maximumC = 70.0f;
+    return maximumC;
+  }
+
+
+void handlePlantLiveJson() {
+  if (!s_ctx) {
+    server.send(500, "application/json", "{\"error\":\"no_context\"}");
+    return;
+  }
+
+  // Schlanker Live-Endpunkt fuer die Startseite.
+  // Nur bereits im RAM vorhandene Runtime-Werte; keine SD-Zugriffe und keine
+  // erneuten Sensor-Messzyklen. Dadurch kann die UI mit hoher Frequenz pollen.
+  float boilerTop = NAN, boilerBottom = NAN;
+  float bufferTop = NAN, bufferHigh = NAN, bufferMid = NAN, bufferBottom = NAN;
+  float poolTemp = NAN, outsideTemp = NAN;
+  bool valid = false;
+
+  SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::SINK_BOILER_TOP, boilerTop, valid);
+  SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::BOILER_BOTTOM, boilerBottom, valid);
+  SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::SINK_BUFFER_TOP, bufferTop, valid);
+  SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::BUFFER_HIGH, bufferHigh, valid);
+  SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::BUFFER_MID, bufferMid, valid);
+  SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::BUFFER_BOTTOM, bufferBottom, valid);
+  SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::SWIMMINGPOOL, poolTemp, valid);
+  SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::OUTSIDE_TEMPERATURE, outsideTemp, valid);
+
+  String json;
+  json.reserve(2800);
+  json = "{";
+
+  json += "\"temperatures\":{";
+  json += "\"boilerTop\":" + jsonFloat(boilerTop, 1) + ",";
+  json += "\"boilerBottom\":" + jsonFloat(boilerBottom, 1) + ",";
+  json += "\"bufferTop\":" + jsonFloat(bufferTop, 1) + ",";
+  json += "\"bufferHigh\":" + jsonFloat(bufferHigh, 1) + ",";
+  json += "\"bufferMid\":" + jsonFloat(bufferMid, 1) + ",";
+  json += "\"bufferBottom\":" + jsonFloat(bufferBottom, 1) + ",";
+  json += "\"pool\":" + jsonFloat(poolTemp, 1) + ",";
+  json += "\"outside\":" + jsonFloat(outsideTemp, 1);
+  json += "},";
+
+  json += "\"collectors\":[";
+  for (uint8_t i = 0; i < 3; i++) {
+    if (i > 0) json += ",";
+    float temp = NAN;
+    bool tempValid = false;
+    switch (i) {
+      case 0: temp = s_ctx->sensors.heatSources.solarCollector1C; tempValid = s_ctx->sensors.heatSources.solarCollector1Valid; break;
+      case 1: temp = s_ctx->sensors.heatSources.solarCollector2C; tempValid = s_ctx->sensors.heatSources.solarCollector2Valid; break;
+      case 2: temp = s_ctx->sensors.heatSources.solarCollector3C; tempValid = s_ctx->sensors.heatSources.solarCollector3Valid; break;
+    }
+    json += "{\"index\":" + String(i) + ",\"valid\":" + String(tempValid ? "true" : "false") + ",\"tempC\":" + String(tempValid ? String(temp, 1) : "null") + "}";
+  }
+  json += "],";
+
+  json += "\"heatSources\":{";
+  json += "\"otherC\":" + String(s_ctx->sensors.heatSources.altSourceOtherValid ? String(s_ctx->sensors.heatSources.altSourceOtherC, 1) : "null") + ",";
+  json += "\"ovenC\":" + String(s_ctx->sensors.heatSources.altSourceOvenValid ? String(s_ctx->sensors.heatSources.altSourceOvenC, 1) : "null");
+  json += "},";
+
+  json += "\"pumps\":[";
+  bool first = true;
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    const PumpConfig& pump = s_ctx->config.pumps[i];
+    if (!pump.enabled || pump.mode == PumpMode::OFF) continue;
+    if (!first) json += ",";
+    first = false;
+    json += "{";
+    json += "\"index\":" + String(i) + ",";
+    json += "\"active\":" + String(pump.state ? "true" : "false") + ",";
+    json += "\"pwm\":" + String(pump.lastPwmPercent, 0) + ",";
+    json += "\"activeTargetIndex\":" + String(pump.activeTargetIndex) + ",";
+    json += "\"sourceTempC\":" + jsonFloat(pump.lastSourceC, 1) + ",";
+    json += "\"sinkTempC\":" + jsonFloat(pump.lastSinkC, 1);
+    json += "}";
+  }
+  json += "],";
+
+  json += "\"valves\":[";
+  first = true;
+  for (uint8_t i = 0; i < MAX_VALVES; i++) {
+    if (!s_ctx->config.valves[i].enabled) continue;
+    if (!first) json += ",";
+    first = false;
+    json += "{";
+    json += "\"index\":" + String(i) + ",";
+    json += "\"moving\":" + String(Valves::isMoving(i) ? "true" : "false") + ",";
+    json += "\"current\":\"" + String(Valves::positionToKey(Valves::currentPosition(i))) + "\",";
+    json += "\"target\":\"" + String(Valves::positionToKey(Valves::targetPosition(i))) + "\"";
+    json += "}";
+  }
+  json += "],";
+
+  json += "\"energy\":{";
+  json += "\"enabled\":" + String(s_ctx->config.energyMeter.enabled ? "true" : "false") + ",";
+  json += "\"totalKWh\":" + String(s_ctx->energyMeter.totalEnergyKWh, 3) + ",";
+  json += "\"powerKw\":" + String(s_ctx->energyMeter.thermalPowerKw, 3) + ",";
+  json += "\"flowLMin\":" + String(s_ctx->energyMeter.flowLitersPerMinute, 2);
+  json += "},";
+
+  json += "\"oven\":{";
+  json += "\"active\":" + String(OvenControl::active() ? "true" : "false") + ",";
+  json += "\"state\":\"" + String(OvenControl::stateText()) + "\",";
+  json += "\"temperatureC\":" + jsonFloat(OvenControl::ovenTemperatureC(), 1) + ",";
+  json += "\"temperatureValid\":" + String(!isnan(OvenControl::ovenTemperatureC()) ? "true" : "false") + ",";
+  json += "\"pumpActive\":" + String(OvenControl::pumpActive() ? "true" : "false") + ",";
+  json += "\"servoOpeningPercent\":" + String(OvenControl::servoOpeningPercent());
+  json += "},";
+
+  json += "\"heatingCircuits\":[";
+  first = true;
+  for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+    const HeatingCircuitConfig& cfg = s_ctx->config.heatingCircuits[i];
+    if (!cfg.enabled) continue;
+    const HeatingCircuitRuntime& rt = s_ctx->heatingCircuitRuntime[i];
+    if (!first) json += ",";
+    first = false;
+    json += "{";
+    json += "\"index\":" + String(i) + ",";
+    json += "\"active\":" + String(rt.active ? "true" : "false") + ",";
+    json += "\"pumpActive\":" + String(rt.pumpActive ? "true" : "false") + ",";
+    json += "\"pumpPercent\":" + String(rt.pumpPercent) + ",";
+    json += "\"flowC\":" + jsonFloat(rt.flowTemperatureC, 1) + ",";
+    json += "\"returnC\":" + jsonFloat(rt.returnTemperatureC, 1) + ",";
+    json += "\"targetC\":" + jsonFloat(rt.targetFlowTemperatureC, 1) + ",";
+    json += "\"roomC\":" + jsonFloat(rt.roomTemperatureC, 1) + ",";
+    json += "\"effectiveRoomTargetC\":" + jsonFloat(rt.effectiveRoomTargetTemperatureC, 1) + ",";
+    json += "\"nightSetbackActive\":" + String(rt.nightSetbackActive ? "true" : "false");
+    json += "}";
+  }
+  json += "],";
+
+  // Alarmzustand bleibt im schnellen Kanal, damit Safety-Hinweise nicht erst
+  // mit dem langsamen Komplett-Refresh sichtbar werden.
+  json += "\"system\":{";
+  json += "\"uptimeMs\":" + String(millis()) + ",";
+  json += "\"alarmActiveCount\":" + String(Alarms::activeCount()) + ",";
+  json += "\"alarmCritical\":" + String(Alarms::hasCriticalActive() ? "true" : "false") + ",";
+  json += "\"alarmMessage\":\"" + jsonEscape(Alarms::currentMessage()) + "\",";
+  json += "\"buzzerMuted\":" + String(Alarms::buzzerMuted() ? "true" : "false");
+  json += "}";
+
+  json += "}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
 void handlePlantJson() {
   if (!s_ctx) {
     server.send(500, "application/json", "{\"error\":\"no_context\"}");
     return;
   }
 
-  Ds18Role activeSinkRole = SensorAssignments::activeSinkRole(s_ctx->config);
-  Ds18RoleAssignment sinkAssignment;
-  bool sinkAssigned = SensorAssignments::getAssignment(s_ctx->assignments, activeSinkRole, sinkAssignment);
-
+  // Diese API ist die einzige Datenquelle fuer die dynamische Startseite.
+  // "present" beschreibt die konfigurierte Anlagenstruktur, "active" den
+  // momentanen Betriebszustand. Dadurch muss das SVG nur bei Aenderungen der
+  // Struktur neu aufgebaut werden; Livewerte koennen separat aktualisiert werden.
   float boilerTop = NAN, boilerBottom = NAN;
   float bufferTop = NAN, bufferHigh = NAN, bufferMid = NAN, bufferBottom = NAN;
-  float collector1Flow = s_ctx->sensors.collectorValid ? s_ctx->sensors.collectorC : NAN;
-  float collector1Return = NAN;
-  float poolTemp = NAN;
-
+  float poolTemp = NAN, outsideTemp = NAN;
   bool valid = false;
 
   SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::SINK_BOILER_TOP, boilerTop, valid);
   SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::BOILER_BOTTOM, boilerBottom, valid);
-
-  SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::SINK_BUFFER_TOP, bufferTop, valid); 
+  SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::SINK_BUFFER_TOP, bufferTop, valid);
   SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::BUFFER_HIGH, bufferHigh, valid);
   SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::BUFFER_MID, bufferMid, valid);
   SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::BUFFER_BOTTOM, bufferBottom, valid);
-
-  SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::RETURN_COLLECTOR_1, collector1Return, valid);
   SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::SWIMMINGPOOL, poolTemp, valid);
+  SensorAssignments::readByRole(s_ctx->assignments, Ds18Role::OUTSIDE_TEMPERATURE, outsideTemp, valid);
 
-  bool boilerPresent =
+  const bool boilerPresent =
     SensorAssignments::hasRole(s_ctx->assignments, Ds18Role::SINK_BOILER_TOP) ||
     SensorAssignments::hasRole(s_ctx->assignments, Ds18Role::BOILER_BOTTOM);
-
-  bool bufferPresent =
+  const bool bufferPresent =
     SensorAssignments::hasRole(s_ctx->assignments, Ds18Role::SINK_BUFFER_TOP) ||
     SensorAssignments::hasRole(s_ctx->assignments, Ds18Role::BUFFER_HIGH) ||
     SensorAssignments::hasRole(s_ctx->assignments, Ds18Role::BUFFER_MID) ||
     SensorAssignments::hasRole(s_ctx->assignments, Ds18Role::BUFFER_BOTTOM);
+  const bool poolPresent = SensorAssignments::hasRole(s_ctx->assignments, Ds18Role::SWIMMINGPOOL);
 
-  bool collector1Present = s_ctx->sensors.collectorValid;
+  String json;
+  json.reserve(7600);
+  json = "{";
 
-  bool poolPresent =
-    SensorAssignments::hasRole(s_ctx->assignments, Ds18Role::SWIMMINGPOOL);
-
-  uint8_t zoneValveCount = 0;
-  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
-    if (RelayOutputs::isUsableAsZoneValve(*s_ctx, i)) {
-      zoneValveCount++;
-    }
-  }
-
-  String json = "{";
-
-  json += "\"activeSinkRole\":\"" + String(SensorRoles::toKey(activeSinkRole)) + "\",";
-  json += "\"activeSinkLabel\":\"" + String(SensorRoles::toLabel(activeSinkRole)) + "\",";
-  json += "\"sinkAssigned\":" + String(sinkAssigned ? "true" : "false") + ",";
-  json += "\"pumpOn\":" + String(s_ctx->control.relayEnable ? "true" : "false") + ",";
-
-  json += "\"components\":{";
+  // -------- Anlagenstruktur --------
+  json += "\"layout\":{";
   json += "\"boiler\":" + String(boilerPresent ? "true" : "false") + ",";
   json += "\"buffer\":" + String(bufferPresent ? "true" : "false") + ",";
-  json += "\"collector1\":" + String(collector1Present ? "true" : "false") + ",";
   json += "\"pool\":" + String(poolPresent ? "true" : "false") + ",";
-  json += "\"zoneValves\":" + String(zoneValveCount > 0 ? "true" : "false");
-  json += "},";
+  json += "\"otherSource\":" + String(HeatSourceAssignments::hasRole(s_ctx->heatSourceAssignments, HeatSourceRole::ALT_SOURCE_OTHER) ? "true" : "false") + ",";
+  json += "\"oven\":" + String(s_ctx->config.oven.enabled ? "true" : "false") + ",";
+  json += "\"auxHeater\":" + String(s_ctx->config.auxHeater.enabled ? "true" : "false") + ",";
+  json += "\"energyMeter\":" + String(s_ctx->config.energyMeter.enabled ? "true" : "false") + ",";
 
-  json += "\"zoneValves\":[";
-  bool firstZoneValve = true;
-  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
-    if (!RelayOutputs::isUsableAsZoneValve(*s_ctx, i)) continue;
-    if (!firstZoneValve) json += ",";
-    firstZoneValve = false;
-    json += "{";
-    json += "\"index\":" + String(i) + ",";
-    json += "\"name\":\"" + relayHardwareLabel(i) + "\",";
-    json += "\"state\":" + String(RelayOutputs::get(*s_ctx, i) ? "true" : "false");
-    json += "}";
+  json += "\"collectors\":[";
+  bool first = true;
+  const HeatSourceRole collectorRoles[] = {
+    HeatSourceRole::SOLAR_COLLECTOR_1,
+    HeatSourceRole::SOLAR_COLLECTOR_2,
+    HeatSourceRole::SOLAR_COLLECTOR_3
+  };
+  for (uint8_t i = 0; i < 3; i++) {
+    const HeatSourceRole role = collectorRoles[i];
+    if (!HeatSourceAssignments::hasRole(s_ctx->heatSourceAssignments, role)) continue;
+    if (!first) json += ",";
+    first = false;
+    json += "{\"index\":" + String(i) + ",\"key\":\"" + String(HeatSourceRoles::toKey(role)) + "\",\"label\":\"" + String(HeatSourceRoles::toLabel(role)) + "\"}";
   }
   json += "],";
+
+  json += "\"heatingCircuits\":[";
+  first = true;
+  for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+    if (!s_ctx->config.heatingCircuits[i].enabled) continue;
+    if (!first) json += ",";
+    first = false;
+    json += String(i);
+  }
+  json += "]";
+  json += "},";
 
   json += "\"heatSources\":{";
-  json += "\"solar1\":" + String(s_ctx->sensors.heatSources.solarCollector1Valid ? String(s_ctx->sensors.heatSources.solarCollector1C, 2) : "null") + ",";
-  json += "\"solar2\":" + String(s_ctx->sensors.heatSources.solarCollector2Valid ? String(s_ctx->sensors.heatSources.solarCollector2C, 2) : "null") + ",";
-  json += "\"solar3\":" + String(s_ctx->sensors.heatSources.solarCollector3Valid ? String(s_ctx->sensors.heatSources.solarCollector3C, 2) : "null") + ",";
-  json += "\"oven\":" + String(s_ctx->sensors.heatSources.altSourceOvenValid ? String(s_ctx->sensors.heatSources.altSourceOvenC, 2) : "null") + ",";
-  json += "\"other\":" + String(s_ctx->sensors.heatSources.altSourceOtherValid ? String(s_ctx->sensors.heatSources.altSourceOtherC, 2) : "null");
+  json += "\"otherC\":" + String(s_ctx->sensors.heatSources.altSourceOtherValid ? String(s_ctx->sensors.heatSources.altSourceOtherC, 1) : "null") + ",";
+  json += "\"ovenC\":" + String(s_ctx->sensors.heatSources.altSourceOvenValid ? String(s_ctx->sensors.heatSources.altSourceOvenC, 1) : "null");
   json += "},";
 
-  json += "\"pumps\":[";
-  bool firstPump = true;
-  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
-    const PumpConfig& p = s_ctx->config.pumps[i];
-    if (!p.enabled) continue;
-    if (!firstPump) json += ",";
-    firstPump = false;
+  // -------- Temperaturen --------
+  json += "\"temperatures\":{";
+  json += "\"boilerTop\":" + jsonFloat(boilerTop, 1) + ",";
+  json += "\"boilerBottom\":" + jsonFloat(boilerBottom, 1) + ",";
+  json += "\"bufferTop\":" + jsonFloat(bufferTop, 1) + ",";
+  json += "\"bufferHigh\":" + jsonFloat(bufferHigh, 1) + ",";
+  json += "\"bufferMid\":" + jsonFloat(bufferMid, 1) + ",";
+  json += "\"bufferBottom\":" + jsonFloat(bufferBottom, 1) + ",";
+  json += "\"pool\":" + jsonFloat(poolTemp, 1) + ",";
+  json += "\"outside\":" + jsonFloat(outsideTemp, 1);
+  json += "},";
+
+  // Temperatur-Farbskala der Speicher: 10 C = kalt/blau,
+  // konfigurierte maximale Ladetemperatur = heiss/rot.
+  json += "\"storageColorScale\":{";
+  json += "\"minC\":10.0,";
+  json += "\"bufferMaxC\":" + String(configuredStorageMaximumC(true), 1) + ",";
+  json += "\"boilerMaxC\":" + String(configuredStorageMaximumC(false), 1);
+  json += "},";
+
+  json += "\"collectors\":[";
+  for (uint8_t i = 0; i < 3; i++) {
+    if (i > 0) json += ",";
+    float temp = NAN;
+    bool tempValid = false;
+    switch (i) {
+      case 0: temp = s_ctx->sensors.heatSources.solarCollector1C; tempValid = s_ctx->sensors.heatSources.solarCollector1Valid; break;
+      case 1: temp = s_ctx->sensors.heatSources.solarCollector2C; tempValid = s_ctx->sensors.heatSources.solarCollector2Valid; break;
+      case 2: temp = s_ctx->sensors.heatSources.solarCollector3C; tempValid = s_ctx->sensors.heatSources.solarCollector3Valid; break;
+    }
+
+    const HeatSourceRole role = collectorRoles[i];
+    HeatSourceAssignment assignment;
+    const bool assigned = HeatSourceAssignments::getByRole(s_ctx->heatSourceAssignments, role, assignment);
+    const bool sensorEnabled = assigned && maxChannelEnabled(assignment.channel);
+
     json += "{";
     json += "\"index\":" + String(i) + ",";
-    json += "\"name\":\"Pumpe " + String(i + 1) + "\",";
-    json += "\"state\":" + String(p.state ? "true" : "false") + ",";
-    json += "\"source\":\"" + String(HeatSourceRoles::toLabel(p.sourceRole)) + "\",";
-    json += "\"sink\":\"" + String((p.valveIndex != PIN_UNUSED) ? String("Umschaltventil") : String(SensorRoles::toLabel(p.sinkRole))) + "\",";
-    json += "\"diff\":" + String(isnan(p.lastDiffC) ? "null" : String(p.lastDiffC, 2)) + ",";
-    json += "\"pwm\":" + String(p.lastPwmPercent, 1);
+    json += "\"assigned\":" + String(assigned ? "true" : "false") + ",";
+    json += "\"sensorEnabled\":" + String(sensorEnabled ? "true" : "false") + ",";
+    json += "\"valid\":" + String(tempValid ? "true" : "false") + ",";
+    json += "\"tempC\":" + String(tempValid ? String(temp, 1) : "null");
     json += "}";
   }
   json += "],";
 
-  json += "\"temperatures\":{";
-  json += "\"boilerTop\":" + String(isnan(boilerTop) ? "null" : String(boilerTop, 2)) + ",";
-  json += "\"boilerBottom\":" + String(isnan(boilerBottom) ? "null" : String(boilerBottom, 2)) + ",";
-  json += "\"bufferTop\":" + String(isnan(bufferTop) ? "null" : String(bufferTop, 2)) + ",";
-  json += "\"bufferHigh\":" + String(isnan(bufferHigh) ? "null" : String(bufferHigh, 2)) + ",";
-  json += "\"bufferMid\":" + String(isnan(bufferMid) ? "null" : String(bufferMid, 2)) + ",";
-  json += "\"bufferBottom\":" + String(isnan(bufferBottom) ? "null" : String(bufferBottom, 2)) + ",";
-  json += "\"collector1Flow\":" + String(isnan(collector1Flow) ? "null" : String(collector1Flow, 2)) + ",";
-  json += "\"collector1Return\":" + String(isnan(collector1Return) ? "null" : String(collector1Return, 2)) + ",";
-  json += "\"poolTemp\":" + String(isnan(poolTemp) ? "null" : String(poolTemp, 2));
-  json += "}";
+  // -------- Pumpen / hydraulische Routen --------
+  json += "\"pumps\":[";
+  first = true;
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    const PumpConfig& pump = s_ctx->config.pumps[i];
+    if (!pump.enabled || pump.mode == PumpMode::OFF) continue;
+    if (!first) json += ",";
+    first = false;
+    json += "{";
+    json += "\"index\":" + String(i) + ",";
+    json += "\"mode\":" + String((int)pump.mode) + ",";
+    json += "\"active\":" + String(pump.state ? "true" : "false") + ",";
+    json += "\"pwm\":" + String(pump.lastPwmPercent, 0) + ",";
+    json += "\"sourceType\":" + String((int)pump.sourceType) + ",";
+    json += "\"sourceRole\":\"" + String(HeatSourceRoles::toKey(pump.sourceRole)) + "\",";
+    json += "\"sourceSensorRole\":\"" + String(SensorRoles::toKey(pump.sourceSensorRole)) + "\",";
+    json += "\"sinkRole\":\"" + String(SensorRoles::toKey(pump.sinkRole)) + "\",";
+    json += "\"valveIndex\":" + String(pump.valveIndex) + ",";
+    json += "\"activeTargetIndex\":" + String(pump.activeTargetIndex) + ",";
+    json += "\"sourceTempC\":" + jsonFloat(pump.lastSourceC, 1) + ",";
+    json += "\"sinkTempC\":" + jsonFloat(pump.lastSinkC, 1) + ",";
+    json += "\"targets\":[";
+    bool firstTarget = true;
+    for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
+      if (!pump.targets[t].enabled || pump.targets[t].sinkRole == Ds18Role::NONE) continue;
+      if (!firstTarget) json += ",";
+      firstTarget = false;
+      json += "{\"index\":" + String(t) + ",\"sinkRole\":\"" + String(SensorRoles::toKey(pump.targets[t].sinkRole)) + "\"}";
+    }
+    json += "]";
+    json += "}";
+  }
+  json += "],";
+
+  // -------- Ventile --------
+  json += "\"valves\":[";
+  first = true;
+  for (uint8_t i = 0; i < MAX_VALVES; i++) {
+    if (!s_ctx->config.valves[i].enabled) continue;
+    if (!first) json += ",";
+    first = false;
+    json += "{";
+    json += "\"index\":" + String(i) + ",";
+    json += "\"moving\":" + String(Valves::isMoving(i) ? "true" : "false") + ",";
+    json += "\"current\":\"" + String(Valves::positionToKey(Valves::currentPosition(i))) + "\",";
+    json += "\"target\":\"" + String(Valves::positionToKey(Valves::targetPosition(i))) + "\"";
+    json += "}";
+  }
+  json += "],";
+
+  // -------- Ofen --------
+  json += "\"oven\":{";
+  json += "\"enabled\":" + String(s_ctx->config.oven.enabled ? "true" : "false") + ",";
+  json += "\"active\":" + String(OvenControl::active() ? "true" : "false") + ",";
+  json += "\"state\":\"" + String(OvenControl::stateText()) + "\",";
+  json += "\"temperatureC\":" + jsonFloat(OvenControl::ovenTemperatureC(), 1) + ",";
+  json += "\"temperatureValid\":" + String(!isnan(OvenControl::ovenTemperatureC()) ? "true" : "false") + ",";
+  json += "\"pumpActive\":" + String(OvenControl::pumpActive() ? "true" : "false") + ",";
+  json += "\"servoOpeningPercent\":" + String(OvenControl::servoOpeningPercent());
+  json += "},";
+
+  // -------- Zusatzheizung --------
+  float auxSinkTemp = NAN;
+  bool auxSinkValid = false;
+  if (s_ctx->config.auxHeater.sinkRole != Ds18Role::NONE) {
+    SensorAssignments::readByRole(s_ctx->assignments, s_ctx->config.auxHeater.sinkRole, auxSinkTemp, auxSinkValid);
+  }
+  json += "\"auxHeater\":{";
+  json += "\"enabled\":" + String(s_ctx->config.auxHeater.enabled ? "true" : "false") + ",";
+  json += "\"released\":" + String(s_ctx->config.auxHeater.userReleaseEnabled ? "true" : "false") + ",";
+  json += "\"state\":\"" + String(AuxHeater::stateText()) + "\",";
+  json += "\"pumpActive\":" + String(AuxHeater::pumpActive() ? "true" : "false") + ",";
+  json += "\"activeStages\":" + String(AuxHeater::activeStageCount()) + ",";
+  json += "\"sinkRole\":\"" + String(SensorRoles::toKey(s_ctx->config.auxHeater.sinkRole)) + "\",";
+  json += "\"sinkTemperatureC\":" + String(auxSinkValid ? String(auxSinkTemp, 1) : "null");
+  json += "},";
+
+  // -------- Heizkreise --------
+  json += "\"heatingCircuits\":[";
+  first = true;
+  for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+    const HeatingCircuitConfig& cfg = s_ctx->config.heatingCircuits[i];
+    if (!cfg.enabled) continue;
+    const HeatingCircuitRuntime& rt = s_ctx->heatingCircuitRuntime[i];
+    if (!first) json += ",";
+    first = false;
+    json += "{";
+    json += "\"index\":" + String(i) + ",";
+    json += "\"active\":" + String(rt.active ? "true" : "false") + ",";
+    json += "\"pumpActive\":" + String(rt.pumpActive ? "true" : "false") + ",";
+    json += "\"pumpPercent\":" + String(rt.pumpPercent) + ",";
+    json += "\"flowC\":" + jsonFloat(rt.flowTemperatureC, 1) + ",";
+    json += "\"returnC\":" + jsonFloat(rt.returnTemperatureC, 1) + ",";
+    json += "\"targetC\":" + jsonFloat(rt.targetFlowTemperatureC, 1) + ",";
+    json += "\"roomC\":" + jsonFloat(rt.roomTemperatureC, 1) + ",";
+    json += "\"roomControlEnabled\":" + String(cfg.roomControlEnabled ? "true" : "false") + ",";
+    json += "\"roomTargetC\":" + String(cfg.roomTargetTemperatureC, 1) + ",";
+    json += "\"effectiveRoomTargetC\":" + jsonFloat(rt.effectiveRoomTargetTemperatureC, 1) + ",";
+    json += "\"nightSetbackEnabled\":" + String(cfg.nightSetbackEnabled ? "true" : "false") + ",";
+    json += "\"nightSetbackActive\":" + String(rt.nightSetbackActive ? "true" : "false") + ",";
+    json += "\"bufferReferenceRole\":\"" + String(SensorRoles::toKey(cfg.bufferReferenceRole)) + "\",";
+    json += "\"mixerPosition\":" + String(rt.estimatedMixerPositionPercent);
+    json += "}";
+  }
+  json += "],";
+
+  // -------- Energie / Statusleiste --------
+  json += "\"energy\":{";
+  json += "\"enabled\":" + String(s_ctx->config.energyMeter.enabled ? "true" : "false") + ",";
+  json += "\"totalKWh\":" + String(s_ctx->energyMeter.totalEnergyKWh, 3) + ",";
+  json += "\"powerKw\":" + String(s_ctx->energyMeter.thermalPowerKw, 3) + ",";
+  json += "\"flowLMin\":" + String(s_ctx->energyMeter.flowLitersPerMinute, 2) + ",";
+  json += "\"volumeLiters\":" + String(s_ctx->energyMeter.totalVolumeLiters, 1);
+  json += "},";
+
+  const Forecast::Summary forecastSummary = Forecast::summary();
+  json += "\"system\":{";
+  json += "\"mqttEnabled\":" + String(s_ctx->config.mqttEnabled ? "true" : "false") + ",";
+  json += "\"mqttConnected\":" + String(MqttBridge::connected() ? "true" : "false") + ",";
+  json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"wifiRssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0) + ",";
+  json += "\"forecastEnabled\":" + String(s_ctx->config.forecastEnabled ? "true" : "false") + ",";
+  json += "\"forecastValid\":" + String(forecastSummary.valid ? "true" : "false") + ",";
+  json += "\"todayRemainingKWhM2\":" + (isnan(forecastSummary.todayRemainingKWhM2) ? String("null") : String(forecastSummary.todayRemainingKWhM2, 3)) + ",";
+  json += "\"tomorrowKWhM2\":" + (isnan(forecastSummary.tomorrowKWhM2) ? String("null") : String(forecastSummary.tomorrowKWhM2, 3)) + ",";
+  json += "\"tomorrowSunshineHours\":" + (isnan(forecastSummary.tomorrowSunshineHours) ? String("null") : String(forecastSummary.tomorrowSunshineHours, 2)) + ",";
+  json += "\"uptimeMs\":" + String(millis()) + ",";
+  json += "\"alarmActiveCount\":" + String(Alarms::activeCount()) + ",";
+  json += "\"alarmCritical\":" + String(Alarms::hasCriticalActive() ? "true" : "false") + ",";
+  json += "\"alarmMessage\":\"" + jsonEscape(Alarms::currentMessage()) + "\",";
+  json += "\"buzzerMuted\":" + String(Alarms::buzzerMuted() ? "true" : "false") + ",";
+  json += "\"timeValid\":" + String(TimeService::valid() ? "true" : "false") + ",";
+  json += "\"dateText\":\"" + jsonEscape(TimeService::dateText().c_str()) + "\",";
+  json += "\"timeText\":\"" + jsonEscape(TimeService::timeText().c_str()) + "\"";
+  json += "},";
+  json += "\"ml\":" + MlOptimizer::json(*s_ctx);
 
   json += "}";
-
   server.send(200, "application/json", json);
 }
+
 int pumpUsingFeedbackGpio(const AppContext& ctx, uint8_t gpio) {
   if (gpio == PIN_UNUSED) return -1;
   for (uint8_t i = 0; i < MAX_PUMPS; i++) {
@@ -563,7 +1158,8 @@ void handleEnergyMeterJson() {
   json += "\"frequencyFactorHzPerLMin\":" + String(cfg.pulsesPerLiter / 60.0f, 5) + ",";
   json += "\"flowSensorRole\":\"" + String(SensorRoles::toKey(cfg.flowSensorRole)) + "\",";
   json += "\"returnSensorRole\":\"" + String(SensorRoles::toKey(cfg.returnSensorRole)) + "\",";
-  json += "\"energyFactorWhPerLiterK\":" + String(cfg.energyFactorWhPerLiterK, 5) + ",";
+  json += "\"energyFactorWhPerLiterK\":" + String(EnergyMeter::effectiveEnergyFactorWhPerLiterK(s_ctx->config, rt.temperatureValid ? 0.5f*(rt.flowTemperatureC+rt.returnTemperatureC) : 40.0f), 5) + ",";
+  json += "\"energyFactorSource\":\"plantDataFluidModel\",";
   json += "\"logIntervalMs\":" + String(cfg.logIntervalMs) + ",";
   json += "\"csvPath\":\"" + String(FILE_ENERGY_METER_LOG) + "\",";
   json += "\"runtime\":{";
@@ -625,7 +1221,6 @@ void handleEnergyMeterSave() {
   if (server.hasArg("pulsesPerLiter")) candidate.pulsesPerLiter = server.arg("pulsesPerLiter").toFloat();
   if (server.hasArg("flowSensorRole")) candidate.flowSensorRole = SensorRoles::fromKey(server.arg("flowSensorRole"));
   if (server.hasArg("returnSensorRole")) candidate.returnSensorRole = SensorRoles::fromKey(server.arg("returnSensorRole"));
-  if (server.hasArg("energyFactorWhPerLiterK")) candidate.energyFactorWhPerLiterK = server.arg("energyFactorWhPerLiterK").toFloat();
 
   if (candidate.enabled) {
     if (candidate.feedbackInputIndex == PIN_UNUSED || candidate.feedbackInputIndex >= FEEDBACK_INPUT_COUNT) {
@@ -644,10 +1239,6 @@ void handleEnergyMeterSave() {
     if (!SensorAssignments::hasRole(s_ctx->assignments, candidate.flowSensorRole) ||
         !SensorAssignments::hasRole(s_ctx->assignments, candidate.returnSensorRole)) {
       server.send(409, "text/plain", "Vorlauf- oder Ruecklaufsensor ist aktuell keinem DS18B20 zugeordnet");
-      return;
-    }
-    if (candidate.energyFactorWhPerLiterK <= 0.0f || candidate.energyFactorWhPerLiterK > 2.0f) {
-      server.send(400, "text/plain", "Waermetraegerfaktor ungueltig");
       return;
     }
     const uint8_t gpio = EnergyMeter::gpioForFeedbackInput(candidate.feedbackInputIndex);
@@ -683,6 +1274,7 @@ void handleHeatSourcesJson() {
     String channelKey = "ch1";
     if (a.channel == MaxChannel::CH2) channelKey = "ch2";
     else if (a.channel == MaxChannel::CH3) channelKey = "ch3";
+    else if (a.channel == MaxChannel::CH4) channelKey = "ch4";
 
     json += "{";
     json += "\"channel\":\"" + channelKey + "\",";
@@ -713,16 +1305,17 @@ void handleMaxStatusJson() {
   json += "\"validTempMaxC\":" + String(MAX31865_VALID_TEMP_MAX_C, 1) + ",";
 
   json += "\"channels\":[";
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < MAX_MAX31865_CHANNELS; i++) {
     if (i > 0) json += ",";
 
     const MaxChannelReading& r = s_ctx->maxReadings[i];
     const MaxChannelConfig& c =
       (i == 0) ? s_ctx->config.max1 :
       (i == 1) ? s_ctx->config.max2 :
-                 s_ctx->config.max3;
+      (i == 2) ? s_ctx->config.max3 :
+                 s_ctx->config.max4;
 
-    String channelKey = (i == 0) ? "ch1" : (i == 1) ? "ch2" : "ch3";
+    String channelKey = (i == 0) ? "ch1" : (i == 1) ? "ch2" : (i == 2) ? "ch3" : "ch4";
 
     json += "{";
     json += "\"channel\":\"" + channelKey + "\",";
@@ -766,6 +1359,26 @@ void handleMaxDebugJson() {
   server.send(200, "application/json", HeatSourcesMax::debugJson(*s_ctx, oneShot));
 }
 
+
+void handleMaxFaultTraceJson() {
+  if (!s_ctx) {
+    server.send(500, "application/json", "{\"error\":\"no_context\"}");
+    return;
+  }
+
+  server.send(200, "application/json", HeatSourcesMax::faultTraceJson(*s_ctx));
+}
+
+
+void handleMaxSequenceDiagJson() {
+  if (!s_ctx) {
+    server.send(500, "application/json", "{\"error\":\"no_context\"}");
+    return;
+  }
+
+  server.send(200, "application/json", HeatSourcesMax::sequenceDiagnosticJson(*s_ctx));
+}
+
 void handleNetworkJson() {
   if (!s_ctx) {
     server.send(500, "application/json", "{\"error\":\"no_context\"}");
@@ -793,6 +1406,34 @@ void handleNetworkJson() {
   json += "\"lastStaReconnectAttemptMs\":" + String(s_ctx->networkLastStaReconnectAttemptMs) + ",";
   json += "\"staDisconnectedSinceMs\":" + String(s_ctx->networkStaDisconnectedSinceMs) + ",";
   json += "\"hostName\":\"" + jsonEscape(s_ctx->config.hostName) + "\",";
+  json += "\"mqttEnabled\":" + String(s_ctx->config.mqttEnabled ? "true" : "false") + ",";
+  json += "\"mqttHost\":\"" + jsonEscape(s_ctx->config.mqttHost) + "\",";
+  json += "\"mqttPort\":" + String(s_ctx->config.mqttPort) + ",";
+  json += "\"mqttUser\":\"" + jsonEscape(s_ctx->config.mqttUser) + "\",";
+  json += "\"mqttPasswordSet\":" + String(s_ctx->config.mqttPassword[0] ? "true" : "false") + ",";
+  json += "\"mqttClientId\":\"" + jsonEscape(s_ctx->config.mqttClientId) + "\",";
+  json += "\"mqttBaseTopic\":\"" + jsonEscape(s_ctx->config.mqttBaseTopic) + "\",";
+  json += "\"mqttDiscoveryEnabled\":" + String(s_ctx->config.mqttDiscoveryEnabled ? "true" : "false") + ",";
+  json += "\"mqttPublishIntervalMs\":" + String(s_ctx->config.mqttPublishIntervalMs) + ",";
+  json += "\"mqttConnected\":" + String(MqttBridge::connected() ? "true" : "false") + ",";
+  json += "\"mqttConnecting\":" + String(MqttBridge::connecting() ? "true" : "false") + ",";
+  json += "\"mqttLastError\":\"" + jsonEscape(MqttBridge::lastError()) + "\",";
+  json += "\"mqttLastConnectAttemptMs\":" + String(MqttBridge::lastConnectAttemptMs()) + ",";
+  json += "\"ntpEnabled\":" + String(s_ctx->config.ntpEnabled ? "true" : "false") + ",";
+  json += "\"ntpServer\":\"" + jsonEscape(s_ctx->config.ntpServer) + "\",";
+  json += "\"ntpStatus\":\"" + String(TimeService::statusText()) + "\",";
+  json += "\"ntpLastSyncEpoch\":" + String(TimeService::lastSyncEpoch()) + ",";
+  json += "\"timeValid\":" + String(TimeService::valid() ? "true" : "false") + ",";
+  json += "\"dateText\":\"" + jsonEscape(TimeService::dateText().c_str()) + "\",";
+  json += "\"timeText\":\"" + jsonEscape(TimeService::timeText().c_str()) + "\",";
+  json += "\"forecastEnabled\":" + String(s_ctx->config.forecastEnabled ? "true" : "false") + ",";
+  json += "\"forecastLatitude\":" + String(s_ctx->config.forecastLatitude, 5) + ",";
+  json += "\"forecastLongitude\":" + String(s_ctx->config.forecastLongitude, 5) + ",";
+  json += "\"forecastIntervalMin\":" + String(s_ctx->config.forecastIntervalMs / 60000UL) + ",";
+  json += "\"forecastAuxDelayEnabled\":" + String(s_ctx->config.forecastAuxDelayEnabled ? "true" : "false") + ",";
+  json += "\"forecastAuxMaxWaitHours\":" + String(s_ctx->config.forecastAuxMaxWaitMs / 3600000.0f, 1) + ",";
+  json += "\"forecastSolarPriorityEnabled\":" + String(s_ctx->config.forecastSolarPriorityEnabled ? "true" : "false") + ",";
+  json += "\"forecast\":" + Forecast::json(*s_ctx) + ",";
   json += "\"macSta\":\"" + WiFi.macAddress() + "\",";
   json += "\"macAp\":\"" + WiFi.softAPmacAddress() + "\"";
   json += "}";
@@ -811,7 +1452,7 @@ void handleNetworkSave() {
     return;
   }
 
-  s_ctx->config.staEnabled = server.hasArg("staEnabled") && server.arg("staEnabled") == "1";
+  if (server.hasArg("staEnabled")) s_ctx->config.staEnabled = server.arg("staEnabled") == "1";
 
   if (server.hasArg("staSsid")) {
     String v = server.arg("staSsid");
@@ -843,12 +1484,65 @@ void handleNetworkSave() {
     v.toCharArray(s_ctx->config.hostName, sizeof(s_ctx->config.hostName));
   }
 
+  if (server.hasArg("mqttEnabled")) s_ctx->config.mqttEnabled = server.arg("mqttEnabled") == "1";
+  if (server.hasArg("mqttHost")) {
+    String v = server.arg("mqttHost"); v.trim();
+    if (v.length() >= (int)sizeof(s_ctx->config.mqttHost)) { server.send(400, "text/plain", "MQTT Broker/Host ist zu lang"); return; }
+    v.toCharArray(s_ctx->config.mqttHost, sizeof(s_ctx->config.mqttHost));
+  }
+  if (server.hasArg("mqttPort")) {
+    const int port = server.arg("mqttPort").toInt();
+    if (port < 1 || port > 65535) { server.send(400, "text/plain", "MQTT Port ungueltig"); return; }
+    s_ctx->config.mqttPort = (uint16_t)port;
+  }
+  if (server.hasArg("mqttUser")) {
+    String v = server.arg("mqttUser"); v.trim();
+    if (v.length() >= (int)sizeof(s_ctx->config.mqttUser)) { server.send(400, "text/plain", "MQTT Benutzername ist zu lang"); return; }
+    v.toCharArray(s_ctx->config.mqttUser, sizeof(s_ctx->config.mqttUser));
+  }
+  if (server.hasArg("mqttPasswordClear") && server.arg("mqttPasswordClear") == "1") {
+    s_ctx->config.mqttPassword[0] = '\0';
+  } else if (server.hasArg("mqttPassword") && server.arg("mqttPassword").length() > 0) {
+    String v = server.arg("mqttPassword");
+    if (v.length() >= (int)sizeof(s_ctx->config.mqttPassword)) { server.send(400, "text/plain", "MQTT Passwort ist zu lang"); return; }
+    v.toCharArray(s_ctx->config.mqttPassword, sizeof(s_ctx->config.mqttPassword));
+  }
+  if (server.hasArg("mqttClientId")) {
+    String v = server.arg("mqttClientId"); v.trim(); if (!v.length()) v = "SolarCtrl";
+    if (v.length() >= (int)sizeof(s_ctx->config.mqttClientId)) { server.send(400, "text/plain", "MQTT Client-ID ist zu lang"); return; }
+    v.toCharArray(s_ctx->config.mqttClientId, sizeof(s_ctx->config.mqttClientId));
+  }
+  if (server.hasArg("mqttBaseTopic")) {
+    String v = server.arg("mqttBaseTopic"); v.trim(); while (v.endsWith("/")) v.remove(v.length() - 1); if (!v.length()) v = "haus/solarctrl";
+    if (v.length() >= (int)sizeof(s_ctx->config.mqttBaseTopic)) { server.send(400, "text/plain", "MQTT Basis-Topic ist zu lang"); return; }
+    v.toCharArray(s_ctx->config.mqttBaseTopic, sizeof(s_ctx->config.mqttBaseTopic));
+  }
+  if (server.hasArg("mqttDiscoveryEnabled")) s_ctx->config.mqttDiscoveryEnabled = server.arg("mqttDiscoveryEnabled") == "1";
+  if (server.hasArg("mqttPublishIntervalS")) {
+    const long sec = server.arg("mqttPublishIntervalS").toInt();
+    if (sec < 2 || sec > 300) { server.send(400, "text/plain", "MQTT Intervall muss 2..300 s sein"); return; }
+    s_ctx->config.mqttPublishIntervalMs = (uint32_t)sec * 1000UL;
+  }
+
+  if (server.hasArg("ntpEnabled")) s_ctx->config.ntpEnabled = server.arg("ntpEnabled") == "1";
+  if (server.hasArg("ntpServer")) { String v=server.arg("ntpServer"); v.trim(); if(!v.length()) v="pool.ntp.org"; if(v.length() >= (int)sizeof(s_ctx->config.ntpServer)){server.send(400,"text/plain","NTP Server ist zu lang");return;} v.toCharArray(s_ctx->config.ntpServer,sizeof(s_ctx->config.ntpServer)); }
+  if (server.hasArg("forecastEnabled")) s_ctx->config.forecastEnabled = server.arg("forecastEnabled") == "1";
+  if (server.hasArg("forecastLatitude")) { float v=server.arg("forecastLatitude").toFloat(); if(v < -90.0f || v > 90.0f){server.send(400,"text/plain","Breitengrad ungueltig");return;} s_ctx->config.forecastLatitude=v; }
+  if (server.hasArg("forecastLongitude")) { float v=server.arg("forecastLongitude").toFloat(); if(v < -180.0f || v > 180.0f){server.send(400,"text/plain","Laengengrad ungueltig");return;} s_ctx->config.forecastLongitude=v; }
+  if (server.hasArg("forecastIntervalMin")) { long m=server.arg("forecastIntervalMin").toInt(); if(m<15||m>180){server.send(400,"text/plain","Forecast Intervall muss 15..180 min sein");return;} s_ctx->config.forecastIntervalMs=(uint32_t)m*60000UL; }
+  if (server.hasArg("forecastAuxDelayEnabled")) s_ctx->config.forecastAuxDelayEnabled = server.arg("forecastAuxDelayEnabled") == "1";
+  if (server.hasArg("forecastAuxMaxWaitHours")) { float h=server.arg("forecastAuxMaxWaitHours").toFloat(); if(h<0.25f||h>24.0f){server.send(400,"text/plain","Forecast Wartezeit muss 0.25..24 h sein");return;} s_ctx->config.forecastAuxMaxWaitMs=(uint32_t)(h*3600000.0f); }
+  if (server.hasArg("forecastSolarPriorityEnabled")) s_ctx->config.forecastSolarPriorityEnabled = server.arg("forecastSolarPriorityEnabled") == "1";
+
   if (!Storage::saveConfig(s_ctx->config)) {
     server.send(500, "text/plain", "Speichern fehlgeschlagen");
     return;
   }
 
-  server.send(200, "text/plain", "OK_RESTART_REQUIRED");
+  MqttBridge::forceReconnect();
+  TimeService::forceSync();
+  Forecast::forceRefresh();
+  server.send(200, "text/plain", "OK");
 }
 
 void handleAssignHeatSource() {
@@ -868,10 +1562,16 @@ void handleAssignHeatSource() {
   MaxChannel channel = MaxChannel::CH1;
   if (channelArg.equalsIgnoreCase("ch2")) channel = MaxChannel::CH2;
   else if (channelArg.equalsIgnoreCase("ch3")) channel = MaxChannel::CH3;
+  else if (channelArg.equalsIgnoreCase("ch4")) channel = MaxChannel::CH4;
 
   HeatSourceRole role = HeatSourceRoles::fromKey(roleArg);
   if (role == HeatSourceRole::NONE) {
-    server.send(400, "text/plain", "Ungültige Wärmequellenrolle");
+    // "nicht zugewiesen" ist eine gueltige Konfiguration. Vorhandene
+    // Kanalzuordnung entfernen, damit deaktivierte ADCs keine alte Rolle behalten.
+    HeatSourceAssignments::removeByChannel(s_ctx->heatSourceAssignments, channel);
+    HeatSourceStorage::saveAssignments(s_ctx->heatSourceAssignments);
+    HeatSourceAssignments::resolveHeatSources(*s_ctx);
+    server.send(200, "text/plain", "OK");
     return;
   }
 
@@ -881,6 +1581,7 @@ void handleAssignHeatSource() {
   }
 
   HeatSourceStorage::saveAssignments(s_ctx->heatSourceAssignments);
+  HeatSourceAssignments::resolveHeatSources(*s_ctx);
   server.send(200, "text/plain", "OK");
 }
 void handleSaveMaxConfig() {
@@ -910,8 +1611,18 @@ void handleSaveMaxConfig() {
   applyChannel(s_ctx->config.max1, "max1");
   applyChannel(s_ctx->config.max2, "max2");
   applyChannel(s_ctx->config.max3, "max3");
+  applyChannel(s_ctx->config.max4, "max4");
+
+  // Deaktivierte MAX-Kanaele duerfen keine aktive Sensorrolle behalten.
+  bool assignmentsChanged = false;
+  if (!s_ctx->config.max1.enabled) assignmentsChanged |= HeatSourceAssignments::removeByChannel(s_ctx->heatSourceAssignments, MaxChannel::CH1);
+  if (!s_ctx->config.max2.enabled) assignmentsChanged |= HeatSourceAssignments::removeByChannel(s_ctx->heatSourceAssignments, MaxChannel::CH2);
+  if (!s_ctx->config.max3.enabled) assignmentsChanged |= HeatSourceAssignments::removeByChannel(s_ctx->heatSourceAssignments, MaxChannel::CH3);
+  if (!s_ctx->config.max4.enabled) assignmentsChanged |= HeatSourceAssignments::removeByChannel(s_ctx->heatSourceAssignments, MaxChannel::CH4);
 
   Storage::saveConfig(s_ctx->config);
+  if (assignmentsChanged) HeatSourceStorage::saveAssignments(s_ctx->heatSourceAssignments);
+  HeatSourceAssignments::resolveHeatSources(*s_ctx);
 
   server.send(200, "text/plain", "OK");
 }
@@ -1806,6 +2517,7 @@ int feedbackPinUsedBy(const AppContext& ctx, uint8_t feedbackPin, int ignorePump
       json += "\"sinkLabel\":\"" + String(p.sinkRole == Ds18Role::NONE ? "Priorisierter Sink" : SensorRoles::toLabel(p.sinkRole)) + "\",";
       json += "\"relayIndex\":" + String(p.relayIndex) + ",";
       json += "\"pwmChannel\":" + String(p.pwmChannel) + ",";
+      json += "\"pwmProfile\":\"" + pwmProfileToKey(p.pwmProfile) + "\",";
       json += "\"feedbackPin\":" + String(p.feedbackPin) + ",";
       json += "\"targetDiff\":" + String(p.targetDiff, 2) + ",";
       json += "\"hysteresis\":" + String(p.hysteresis, 2) + ",";
@@ -2445,6 +3157,10 @@ server.send(200, "text/plain", "OK");
     json += "\"frostProtectionActive\":" + String(st.frostProtectionActive ? "true" : "false") + ",";
     json += "\"collectorStagnationActive\":" + String(st.collectorStagnationActive ? "true" : "false") + ",";
     json += "\"storageOvertemperatureActive\":" + String(st.storageOvertemperatureActive ? "true" : "false") + ",";
+    json += "\"storageMaximumActive\":" + String(st.storageMaximumActive ? "true" : "false") + ",";
+    json += "\"storageCriticalOvertemperatureActive\":" + String(st.storageCriticalOvertemperatureActive ? "true" : "false") + ",";
+    json += "\"storageForcedCoolingActive\":" + String(st.storageForcedCoolingActive ? "true" : "false") + ",";
+    json += "\"storageForcedCoolingPumpCount\":" + String(st.storageForcedCoolingPumpCount) + ",";
     json += "\"ovenOvertemperatureActive\":" + String(st.ovenOvertemperatureActive ? "true" : "false") + ",";
     json += "\"sensorFaultActive\":" + String(st.sensorFaultActive ? "true" : "false") + ",";
     json += "\"blockNormalPumpControl\":" + String(st.blockNormalPumpControl ? "true" : "false") + ",";
@@ -2833,18 +3549,10 @@ server.send(200, "text/plain", "OK");
     server.send(200, "text/plain", "OK");
   }
 
-  void handleTestOverviewJson() {
-    if (!s_ctx) {
-      server.send(500, "application/json", "{\"error\":\"no_context\"}");
-      return;
-    }
+  void handleTestRelaysJson() {
+    if (!s_ctx) { server.send(500, "application/json", "{\"error\":\"no_context\"}"); return; }
 
-    if (g_commissioningTestActive) {
-      updatePumpRouteTestRuntime(*s_ctx);
-    }
-
-    String json = "{";
-    json += "\"relays\":[";
+    String json = "{\"relays\":[";
     for (uint8_t i = 0; i < RELAY_COUNT; i++) {
       if (i > 0) json += ",";
       const RelayOutputConfig& cfg = s_ctx->config.relays[i];
@@ -2856,8 +3564,14 @@ server.send(200, "text/plain", "OK");
       json += "\"state\":" + String(RelayOutputs::get(*s_ctx, i) ? "true" : "false");
       json += "}";
     }
+    json += "]}";
+    server.send(200, "application/json", json);
+  }
 
-    json += "],\"pcaChannels\":[";
+  void handleTestPwmJson() {
+    if (!s_ctx) { server.send(500, "application/json", "{\"error\":\"no_context\"}"); return; }
+
+    String json = "{\"pcaChannels\":[";
     for (uint8_t ch = 0; ch < PWM_OUTPUT_COUNT; ch++) {
       if (ch > 0) json += ",";
       const PwmOutputConfig& out = s_ctx->config.pwmOutputs[ch];
@@ -2872,16 +3586,27 @@ server.send(200, "text/plain", "OK");
       json += "\"percent\":" + String(PwmDriver::getDuty(ch));
       json += "}";
     }
+    json += "]}";
+    server.send(200, "application/json", json);
+  }
 
-    json += "],\"servo\":{";
+  void handleTestServoJson() {
+    String json = "{\"servo\":{";
     json += "\"available\":true,";
     json += "\"label\":\"Ofenklappen-Servo\",";
     json += "\"pin\":" + String(OVEN_SERVO_PIN) + ",";
     json += "\"initialized\":" + String(ServoDriver::initialized() ? "true" : "false") + ",";
     json += "\"angle\":" + String(ServoDriver::angle());
-    json += "}";
+    json += "}}";
+    server.send(200, "application/json", json);
+  }
 
-    json += ",\"pumps\":[";
+  void handleTestPumpsJson() {
+    if (!s_ctx) { server.send(500, "application/json", "{\"error\":\"no_context\"}"); return; }
+
+    if (g_commissioningTestActive) updatePumpRouteTestRuntime(*s_ctx);
+
+    String json = "{\"pumps\":[";
     for (uint8_t i = 0; i < MAX_PUMPS; i++) {
       if (i > 0) json += ",";
       const PumpConfig& pump = s_ctx->config.pumps[i];
@@ -2945,12 +3670,16 @@ server.send(200, "text/plain", "OK");
         json += "\"lastDiffC\":" + jsonFloat(target.lastDiffC, 1);
         json += "}";
       }
-      json += "]";
-      json += "}";
+      json += "]}";
     }
+    json += "]}";
+    server.send(200, "application/json", json);
+  }
 
+  void handleTestValvesJson() {
+    if (!s_ctx) { server.send(500, "application/json", "{\"error\":\"no_context\"}"); return; }
 
-    json += "],\"valves\":[";
+    String json = "{\"valves\":[";
     for (uint8_t i = 0; i < MAX_VALVES; i++) {
       if (i > 0) json += ",";
       const ValveConfig& valve = s_ctx->config.valves[i];
@@ -2968,8 +3697,14 @@ server.send(200, "text/plain", "OK");
       json += "\"safetyPosition\":\"" + valvePositionToKey(valve.safetyPosition) + "\"";
       json += "}";
     }
+    json += "]}";
+    server.send(200, "application/json", json);
+  }
 
-    json += "],\"heatingCircuits\":[";
+  void handleTestHeatingJson() {
+    if (!s_ctx) { server.send(500, "application/json", "{\"error\":\"no_context\"}"); return; }
+
+    String json = "{\"heatingCircuits\":[";
     for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
       if (i > 0) json += ",";
       const HeatingCircuitConfig& cfg = s_ctx->config.heatingCircuits[i];
@@ -3001,8 +3736,14 @@ server.send(200, "text/plain", "OK");
       json += "\"mixerPosition\":" + String(rt.estimatedMixerPositionPercent);
       json += "}";
     }
+    json += "]}";
+    server.send(200, "application/json", json);
+  }
 
-    json += "],\"sensors\":{\"ds18b20\":[";
+  void handleTestSensorsJson() {
+    if (!s_ctx) { server.send(500, "application/json", "{\"error\":\"no_context\"}"); return; }
+
+    String json = "{\"sensors\":{\"ds18b20\":[";
     for (uint8_t i = 0; i < s_ctx->ds18b20.count; i++) {
       if (i > 0) json += ",";
       const Ds18b20DeviceInfo& d = s_ctx->ds18b20.devices[i];
@@ -3015,7 +3756,7 @@ server.send(200, "text/plain", "OK");
       json += "}";
     }
     json += "],\"max\":[";
-    for (uint8_t i = 0; i < 3; i++) {
+    for (uint8_t i = 0; i < MAX_MAX31865_CHANNELS; i++) {
       if (i > 0) json += ",";
       const MaxChannelReading& r = s_ctx->maxReadings[i];
       json += "{";
@@ -3027,15 +3768,21 @@ server.send(200, "text/plain", "OK");
       json += "\"fault\":" + String(r.fault);
       json += "}";
     }
-    json += "]}";
+    json += "]}}";
+    server.send(200, "application/json", json);
+  }
 
-    json += ",";
+  void handleTestSafetyJson() {
+    String json = "{";
     appendTestSafetyJson(json);
+    json += "}";
+    server.send(200, "application/json", json);
+  }
 
-    json += ",\"alarms\":";
-    Alarms::appendJson(json);
+  void handleTestDiagnosticsJson() {
+    if (!s_ctx) { server.send(500, "application/json", "{\"error\":\"no_context\"}"); return; }
 
-    json += ",\"diagnostics\":{";
+    String json = "{\"diagnostics\":{";
     json += "\"faultActive\":" + String(s_ctx->diag.faultActive ? "true" : "false") + ",";
     json += "\"faultText\":\"" + jsonEscape(s_ctx->diag.faultText) + "\",";
     json += "\"bootCount\":" + String(s_ctx->diag.bootCount) + ",";
@@ -3046,16 +3793,14 @@ server.send(200, "text/plain", "OK");
     json += "\"sdAvailable\":" + String(s_ctx->sdAvailable ? "true" : "false") + ",";
     json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
     json += "\"uptimeMs\":" + String(millis());
-    json += "}";
+    json += "},";
 
     String validationError;
     const bool outputValid = OutputValidation::validateAll(*s_ctx, validationError);
-    json += ",\"outputValidation\":{";
+    json += "\"outputValidation\":{";
     json += "\"ok\":" + String(outputValid ? "true" : "false") + ",";
-    json += "\"message\":\"" + validationError + "\"";
-    json += "}";
-
-    json += "}";
+    json += "\"message\":\"" + jsonEscape(validationError.c_str()) + "\"";
+    json += "}}";
     server.send(200, "application/json", json);
   }
 
@@ -3272,6 +4017,17 @@ server.send(200, "text/plain", "OK");
     server.send(200, "text/plain", "Quittiert: " + String(count));
   }
 
+  void handleBuzzerMute() {
+    if (!s_ctx) { server.send(500, "text/plain", "Kein Kontext"); return; }
+    bool mute = true;
+    if (server.hasArg("state")) {
+      String v = server.arg("state"); v.toLowerCase();
+      mute = !(v == "0" || v == "off" || v == "false");
+    }
+    Alarms::setBuzzerMuted(mute);
+    server.send(200, "application/json", String("{\"muted\":") + (Alarms::buzzerMuted() ? "true" : "false") + "}");
+  }
+
   void handleAlarmsClearHistory() {
     if (!testSessionValid()) {
       server.send(403, "text/plain", "Service-PIN falsch oder fehlt");
@@ -3418,11 +4174,16 @@ server.send(200, "text/plain", "OK");
   json += String((int)c.solarHydraulicType);
   json += ",\"solarCollectorType\":";
   json += String((int)c.solarCollectorType);
+  json += ",\"collectorApertureM2\":"; json += jsonFloat(c.collectorApertureM2, 3);
+  json += ",\"collectorTiltDeg\":"; json += jsonFloat(c.collectorTiltDeg, 1);
+  json += ",\"collectorAzimuthDeg\":"; json += jsonFloat(c.collectorAzimuthDeg, 1);
 
   json += ",\"frostEnabled\":";
   json += c.frostEnabled ? "true" : "false";
   json += ",\"frostCollectorOnC\":";
   json += jsonFloat(c.frostCollectorOnC, 1);
+  json += ",\"frostCollectorOffC\":";
+  json += jsonFloat(c.frostCollectorOffC, 1);
   json += ",\"frostSafeCollectorTemperatureC\":";
   json += jsonFloat(c.frostSafeCollectorTemperatureC, 1);
   json += ",\"frostSinkMinC\":";
@@ -3431,6 +4192,8 @@ server.send(200, "text/plain", "OK");
   json += jsonFloat(c.frostPumpPercent, 0);
   json += ",\"frostProtectionStorageRole\":";
   json += String((int)c.frostProtectionStorageRole);
+  json += ",\"frostRequiredProtectionC\":"; json += jsonFloat(c.frostRequiredProtectionC, 1);
+  json += ",\"frostProtectionReserveK\":"; json += jsonFloat(c.frostProtectionReserveK, 1);
 
   json += ",\"stagnationEnabled\":";
   json += c.stagnationEnabled ? "true" : "false";
@@ -3508,16 +4271,24 @@ static void handleSafetySave() {
 
   ConfigData& c = s_ctx->config;
 
-  c.solarFluidType = (SolarFluidType)server.arg("solarFluidType").toInt();
-  c.solarHydraulicType = (SolarHydraulicType)server.arg("solarHydraulicType").toInt();
-  c.solarCollectorType = (SolarCollectorType)server.arg("solarCollectorType").toInt();
+  // Physikalische Solaranlagendaten werden auf /plant-data.html gepflegt.
+  // Alte Clients duerfen sie weiterhin mitsenden, fehlende Felder duerfen sie aber niemals ueberschreiben.
+  if (server.hasArg("solarFluidType")) c.solarFluidType = (SolarFluidType)server.arg("solarFluidType").toInt();
+  if (server.hasArg("solarHydraulicType")) c.solarHydraulicType = (SolarHydraulicType)server.arg("solarHydraulicType").toInt();
+  if (server.hasArg("solarCollectorType")) c.solarCollectorType = (SolarCollectorType)server.arg("solarCollectorType").toInt();
+  if (server.hasArg("collectorApertureM2")) c.collectorApertureM2 = constrain(server.arg("collectorApertureM2").toFloat(), 0.1f, 100.0f);
+  if (server.hasArg("collectorTiltDeg")) c.collectorTiltDeg = constrain(server.arg("collectorTiltDeg").toFloat(), 0.0f, 90.0f);
+  if (server.hasArg("collectorAzimuthDeg")) { float a=server.arg("collectorAzimuthDeg").toFloat(); while(a<0)a+=360.0f; while(a>=360)a-=360.0f; c.collectorAzimuthDeg=a; }
 
-  c.frostEnabled = server.arg("frostEnabled").toInt() != 0;
-  c.frostCollectorOnC = server.arg("frostCollectorOnC").toFloat();
-  c.frostSafeCollectorTemperatureC = server.arg("frostSafeCollectorTemperatureC").toFloat();
-  c.frostSinkMinC = server.arg("frostSinkMinC").toFloat();
-  c.frostPumpPercent = server.arg("frostPumpPercent").toFloat();
-  c.frostProtectionStorageRole = (Ds18Role)server.arg("frostProtectionStorageRole").toInt();
+  if (server.hasArg("frostEnabled")) c.frostEnabled = server.arg("frostEnabled").toInt() != 0;
+  if (server.hasArg("frostCollectorOnC")) c.frostCollectorOnC = server.arg("frostCollectorOnC").toFloat();
+  if (server.hasArg("frostCollectorOffC")) c.frostCollectorOffC = server.arg("frostCollectorOffC").toFloat();
+  if (server.hasArg("frostSafeCollectorTemperatureC")) c.frostSafeCollectorTemperatureC = server.arg("frostSafeCollectorTemperatureC").toFloat();
+  if (server.hasArg("frostSinkMinC")) c.frostSinkMinC = server.arg("frostSinkMinC").toFloat();
+  if (server.hasArg("frostPumpPercent")) c.frostPumpPercent = server.arg("frostPumpPercent").toFloat();
+  if (server.hasArg("frostProtectionStorageRole")) c.frostProtectionStorageRole = (Ds18Role)server.arg("frostProtectionStorageRole").toInt();
+  if (server.hasArg("frostRequiredProtectionC")) c.frostRequiredProtectionC = constrain(server.arg("frostRequiredProtectionC").toFloat(), -60.0f, 5.0f);
+  if (server.hasArg("frostProtectionReserveK")) c.frostProtectionReserveK = constrain(server.arg("frostProtectionReserveK").toFloat(), 0.0f, 20.0f);
 
   c.stagnationEnabled = server.arg("stagnationEnabled").toInt() != 0;
   c.stagnationCollectorOnC = server.arg("stagnationCollectorOnC").toFloat();
@@ -3714,6 +4485,10 @@ namespace {
       json += "\"minimumFlowTemperatureC\":" + String(cfg.minimumFlowTemperatureC, 2) + ",";
       json += "\"roomTargetTemperatureC\":" + String(cfg.roomTargetTemperatureC, 2) + ",";
       json += "\"roomInfluenceK\":" + String(cfg.roomInfluenceK, 2) + ",";
+      json += "\"nightSetbackEnabled\":" + String(cfg.nightSetbackEnabled ? "true" : "false") + ",";
+      json += "\"nightSetbackStartMinute\":" + String(cfg.nightSetbackStartMinute) + ",";
+      json += "\"nightSetbackEndMinute\":" + String(cfg.nightSetbackEndMinute) + ",";
+      json += "\"nightSetbackK\":" + String(cfg.nightSetbackK, 2) + ",";
       json += "\"heatingCurveBaseC\":" + String(cfg.heatingCurveBaseC, 2) + ",";
       json += "\"heatingCurveSlope\":" + String(cfg.heatingCurveSlope, 3) + ",";
       json += "\"frostProtectionEnabled\":" + String(cfg.frostProtectionEnabled ? "true" : "false") + ",";
@@ -3730,6 +4505,8 @@ namespace {
       json += "\"roomTemperatureC\":" + jsonFloat(rt.roomTemperatureC, 2) + ",";
       json += "\"outsideTemperatureC\":" + jsonFloat(rt.outsideTemperatureC, 2) + ",";
       json += "\"targetFlowTemperatureC\":" + jsonFloat(rt.targetFlowTemperatureC, 2) + ",";
+      json += "\"effectiveRoomTargetTemperatureC\":" + jsonFloat(rt.effectiveRoomTargetTemperatureC, 2) + ",";
+      json += "\"nightSetbackActive\":" + String(rt.nightSetbackActive ? "true" : "false") + ",";
       json += "\"spreadTemperatureC\":" + jsonFloat(rt.spreadTemperatureC, 2) + ",";
       json += "\"pumpPercent\":" + String(rt.pumpPercent) + ",";
       json += "\"mixerPosition\":" + String(rt.estimatedMixerPositionPercent);
@@ -3787,6 +4564,11 @@ namespace {
     candidate.roomControlEnabled = server.hasArg("roomControlEnabled") && server.arg("roomControlEnabled").toInt() != 0;
     if (server.hasArg("roomTargetTemperatureC")) candidate.roomTargetTemperatureC = server.arg("roomTargetTemperatureC").toFloat();
     if (server.hasArg("roomInfluenceK")) candidate.roomInfluenceK = server.arg("roomInfluenceK").toFloat();
+    candidate.nightSetbackEnabled = server.hasArg("nightSetbackEnabled") && server.arg("nightSetbackEnabled").toInt() != 0;
+    if (server.hasArg("nightSetbackStartMinute")) candidate.nightSetbackStartMinute = (uint16_t)constrain(server.arg("nightSetbackStartMinute").toInt(), 0, 1439);
+    if (server.hasArg("nightSetbackEndMinute")) candidate.nightSetbackEndMinute = (uint16_t)constrain(server.arg("nightSetbackEndMinute").toInt(), 0, 1439);
+    if (server.hasArg("nightSetbackK")) candidate.nightSetbackK = constrain(server.arg("nightSetbackK").toFloat(), 0.0f, 10.0f);
+    candidate.roomTargetTemperatureC = constrain(candidate.roomTargetTemperatureC, 16.0f, 30.0f);
     if (server.hasArg("heatingCurveBaseC")) candidate.heatingCurveBaseC = server.arg("heatingCurveBaseC").toFloat();
     if (server.hasArg("heatingCurveSlope")) candidate.heatingCurveSlope = server.arg("heatingCurveSlope").toFloat();
     if (server.hasArg("frostProtectionEnabled")) candidate.frostProtectionEnabled = server.arg("frostProtectionEnabled").toInt() != 0;
@@ -3819,9 +4601,58 @@ s_ctx->heatingCircuitRuntime[idx].pumpActive = false;
 s_ctx->heatingCircuitRuntime[idx].opening = false;
 s_ctx->heatingCircuitRuntime[idx].closing = false;
 
-Storage::saveConfig(s_ctx->config);
+if (!Storage::saveConfig(s_ctx->config)) {
+  s_ctx->config.heatingCircuits[idx] = old;
+  server.send(500, "text/plain", "Konfiguration konnte nicht auf SD gespeichert werden");
+  return;
+}
 server.send(200, "text/plain", "OK");
   }
+
+void handleHeatingCircuitRoomTarget() {
+  if (!s_ctx || !server.hasArg("index") || !server.hasArg("targetC")) {
+    server.send(400, "text/plain", "Parameter fehlen");
+    return;
+  }
+  const int idx = server.arg("index").toInt();
+  const float targetC = server.arg("targetC").toFloat();
+  if (idx < 0 || idx >= MAX_HEATING_CIRCUITS || targetC < 16.0f || targetC > 30.0f) {
+    server.send(400, "text/plain", "Raum-Soll muss 16.0..30.0 C sein");
+    return;
+  }
+  HeatingCircuitConfig& cfg = s_ctx->config.heatingCircuits[idx];
+  if (!cfg.enabled || !cfg.roomControlEnabled) {
+    server.send(409, "text/plain", "Raumregelung fuer diesen Heizkreis ist nicht aktiv");
+    return;
+  }
+  const float oldTarget = cfg.roomTargetTemperatureC;
+  cfg.roomTargetTemperatureC = targetC;
+  if (!Storage::saveConfig(s_ctx->config)) {
+    cfg.roomTargetTemperatureC = oldTarget;
+    server.send(500, "text/plain", "Raum-Soll konnte nicht gespeichert werden");
+    return;
+  }
+  server.send(200, "application/json", String("{\"targetC\":") + String(cfg.roomTargetTemperatureC, 1) + "}");
+}
+
+void handleManualTimeSet() {
+  if (!serviceSessionValid()) {
+    server.send(403, "text/plain", "Nicht erlaubt");
+    return;
+  }
+  if (!s_ctx || !server.hasArg("date") || !server.hasArg("time")) {
+    server.send(400, "text/plain", "Datum oder Uhrzeit fehlt");
+    return;
+  }
+  int year=0, month=0, day=0, hour=0, minute=0;
+  if (sscanf(server.arg("date").c_str(), "%d-%d-%d", &year, &month, &day) != 3 ||
+      sscanf(server.arg("time").c_str(), "%d:%d", &hour, &minute) != 2 ||
+      !TimeService::setManualLocalTime(*s_ctx, year, month, day, hour, minute, 0)) {
+    server.send(400, "text/plain", "Ungueltiges Datum oder Uhrzeit");
+    return;
+  }
+  server.send(200, "text/plain", "OK");
+}
 
 
 void handleAuxHeaterJson() {
@@ -3836,6 +4667,8 @@ void handleAuxHeaterJson() {
   json += "\"config\":{";
   json += "\"enabled\":";
   json += String(cfg.enabled ? "true" : "false");
+  json += ",\"released\":";
+  json += String(cfg.userReleaseEnabled ? "true" : "false");
   json += ",\"minimumTemperatureC\":";
   json += String(cfg.minimumTemperatureC, 1);
   json += ",\"targetTemperatureC\":";
@@ -4150,9 +4983,138 @@ server.send(200, "text/plain", "OK");
 }
 
 
+void handleAuxHeaterRelease() {
+  if (!s_ctx) {
+    server.send(500, "text/plain", "Kein Kontext");
+    return;
+  }
+  if (!s_ctx->config.auxHeater.enabled) {
+    server.send(409, "text/plain", "Zusatzheizung ist nicht aktiviert");
+    return;
+  }
+  if (!server.hasArg("state")) {
+    server.send(400, "text/plain", "state fehlt");
+    return;
+  }
+
+  const bool release = server.arg("state").toInt() != 0;
+  const bool oldRelease = s_ctx->config.auxHeater.userReleaseEnabled;
+  s_ctx->config.auxHeater.userReleaseEnabled = release;
+
+  if (!Storage::saveConfig(s_ctx->config)) {
+    s_ctx->config.auxHeater.userReleaseEnabled = oldRelease;
+    server.send(500, "text/plain", "Freigabe konnte nicht gespeichert werden");
+    return;
+  }
+
+  server.send(200, "application/json", String("{\"released\":") + (release ? "true" : "false") + "}");
+}
+
+static void handlePlantDataJson() {
+  if (!s_ctx) { server.send(500, "application/json", "{\"error\":\"no_context\"}"); return; }
+  const ConfigData& c = s_ctx->config;
+  const float meanFluidC = s_ctx->energyMeter.temperatureValid
+      ? 0.5f * (s_ctx->energyMeter.flowTemperatureC + s_ctx->energyMeter.returnTemperatureC) : 40.0f;
+  const FluidProperties::Result fluid = FluidProperties::evaluate(c, meanFluidC);
+  String j="{";
+  j += "\"solarFluidType\":" + String((int)c.solarFluidType) + ",";
+  j += "\"glycolType\":" + String((int)c.glycolType) + ",";
+  j += "\"glycolMeasuredFreezeProtectionC\":" + String(c.glycolMeasuredFreezeProtectionC,1) + ",";
+  j += "\"solarHydraulicType\":" + String((int)c.solarHydraulicType) + ",";
+  j += "\"solarCollectorType\":" + String((int)c.solarCollectorType) + ",";
+  j += "\"collectorApertureM2\":" + String(c.collectorApertureM2,3) + ",";
+  j += "\"collectorTiltDeg\":" + String(c.collectorTiltDeg,1) + ",";
+  j += "\"collectorAzimuthDeg\":" + String(c.collectorAzimuthDeg,1) + ",";
+  j += "\"bufferVolumeLiters\":" + String(c.bufferVolumeLiters,1) + ",";
+  j += "\"boilerVolumeLiters\":" + String(c.boilerVolumeLiters,1) + ",";
+  j += "\"mlMode\":" + String((int)c.mlMode) + ",";
+  j += "\"glycolConcentrationPercent\":" + String(fluid.glycolConcentrationPercent,1) + ",";
+  j += "\"waterConcentrationPercent\":" + String(fluid.waterConcentrationPercent,1) + ",";
+  j += "\"fluidHeatCapacityWhPerLiterK\":" + String(fluid.volumetricHeatCapacityWhPerLiterK,4) + ",";
+  j += "\"freezePointInRange\":" + String(fluid.freezePointInRange?"true":"false") + ",";
+  j += "\"frostRequiredProtectionC\":" + String(c.frostRequiredProtectionC,1) + ",";
+  j += "\"frostProtectionReserveK\":" + String(c.frostProtectionReserveK,1) + ",";
+  j += "\"frostSafetyCompatible\":" + String(fluid.safetyCompatible?"true":"false") + ",";
+  j += "\"frostSafetyMarginMet\":" + String(fluid.safetyMarginMet?"true":"false") + ",";
+  j += "\"heatingCircuits\":[";
+  for(uint8_t i=0;i<MAX_HEATING_CIRCUITS;i++){
+    if(i)j+=","; j+="{\"index\":"+String(i)+",\"enabled\":"+String(c.heatingCircuits[i].enabled?"true":"false")+",\"areaM2\":"+String(c.heatingCircuitAreaM2[i],1)+",\"emitterType\":"+String((int)c.heatingCircuitEmitterType[i])+"}";
+  }
+  j += "],\"ml\":" + MlOptimizer::json(*s_ctx) + "}";
+  server.send(200,"application/json",j);
+}
+
+static void handlePlantDataSave() {
+  if (!s_ctx) { server.send(500,"text/plain","context missing"); return; }
+  if (!serviceSessionValid()) { server.send(403,"text/plain","Service nicht freigegeben"); return; }
+
+  // Erst in eine Kandidatenkopie schreiben. Erst wenn die SD-Datei erfolgreich
+  // geschrieben wurde, wird die laufende Konfiguration ersetzt. Dadurch kann ein
+  // SD-Schreibfehler keine nur im RAM scheinbar gespeicherte Anlagendatei erzeugen.
+  ConfigData candidate=s_ctx->config;
+  ConfigData& c=candidate;
+  if(server.hasArg("solarFluidType")){int v=server.arg("solarFluidType").toInt();c.solarFluidType=v==1?SolarFluidType::WATER:SolarFluidType::GLYCOL;}
+  if(server.hasArg("glycolType")){c.glycolType=server.arg("glycolType").toInt()==1?GlycolType::ETHYLENE:GlycolType::PROPYLENE;}
+  if(server.hasArg("glycolMeasuredFreezeProtectionC"))c.glycolMeasuredFreezeProtectionC=constrain(server.arg("glycolMeasuredFreezeProtectionC").toFloat(),-60.0f,0.0f);
+  if(server.hasArg("solarHydraulicType"))c.solarHydraulicType=server.arg("solarHydraulicType").toInt()==1?SolarHydraulicType::DRAINBACK:SolarHydraulicType::CLOSED_PRESSURIZED;
+  if(server.hasArg("solarCollectorType"))c.solarCollectorType=server.arg("solarCollectorType").toInt()==1?SolarCollectorType::EVACUATED_TUBE:SolarCollectorType::FLAT_PLATE;
+  if(server.hasArg("collectorApertureM2"))c.collectorApertureM2=constrain(server.arg("collectorApertureM2").toFloat(),0.1f,100.0f);
+  if(server.hasArg("collectorTiltDeg"))c.collectorTiltDeg=constrain(server.arg("collectorTiltDeg").toFloat(),0.0f,90.0f);
+  if(server.hasArg("collectorAzimuthDeg")){float a=server.arg("collectorAzimuthDeg").toFloat();while(a<0)a+=360;while(a>=360)a-=360;c.collectorAzimuthDeg=a;}
+  if(server.hasArg("bufferVolumeLiters"))c.bufferVolumeLiters=constrain(server.arg("bufferVolumeLiters").toFloat(),0.0f,20000.0f);
+  if(server.hasArg("boilerVolumeLiters"))c.boilerVolumeLiters=constrain(server.arg("boilerVolumeLiters").toFloat(),0.0f,5000.0f);
+  if(server.hasArg("mlMode")){int m=server.arg("mlMode").toInt();c.mlMode=m==2?MlMode::AUTOMATIC:(m==1?MlMode::LEARN_ONLY:MlMode::OFF);}
+  for(uint8_t i=0;i<MAX_HEATING_CIRCUITS;i++){
+    String ak="heatingCircuitAreaM2_"+String(i), ek="heatingCircuitEmitterType_"+String(i);
+    if(server.hasArg(ak))c.heatingCircuitAreaM2[i]=constrain(server.arg(ak).toFloat(),0.0f,1000.0f);
+    if(server.hasArg(ek)){int e=server.arg(ek).toInt();c.heatingCircuitEmitterType[i]=(e>=0&&e<=3)?(HeatingEmitterType)e:HeatingEmitterType::UNKNOWN;}
+  }
+
+  if(!Storage::saveConfig(candidate)) {
+    server.send(500,"application/json","{\"ok\":false,\"error\":\"config_write_failed\"}");
+    return;
+  }
+  s_ctx->config=candidate;
+  Forecast::forceRefresh();
+  server.send(200,"application/json","{\"ok\":true}");
+}
+
+
+static void handleHistoryConfigJson() {
+  if (!s_ctx) { server.send(500,"application/json","{\"error\":\"no_context\"}"); return; }
+  server.send(200,"application/json",History::configJson(*s_ctx));
+}
+
+static void handleHistoryConfigSave() {
+  if (!s_ctx) { server.send(500,"text/plain","context missing"); return; }
+  if (!serviceSessionValid()) { server.send(403,"text/plain","Service nicht freigegeben"); return; }
+  if(server.hasArg("enabled")) History::setEnabled(server.arg("enabled").toInt()!=0);
+  if(server.hasArg("sensorId") && server.hasArg("show")) History::setDisplayEnabled(server.arg("sensorId").c_str(),server.arg("show").toInt()!=0);
+  if(!History::savePreferences()) { server.send(500,"application/json","{\"ok\":false,\"error\":\"history_config_write_failed\"}"); return; }
+  server.send(200,"application/json","{\"ok\":true}");
+}
+
+static void handleHistoryJson() {
+  if (!s_ctx) { server.send(500,"application/json","{\"error\":\"no_context\"}"); return; }
+  History::handleHistoryRequest(*s_ctx,server);
+}
+
+static void handleMlReset() {
+  if (!s_ctx) { server.send(500,"text/plain","context missing"); return; }
+  if (!serviceSessionValid()) { server.send(403,"text/plain","Service nicht freigegeben"); return; }
+  MlOptimizer::resetLearning(*s_ctx);
+  server.send(200,"application/json","{\"ok\":true}");
+}
+
+
 } // namespace
 
 namespace UI {
+
+void handleForecastJson() {
+  if (!s_ctx) { server.send(500, "application/json", "{\"error\":\"no_context\"}"); return; }
+  server.send(200, "application/json", Forecast::json(*s_ctx));
+}
 
 void begin(AppContext& ctx) {
   Serial.println("UI::begin()");
@@ -4165,11 +5127,23 @@ void begin(AppContext& ctx) {
   server.on("/api/assignments", HTTP_GET, handleAssignmentsJson);
   server.on("/service-assign-role", HTTP_POST, handleAssignRole);
   server.on("/api/plant", HTTP_GET, handlePlantJson);
+  server.on("/api/plant-overview", HTTP_GET, handlePlantJson);
+  server.on("/api/plant-live", HTTP_GET, handlePlantLiveJson);
   server.on("/api/heat-sources", HTTP_GET, handleHeatSourcesJson);
   server.on("/api/max-status", HTTP_GET, handleMaxStatusJson);
   server.on("/api/max-debug", HTTP_GET, handleMaxDebugJson);
+  server.on("/api/max-fault-trace", HTTP_GET, handleMaxFaultTraceJson);
+  server.on("/api/max-sequence-diag", HTTP_GET, handleMaxSequenceDiagJson);
   server.on("/api/network", HTTP_GET, handleNetworkJson);
+  server.on("/api/forecast", HTTP_GET, handleForecastJson);
+  server.on("/api/plant-data", HTTP_GET, handlePlantDataJson);
+  server.on("/service-save-plant-data", HTTP_POST, handlePlantDataSave);
+  server.on("/service-reset-ml", HTTP_POST, handleMlReset);
+  server.on("/api/history-config", HTTP_GET, handleHistoryConfigJson);
+  server.on("/service-save-history-config", HTTP_POST, handleHistoryConfigSave);
+  server.on("/api/history", HTTP_GET, handleHistoryJson);
   server.on("/service-save-network", HTTP_POST, handleNetworkSave);
+  server.on("/service-set-manual-time", HTTP_POST, handleManualTimeSet);
   server.on("/api/relays", HTTP_GET, handleRelaysJson);
   server.on("/service-relay-config", HTTP_POST, handleRelayConfig);
   server.on("/api/pumps", HTTP_GET, handlePumpsJson);
@@ -4180,9 +5154,18 @@ void begin(AppContext& ctx) {
   server.on("/service-save-oven", HTTP_POST, handleOvenSave);
   server.on("/service-oven-start", HTTP_POST, handleOvenStart);
   server.on("/service-oven-stop", HTTP_POST, handleOvenStop);
-  server.on("/api/test", HTTP_GET, handleTestOverviewJson);
+  server.on("/api/test/relays", HTTP_GET, handleTestRelaysJson);
+  server.on("/api/test/pwm", HTTP_GET, handleTestPwmJson);
+  server.on("/api/test/servo", HTTP_GET, handleTestServoJson);
+  server.on("/api/test/pumps", HTTP_GET, handleTestPumpsJson);
+  server.on("/api/test/valves", HTTP_GET, handleTestValvesJson);
+  server.on("/api/test/heating", HTTP_GET, handleTestHeatingJson);
+  server.on("/api/test/sensors", HTTP_GET, handleTestSensorsJson);
+  server.on("/api/test/safety", HTTP_GET, handleTestSafetyJson);
+  server.on("/api/test/diagnostics", HTTP_GET, handleTestDiagnosticsJson);
   server.on("/api/alarms", HTTP_GET, handleAlarmsJson);
   server.on("/service-alarms-ack", HTTP_POST, handleAlarmsAck);
+  server.on("/service-alarm-buzzer-mute", HTTP_POST, handleBuzzerMute);
   server.on("/service-alarms-clear-history", HTTP_POST, handleAlarmsClearHistory);
   server.on("/api/testmode", HTTP_GET, handleTestModeGet);
   server.on("/service-testmode", HTTP_POST, handleTestModeSet);
@@ -4194,16 +5177,22 @@ void begin(AppContext& ctx) {
   server.on("/service-test-pump-output", HTTP_POST, handleTestPumpOutput);
   server.on("/service-test-heating-circuit-output", HTTP_POST, handleTestHeatingCircuitOutput);
   server.on("/service-test-all-off", HTTP_POST, handleTestAllOff);
+  server.on("/api/sd/files", HTTP_GET, handleSdFilesJson);
+  server.on("/api/sd/download", HTTP_GET, handleSdDownload);
+  server.on("/api/sd/upload", HTTP_POST, handleSdUploadComplete, handleSdUploadStream);
+  server.on("/api/sd/delete", HTTP_POST, handleSdDelete);
   server.on("/service-factory-reset", HTTP_POST, handleFactoryReset);
   server.on("/service-restart", HTTP_POST, handleServiceRestart);
   server.on("/service-assign-heat-source", HTTP_POST, handleAssignHeatSource);
   server.on("/service-save-max-config", HTTP_POST, handleSaveMaxConfig);
   server.on("/api/heating-circuits", HTTP_GET, handleHeatingCircuitsJson);
   server.on("/service-heating-circuit", HTTP_POST, handleHeatingCircuitSave);
+  server.on("/api/heating-circuit-room-target", HTTP_POST, handleHeatingCircuitRoomTarget);
   server.on("/api/safety", HTTP_GET, handleSafetyJson);
   server.on("/service-save-safety", HTTP_POST, handleSafetySave);
   server.on("/api/aux-heater", HTTP_GET, handleAuxHeaterJson);
   server.on("/service-save-aux-heater", HTTP_POST, handleAuxHeaterSave);
+  server.on("/api/aux-heater-release", HTTP_POST, handleAuxHeaterRelease);
   server.on("/api/energy-meter", HTTP_GET, handleEnergyMeterJson);
   server.on("/service-save-energy-meter", HTTP_POST, handleEnergyMeterSave);
   server.onNotFound(handleStatic);

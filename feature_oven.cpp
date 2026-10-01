@@ -31,6 +31,7 @@ uint8_t g_servoOpeningPercent = 0;
 float g_ovenTemperatureC = NAN;
 float g_lastStandbyTemperatureC = NAN;
 float g_peakTemperatureC = NAN;
+float g_burnoutMinimumTemperatureC = NAN;
 
 uint32_t g_lastServoControlMs = 0;
 uint32_t g_lastPeakReachedMs = 0;
@@ -42,6 +43,7 @@ static constexpr float OVEN_PEAK_REACHED_EPSILON_C = 0.2f;
 static constexpr uint32_t OVEN_SERVO_CONTROL_INTERVAL_MS = 1000;
 
 void updateServoControl(AppContext& ctx, float ovenTemperatureC);
+void setOvenPump(AppContext& ctx, bool on, float ovenTemperatureC, float targetTemperatureC, bool targetValid);
 
 float clampFloat(float value, float minimum, float maximum) {
   if (value < minimum) return minimum;
@@ -159,6 +161,7 @@ void enterStandby(AppContext& ctx) {
   g_userRequestedActive = false;
   g_autoStarted = false;
   g_burnoutStartedMs = 0;
+  g_burnoutMinimumTemperatureC = NAN;
   g_lastPumpActive = false;
   clearPeak();
 }
@@ -169,6 +172,7 @@ void startBurnoutVenting(AppContext& ctx) {
   if (g_state == OvenState::BURNOUT_VENTING || g_state == OvenState::EMBER_VENTING) return;
 
   g_burnoutStartedMs = millis();
+  g_burnoutMinimumTemperatureC = g_ovenTemperatureC;
   g_userRequestedActive = false;
   g_autoStarted = false;
   g_state = OvenState::BURNOUT_VENTING;
@@ -193,34 +197,88 @@ bool peakTimeoutReached(const OvenConfig& cfg) {
   return (uint32_t)(millis() - g_lastPeakReachedMs) >= timeoutMs;
 }
 
-void updateBurnoutVenting(AppContext& ctx, float ovenTemperatureC) {
+// Liefert true, solange der Nachlauf den aktuellen process()-Durchlauf
+// vollstaendig behandelt. Bei erneut erkanntem Abbrand wird false geliefert,
+// damit process() noch im selben Zyklus mit der normalen Ofenregelung fortsetzt.
+bool updateBurnoutVenting(AppContext& ctx, float ovenTemperatureC) {
   OvenConfig& cfg = ctx.config.oven;
 
   const uint32_t mainMs = burnoutMainMs(cfg);
   const uint32_t emberMs = burnoutEmberMs(cfg);
   if (mainMs == 0 || g_burnoutStartedMs == 0) {
     enterStandby(ctx);
-    return;
+    return true;
   }
 
-  Pumps::applyOvenPumpRequest(ctx, false, ovenTemperatureC, NAN, false);
-  g_pumpActive = false;
+  // Tiefsten Temperaturpunkt des Nachlaufs merken. Ein erneuter, deutlicher
+  // Temperaturanstieg bedeutet, dass der Abbrand noch nicht beendet ist
+  // (z.B. Holz nachgerutscht / Flamme wieder aufgelebt).
+  if (isnan(g_burnoutMinimumTemperatureC) || ovenTemperatureC < g_burnoutMinimumTemperatureC) {
+    g_burnoutMinimumTemperatureC = ovenTemperatureC;
+  }
+
+  const bool restartByRise =
+      cfg.autoStartRiseC > 0.1f &&
+      !isnan(g_burnoutMinimumTemperatureC) &&
+      ovenTemperatureC >= (g_burnoutMinimumTemperatureC + cfg.autoStartRiseC);
+
+  if (restartByRise) {
+    Serial.print("OVEN: Erneuter Abbrand erkannt, Rueckkehr in Regelbetrieb (min=");
+    Serial.print(g_burnoutMinimumTemperatureC, 1);
+    Serial.print(" C, aktuell=");
+    Serial.print(ovenTemperatureC, 1);
+    Serial.println(" C)");
+    Serial.flush();
+
+    g_state = OvenState::REGULATING;
+    g_userRequestedActive = false;
+    g_autoStarted = true;
+    g_burnoutStartedMs = 0;
+    g_burnoutMinimumTemperatureC = NAN;
+
+    // Aktuelle Klappenstellung beibehalten. Insbesondere bei bereits hoher
+    // Ofentemperatur darf der Ruecksprung die Klappe nicht erneut auf 100 %
+    // Startoeffnung setzen.
+    if (ovenTemperatureC >= cfg.targetOvenTemperatureC) {
+      g_targetTemperatureReached = true;
+    }
+    g_lastServoControlMs = 0;
+
+    // Der wieder aufgeflammte Abbrand bekommt einen neuen Peak. Dadurch wird
+    // der alte Peak (der den Nachlauf ausgeloest hat) nicht weiterverwendet.
+    initPeak(ovenTemperatureC);
+    g_lastPumpActive = g_pumpActive;
+    return false;
+  }
 
   const uint32_t elapsedMs = millis() - g_burnoutStartedMs;
   if (elapsedMs < mainMs) {
     // Haupt-Nachlauf: normale Servo-Regelung bleibt aktiv.
+    // Die Pumpe bleibt jedoch AUS. Sie darf dem Ofen in dieser Phase keine
+    // zusaetzliche Waerme entziehen, weil genau dieser Waermeentzug die
+    // Luftklappe sonst unnoetig weiter Richtung Minimaloeffnung treiben kann.
+    // Ein echter erneuter Abbrand wird oben ueber autoStartRiseC erkannt; dann
+    // springt die Zustandsmaschine zurueck nach REGULATING und updatePump()
+    // darf die Pumpe noch im selben process()-Durchlauf wieder einschalten.
     updateServoControl(ctx, ovenTemperatureC);
-    return;
+    setOvenPump(ctx, false, ovenTemperatureC, NAN, false);
+    g_lastPumpActive = false;
+    return true;
   }
 
   if (elapsedMs < (mainMs + emberMs)) {
     // Restglutphase: halbe eingestellte Zeit mit minimaler Regeloeffnung.
+    // Pumpe aus; ein erneuter Temperaturanstieg kann weiterhin zurueck in den
+    // Regelbetrieb fuehren.
     g_state = OvenState::EMBER_VENTING;
     writeServoOpening(cfg, cfg.servoMinimumOpeningPercent);
-    return;
+    setOvenPump(ctx, false, ovenTemperatureC, NAN, false);
+    g_lastPumpActive = false;
+    return true;
   }
 
   enterStandby(ctx);
+  return true;
 }
 
 void activateOven(const OvenConfig& cfg, bool automaticStart) {
@@ -372,6 +430,7 @@ void requestStart() {
   g_userRequestedActive = true;
   g_autoStarted = false;
   g_burnoutStartedMs = 0;
+  g_burnoutMinimumTemperatureC = NAN;
   g_lastPumpActive = false;
   resetServoControl();
   clearPeak();
@@ -463,6 +522,8 @@ void process(AppContext& ctx) {
     g_state = OvenState::SAFETY;
     g_userRequestedActive = false;
     g_autoStarted = false;
+    g_burnoutStartedMs = 0;
+    g_burnoutMinimumTemperatureC = NAN;
     clearPeak();
 
     Serial.println("OVEN SAFETY: Luftklappe geschlossen");
@@ -471,8 +532,11 @@ void process(AppContext& ctx) {
   }
 
   if (g_state == OvenState::BURNOUT_VENTING || g_state == OvenState::EMBER_VENTING) {
-    updateBurnoutVenting(ctx, ovenTemperature);
-    return;
+    if (updateBurnoutVenting(ctx, ovenTemperature)) {
+      return;
+    }
+    // Erneuter Abbrand erkannt: noch in diesem process()-Durchlauf mit der
+    // regulaeren Pumpen-/Peak-/Servologik fortsetzen.
   }
 
   updateAutoStart(cfg, ovenTemperature);
@@ -503,11 +567,33 @@ void process(AppContext& ctx) {
   updatePeak(ovenTemperature);
 
   const bool pumpWasActive = g_lastPumpActive;
+
+  // Wenn der Abfall vom Peak bzw. das Peak-Timeout den Nachlauf ausloest,
+  // direkt in den Nachlauf wechseln. Im Nachlauf wird die Pumpe sofort AUS
+  // gehalten; die Luftklappe darf den restlichen Abbrand ohne zusaetzlichen
+  // Waermeentzug weiter ausregeln. Bei erneutem deutlichem Temperaturanstieg
+  // kann der Zustand wieder nach REGULATING zurueckspringen.
+  const bool peakDropStopEnabled = cfg.pumpStopDropFromPeakC > 0.1f;
+  const bool peakDropReached =
+      pumpWasActive &&
+      peakDropStopEnabled &&
+      !isnan(g_peakTemperatureC) &&
+      ovenTemperature <= (g_peakTemperatureC - cfg.pumpStopDropFromPeakC);
+
+  if (peakDropReached || peakTimeoutReached(cfg)) {
+    startBurnoutVenting(ctx);
+    updateBurnoutVenting(ctx, ovenTemperature);
+    return;
+  }
+
   updatePump(ctx, ovenTemperature);
   const bool pumpSwitchedOff = pumpWasActive && !g_pumpActive;
   g_lastPumpActive = g_pumpActive;
 
-  if (pumpSwitchedOff || peakTimeoutReached(cfg)) {
+  // Andere regulaere Pumpen-Abschaltgruende (z.B. Rueckkuehlgrenze) starten
+  // weiterhin den Nachlauf. Die Pumpe bleibt dort AUS; nur ein erkannter
+  // erneuter Abbrand fuehrt zurueck in die regulaere Pumpenlogik.
+  if (pumpSwitchedOff) {
     startBurnoutVenting(ctx);
     updateBurnoutVenting(ctx, ovenTemperature);
     return;

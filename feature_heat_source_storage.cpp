@@ -81,6 +81,7 @@ namespace {
       case MaxChannel::CH1: return "ch1";
       case MaxChannel::CH2: return "ch2";
       case MaxChannel::CH3: return "ch3";
+      case MaxChannel::CH4: return "ch4";
       default: return "ch1";
     }
   }
@@ -88,6 +89,7 @@ namespace {
   MaxChannel channelFromKey(const String& key) {
     if (key.equalsIgnoreCase("ch2")) return MaxChannel::CH2;
     if (key.equalsIgnoreCase("ch3")) return MaxChannel::CH3;
+    if (key.equalsIgnoreCase("ch4")) return MaxChannel::CH4;
     return MaxChannel::CH1;
   }
 }

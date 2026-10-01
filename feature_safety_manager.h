@@ -18,7 +18,12 @@ struct SafetyStatus {
 
   bool frostProtectionActive = false;
   bool collectorStagnationActive = false;
+  bool storageMaximumActive = false;
+  bool storageCriticalOvertemperatureActive = false;
+  // Backward-compatible aggregate: true from storage maximum upwards.
   bool storageOvertemperatureActive = false;
+  bool storageForcedCoolingActive = false;
+  uint8_t storageForcedCoolingPumpCount = 0;
   bool ovenOvertemperatureActive = false;
   bool sensorFaultActive = false;
 

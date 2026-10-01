@@ -22,6 +22,7 @@ namespace {
     g_state |= (1u << PCF_BIT_MAX1_CS);
     g_state |= (1u << PCF_BIT_MAX2_CS);
     g_state |= (1u << PCF_BIT_MAX3_CS);
+    g_state |= (1u << PCF_BIT_MAX4_CS);
   }
 }
 
@@ -116,6 +117,10 @@ bool selectMax(MaxChannel ch) {
 
     case MaxChannel::CH3:
       g_state &= ~(1u << PCF_BIT_MAX3_CS);
+      break;
+
+    case MaxChannel::CH4:
+      g_state &= ~(1u << PCF_BIT_MAX4_CS);
       break;
 
     default:

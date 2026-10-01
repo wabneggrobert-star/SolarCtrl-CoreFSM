@@ -5,6 +5,10 @@ namespace HeatingCircuits {
   void begin(AppContext& ctx);
   void process(AppContext& ctx);
   void allOff(AppContext& ctx);
+  // Emergency heat dump from a critically hot configured storage through safe
+  // mixed heating circuits. Only runs with valid flow/return sensors and never
+  // exceeds maximumFlowTemperatureC. Returns number of running circuits.
+  uint8_t safetyHeatDump(AppContext& ctx, float criticalStorageTemperatureC, float minimumDeltaC);
 
   Ds18Role defaultFlowSensorRole(uint8_t circuitIndex);
   Ds18Role defaultReturnSensorRole(uint8_t circuitIndex);

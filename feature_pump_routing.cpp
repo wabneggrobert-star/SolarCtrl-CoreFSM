@@ -2,6 +2,8 @@
 
 #include "feature_sensor_assignments.h"
 #include "feature_valves.h"
+#include "feature_forecast.h"
+#include "feature_ml_optimizer.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -37,10 +39,18 @@ bool targetBelowMaxTemp(const PumpRouteTargetConfig& target, float sinkC) {
   return sinkC < target.maxTempC;
 }
 
-bool targetNeedsHeat(const PumpRouteTargetConfig& target, float sinkC) {
-  if (target.minTempC <= 0.01f) return true;
+bool targetBelowMinTemp(const PumpRouteTargetConfig& target, float sinkC) {
+  if (target.minTempC <= 0.01f) return false;
   if (isnan(sinkC)) return false;
   return sinkC < target.minTempC;
+}
+
+bool isBufferRole(Ds18Role role) {
+  return role == Ds18Role::SINK_BUFFER_TOP || role == Ds18Role::BUFFER_HIGH || role == Ds18Role::BUFFER_MID || role == Ds18Role::BUFFER_BOTTOM;
+}
+
+bool isBoilerRole(Ds18Role role) {
+  return role == Ds18Role::SINK_BOILER_TOP || role == Ds18Role::BOILER_BOTTOM;
 }
 
 bool valveUsable(const AppContext& ctx, const PumpConfig& pump) {
@@ -120,6 +130,16 @@ bool handlePendingValveMove(AppContext& ctx, PumpConfig& pump, RouteResult& r, f
   const float hyst = hysteresisFor(pump, pending);
   pending.lastSinkC = sinkC;
   pending.lastDiffC = diffC;
+
+  // Auch waehrend der Ventilfahrt bleibt maxTempC eine harte Grenze. Wenn das
+  // Ziel in der Umschaltzeit sein Maximum erreicht (z. B. durch eine andere
+  // Waermequelle), darf die Pumpe danach nicht mehr auf dieses Ziel starten.
+  if (!targetBelowMaxTemp(pending, sinkC)) {
+    pending.active = false;
+    cancelValveMove(pump);
+    return false;
+  }
+
   fillTargetResult(r, ctx, pump, pendingIndex, pending, sinkC, diffC, targetDiff, hyst);
 
   if (Valves::isMoving(pump.valveIndex)) {
@@ -190,8 +210,65 @@ RouteResult resolve(AppContext& ctx, uint8_t pumpIndex, float sourceC, bool sour
     return legacySingleSink(ctx, pump, sourceC, sourceValid);
   }
 
+  // Eine bereits angeforderte Ventilfahrt gehoert noch zum selben Pumpenzyklus.
+  // Deshalb darf die Zielwahl waehrend der Fahrt nicht neu bewertet werden.
   if (handlePendingValveMove(ctx, pump, r, sourceC)) return r;
 
+  // Valve-V2 Prioritaet:
+  // Ziel A hat eine harte Mindesttemperatur-Prioritaet. Solange A unter minTempC
+  // liegt, darf Ziel B nicht geladen werden. Die Entscheidung basiert bewusst
+  // ausschliesslich auf dem fuer Ziel A konfigurierten Sink-Sensor.
+  PumpRouteTargetConfig& targetA = pump.targets[0];
+  float targetASinkC = NAN;
+  bool targetASinkValid = false;
+  const bool targetAConfigured = targetA.enabled && targetA.sinkRole != Ds18Role::NONE;
+  if (targetAConfigured) {
+    readSinkByRole(ctx, targetA.sinkRole, targetASinkC, targetASinkValid);
+    targetA.lastSinkC = targetASinkValid ? targetASinkC : NAN;
+    targetA.lastDiffC = targetASinkValid ? (sourceC - targetASinkC) : NAN;
+  }
+
+  const bool targetAMinConfigured = targetAConfigured && targetA.minTempC > 0.01f;
+  const bool targetABelowMinimum = targetAMinConfigured && targetASinkValid && targetBelowMinTemp(targetA, targetASinkC);
+  const bool targetAMinimumKnownSatisfied = !targetAMinConfigured || (targetASinkValid && !targetABelowMinimum);
+
+  // Wenn fuer A eine Mindesttemperatur konfiguriert ist, der A-Sensor aber
+  // ungueltig ist, darf B nicht als Ersatz geladen werden. Safety kann den
+  // Sensorfehler separat behandeln; Routing bleibt hier konservativ.
+  const bool targetAPriorityUnknown = targetAMinConfigured && !targetASinkValid;
+  if (targetAPriorityUnknown) {
+    markTargetsInactive(pump);
+    return r;
+  }
+
+  // ML/Forecast darf nur dann zwischen A/B umpriorisieren, wenn A seine
+  // Mindesttemperatur erreicht hat. Unterhalb der Mindesttemperatur bleibt A
+  // eine harte Sperre fuer Ziel B.
+  const bool forecastPreferBuffer = targetAMinimumKnownSatisfied && MlOptimizer::preferBufferForSolar(ctx, pump);
+
+  // Harte A-Prioritaet gilt auch dann, wenn aus einem frueheren Zyklus noch B
+  // aktiv waere. Normalerweise wird activeTargetIndex beim Pump-Enable-AUS
+  // bereits geloescht; diese Absicherung verhindert dennoch ein Durchrutschen.
+  if (targetABelowMinimum && validTargetIndex(pump.activeTargetIndex) && pump.activeTargetIndex != 0) {
+    markTargetsInactive(pump);
+  }
+
+  // ML darf oberhalb A-Minimum ein laufendes Boiler-Ziel zugunsten des Puffers
+  // wechseln. Unterhalb A-Minimum ist forecastPreferBuffer immer false.
+  if (forecastPreferBuffer && validTargetIndex(pump.activeTargetIndex) && isBoilerRole(pump.targets[pump.activeTargetIndex].sinkRole)) {
+    for (uint8_t i = 0; i < PUMP_ROUTE_TARGET_COUNT; i++) {
+      if (pump.targets[i].enabled && isBufferRole(pump.targets[i].sinkRole)) {
+        markTargetsInactive(pump);
+        break;
+      }
+    }
+  }
+
+  // Bereits fuer diesen Pumpenzyklus gewaehltes Ziel beibehalten:
+  // minTempC beendet keinen laufenden Zyklus. Das Routing entscheidet nur,
+  // welches Ziel hydraulisch zulaessig ist. Die thermische Start-/Stoplogik
+  // (startDiff bzw. targetDiff/hysteresis) gehoert ausschliesslich ins
+  // Pumpenmodul. Hier bleibt nur maxTempC als harte Zielgrenze.
   if (validTargetIndex(pump.activeTargetIndex)) {
     PumpRouteTargetConfig& target = pump.targets[pump.activeTargetIndex];
     if (target.enabled && target.sinkRole != Ds18Role::NONE) {
@@ -203,7 +280,7 @@ RouteResult resolve(AppContext& ctx, uint8_t pumpIndex, float sourceC, bool sour
         const float hyst = hysteresisFor(pump, target);
         target.lastSinkC = sinkC;
         target.lastDiffC = diffC;
-        if (targetBelowMaxTemp(target, sinkC) && diffC > (targetDiff - hyst)) {
+        if (targetBelowMaxTemp(target, sinkC)) {
           target.active = true;
           fillTargetResult(r, ctx, pump, pump.activeTargetIndex, target, sinkC, diffC, targetDiff, hyst);
           return r;
@@ -212,9 +289,54 @@ RouteResult resolve(AppContext& ctx, uint8_t pumpIndex, float sourceC, bool sour
     }
   }
 
+  // Kein laufendes Ziel mehr: neuer Auswahlvorgang. activeTargetIndex wird
+  // durch feature_pumps beim Pump-Enable-AUS geloescht, daher entspricht diese
+  // Auswahl dem Beginn eines neuen Pumpenzyklus.
   markTargetsInactive(pump);
 
-  for (uint8_t i = 0; i < PUMP_ROUTE_TARGET_COUNT; i++) {
+  // A unter Minimum: ausschliesslich A auswaehlen. B bleibt in diesem Fall
+  // ausdruecklich gesperrt. Ob die Pumpe fuer dieses Ziel thermisch starten
+  // darf, entscheidet anschliessend feature_pumps.cpp.
+  if (targetABelowMinimum) {
+    if (!targetBelowMaxTemp(targetA, targetASinkC)) return r;
+
+    const float diffC = sourceC - targetASinkC;
+    const float targetDiff = targetDiffFor(pump, targetA);
+    const float hyst = hysteresisFor(pump, targetA);
+    targetA.lastDiffC = diffC;
+
+    fillTargetResult(r, ctx, pump, 0, targetA, targetASinkC, diffC, targetDiff, hyst);
+    requestValveTarget(ctx, pump, 0, r);
+    if (r.valveMoving) return r;
+
+    pump.activeTargetIndex = 0;
+    targetA.active = true;
+    return r;
+  }
+
+  // A hat Minimum erreicht (oder fuer A ist kein Minimum konfiguriert):
+  // Standardmaessig darf jetzt B zuerst geladen werden. Ist B voll, ungueltig
+  // oder thermisch nicht ladbar, darf A als Fallback bis zu seinem Maximum
+  // weitergeladen werden. ML darf oberhalb A-Minimum die Reihenfolge A/B
+  // umpriorisieren, ohne die jeweiligen Maximaltemperaturen zu umgehen.
+  uint8_t order[PUMP_ROUTE_TARGET_COUNT] = {1, 0};
+
+  if (forecastPreferBuffer) {
+    int8_t bufferIndex = -1;
+    for (uint8_t i = 0; i < PUMP_ROUTE_TARGET_COUNT; i++) {
+      if (pump.targets[i].enabled && isBufferRole(pump.targets[i].sinkRole)) {
+        bufferIndex = (int8_t)i;
+        break;
+      }
+    }
+    if (bufferIndex >= 0) {
+      order[0] = (uint8_t)bufferIndex;
+      order[1] = (uint8_t)(1 - bufferIndex);
+    }
+  }
+
+  for (uint8_t orderIndex = 0; orderIndex < PUMP_ROUTE_TARGET_COUNT; orderIndex++) {
+    const uint8_t i = order[orderIndex];
     PumpRouteTargetConfig& target = pump.targets[i];
     if (!target.enabled || target.sinkRole == Ds18Role::NONE) {
       target.lastSinkC = NAN;
@@ -236,21 +358,21 @@ RouteResult resolve(AppContext& ctx, uint8_t pumpIndex, float sourceC, bool sour
     target.lastSinkC = sinkC;
     target.lastDiffC = diffC;
 
+    // Fuer die Zielauswahl oberhalb A-Minimum ist nur maxTempC die harte
+    // thermische Zielbegrenzung. Das Routing waehlt den Sink; die Pumpe
+    // entscheidet danach anhand ihrer eigenen Start-/Stoplogik, ob sie laufen
+    // darf. Insbesondere darf A als Fallback oberhalb seines minTempC bis
+    // maxTempC weitergeladen werden.
     if (!targetBelowMaxTemp(target, sinkC)) continue;
-    if (!targetNeedsHeat(target, sinkC)) continue;
 
-    if (diffC >= (targetDiff + hyst)) {
-      fillTargetResult(r, ctx, pump, i, target, sinkC, diffC, targetDiff, hyst);
+    fillTargetResult(r, ctx, pump, i, target, sinkC, diffC, targetDiff, hyst);
 
-      if (pump.activeTargetIndex != i) {
-        requestValveTarget(ctx, pump, i, r);
-        if (r.valveMoving) return r;
-      }
+    requestValveTarget(ctx, pump, i, r);
+    if (r.valveMoving) return r;
 
-      pump.activeTargetIndex = i;
-      target.active = true;
-      return r;
-    }
+    pump.activeTargetIndex = i;
+    target.active = true;
+    return r;
   }
 
   return r;

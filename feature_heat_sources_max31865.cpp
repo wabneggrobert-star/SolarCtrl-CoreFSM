@@ -13,8 +13,10 @@ namespace {
   SPIClass maxSpi(HSPI);
 
   static constexpr uint8_t REG_CONFIG     = 0x00;
-  static constexpr uint8_t REG_RTD_MSB    = 0x01;
-  static constexpr uint8_t REG_FAULT_STAT = 0x07;
+  static constexpr uint8_t REG_RTD_MSB       = 0x01;
+  static constexpr uint8_t REG_HFAULT_MSB    = 0x03;
+  static constexpr uint8_t REG_LFAULT_MSB    = 0x05;
+  static constexpr uint8_t REG_FAULT_STAT    = 0x07;
 
   static constexpr uint8_t CFG_VBIAS       = 0x80;
   static constexpr uint8_t CFG_1SHOT       = 0x20;
@@ -51,6 +53,7 @@ namespace {
       case MaxChannel::CH1: return ctx.config.max1;
       case MaxChannel::CH2: return ctx.config.max2;
       case MaxChannel::CH3: return ctx.config.max3;
+      case MaxChannel::CH4: return ctx.config.max4;
       default: return ctx.config.max1;
     }
   }
@@ -60,6 +63,7 @@ namespace {
       case MaxChannel::CH1: return ctx.config.max1;
       case MaxChannel::CH2: return ctx.config.max2;
       case MaxChannel::CH3: return ctx.config.max3;
+      case MaxChannel::CH4: return ctx.config.max4;
       default: return ctx.config.max1;
     }
   }
@@ -69,6 +73,7 @@ namespace {
       case MaxChannel::CH1: return ctx.maxReadings[0];
       case MaxChannel::CH2: return ctx.maxReadings[1];
       case MaxChannel::CH3: return ctx.maxReadings[2];
+      case MaxChannel::CH4: return ctx.maxReadings[3];
       default: return ctx.maxReadings[0];
     }
   }
@@ -78,6 +83,7 @@ namespace {
       case MaxChannel::CH1: return ctx.maxReadings[0];
       case MaxChannel::CH2: return ctx.maxReadings[1];
       case MaxChannel::CH3: return ctx.maxReadings[2];
+      case MaxChannel::CH4: return ctx.maxReadings[3];
       default: return ctx.maxReadings[0];
     }
   }
@@ -87,6 +93,7 @@ namespace {
       case MaxChannel::CH1: return ctx.maxRuntime[0];
       case MaxChannel::CH2: return ctx.maxRuntime[1];
       case MaxChannel::CH3: return ctx.maxRuntime[2];
+      case MaxChannel::CH4: return ctx.maxRuntime[3];
       default: return ctx.maxRuntime[0];
     }
   }
@@ -262,14 +269,16 @@ namespace {
   bool anyCycleInProgress(const AppContext& ctx) {
     return ctx.maxRuntime[0].step != MaxReadStep::IDLE ||
            ctx.maxRuntime[1].step != MaxReadStep::IDLE ||
-           ctx.maxRuntime[2].step != MaxReadStep::IDLE;
+           ctx.maxRuntime[2].step != MaxReadStep::IDLE ||
+           ctx.maxRuntime[3].step != MaxReadStep::IDLE;
   }
 
   bool allDone(const AppContext& ctx) {
     const bool ch1Done = (!ctx.config.max1.enabled) || ctx.maxRuntime[0].cycleDone;
     const bool ch2Done = (!ctx.config.max2.enabled) || ctx.maxRuntime[1].cycleDone;
     const bool ch3Done = (!ctx.config.max3.enabled) || ctx.maxRuntime[2].cycleDone;
-    return ch1Done && ch2Done && ch3Done;
+    const bool ch4Done = (!ctx.config.max4.enabled) || ctx.maxRuntime[3].cycleDone;
+    return ch1Done && ch2Done && ch3Done && ch4Done;
   }
 
   String hex2(uint8_t v) {
@@ -289,6 +298,7 @@ namespace {
       case MaxChannel::CH1: return "ch1";
       case MaxChannel::CH2: return "ch2";
       case MaxChannel::CH3: return "ch3";
+      case MaxChannel::CH4: return "ch4";
       default: return "unknown";
     }
   }
@@ -298,6 +308,7 @@ namespace {
       case MaxChannel::CH1: return "ADC1 / CS_MAX1 / PCF P0";
       case MaxChannel::CH2: return "ADC2 / CS_MAX2 / PCF P1";
       case MaxChannel::CH3: return "ADC3 / CS_MAX3 / PCF P2";
+      case MaxChannel::CH4: return "ADC4 / CS_MAX4 / PCF P3";
       default: return "Unbekannt";
     }
   }
@@ -307,6 +318,7 @@ namespace {
       case MaxChannel::CH1: return PCF_BIT_MAX1_CS;
       case MaxChannel::CH2: return PCF_BIT_MAX2_CS;
       case MaxChannel::CH3: return PCF_BIT_MAX3_CS;
+      case MaxChannel::CH4: return PCF_BIT_MAX4_CS;
       default: return 255;
     }
   }
@@ -335,6 +347,186 @@ namespace {
     return json;
   }
 
+
+  float thresholdRawToResistance(uint16_t raw) {
+    const uint16_t code = raw >> 1;
+    return (float(code) / 32768.0f) * MAX31865_RREF;
+  }
+
+  void appendTraceSnapshotJson(String& json, MaxChannel ch) {
+    const uint8_t cfg = spiRead8(ch, REG_CONFIG);
+    const uint8_t fault = spiRead8(ch, REG_FAULT_STAT);
+    const uint16_t raw = spiRead16(ch, REG_RTD_MSB);
+    json += "{";
+    json += "\"config\":\"" + hex2(cfg) + "\",";
+    json += "\"configBits\":" + configBitsJson(cfg) + ",";
+    json += "\"fault\":\"" + hex2(fault) + "\",";
+    json += "\"faultBits\":" + maxFaultBitsJson(fault) + ",";
+    json += "\"rawRtd\":\"" + hex4(raw) + "\",";
+    json += "\"rtdCode\":" + String(raw >> 1) + ",";
+    json += "\"rawFaultBit\":" + String((raw & 0x0001u) ? "true" : "false");
+    json += "}";
+  }
+
+  uint8_t idleConfig() {
+    uint8_t cfg = CFG_FILTER_50HZ;
+    if (MAX31865_USE_3WIRE) cfg |= CFG_3WIRE;
+    return cfg;
+  }
+
+  void forceIdle(MaxChannel ch) {
+    // Explicitly remove VBIAS and 1-SHOT before a diagnostic sequence.
+    spiWrite8(ch, REG_CONFIG, idleConfig());
+    settleUs(2000);
+  }
+
+  void clearFaultWhileIdle(MaxChannel ch) {
+    spiWrite8(ch, REG_CONFIG, uint8_t(idleConfig() | CFG_FAULT_CLEAR));
+    settleUs(2000);
+    spiWrite8(ch, REG_CONFIG, idleConfig());
+    settleUs(2000);
+  }
+
+  void appendSequenceSnapshotJson(String& json, MaxChannel ch) {
+    appendTraceSnapshotJson(json, ch);
+  }
+
+  void appendTimingCaseJson(String& json, MaxChannel ch, uint32_t biasWaitUs) {
+    forceIdle(ch);
+    clearFaultWhileIdle(ch);
+
+    json += "{";
+    json += "\"biasWaitUs\":" + String(biasWaitUs) + ",";
+    json += "\"idle\":";
+    appendSequenceSnapshotJson(json, ch);
+
+    spiWrite8(ch, REG_CONFIG, baseConfig(false, false));
+    settleUs(biasWaitUs);
+    json += ",\"beforeOneShot\":";
+    appendSequenceSnapshotJson(json, ch);
+
+    spiWrite8(ch, REG_CONFIG, baseConfig(true, false));
+    json += ",\"immediateAfterOneShot\":";
+    appendSequenceSnapshotJson(json, ch);
+
+    settleUs(100000);
+    json += ",\"after100ms\":";
+    appendSequenceSnapshotJson(json, ch);
+    json += "}";
+  }
+
+  void appendHardResetAndOneShotJson(String& json, MaxChannel ch) {
+    const uint8_t idle = idleConfig();
+    forceIdle(ch);
+
+    json += "{";
+    json += "\"writeIdle\":\"" + hex2(idle) + "\",";
+    json += "\"idleReadback\":";
+    appendSequenceSnapshotJson(json, ch);
+
+    clearFaultWhileIdle(ch);
+    json += ",\"afterIdleFaultClear\":";
+    appendSequenceSnapshotJson(json, ch);
+
+    spiWrite8(ch, REG_CONFIG, baseConfig(false, false));
+    settleUs(100000);
+    json += ",\"afterBias100ms\":";
+    appendSequenceSnapshotJson(json, ch);
+
+    spiWrite8(ch, REG_CONFIG, baseConfig(true, false));
+    json += ",\"oneShotStart\":";
+    appendSequenceSnapshotJson(json, ch);
+
+    settleUs(10000);
+    json += ",\"after10ms\":";
+    appendSequenceSnapshotJson(json, ch);
+    settleUs(40000);
+    json += ",\"after50ms\":";
+    appendSequenceSnapshotJson(json, ch);
+    settleUs(50000);
+    json += ",\"after100ms\":";
+    appendSequenceSnapshotJson(json, ch);
+    settleUs(50000);
+    json += ",\"after150ms\":";
+    appendSequenceSnapshotJson(json, ch);
+    json += "}";
+  }
+
+  void appendCsStabilityJson(String& json, MaxChannel a, MaxChannel b, uint8_t samples) {
+    json += "[";
+    for (uint8_t i = 0; i < samples; ++i) {
+      if (i) json += ",";
+      json += "{";
+      json += "\"n\":" + String(i + 1) + ",";
+      json += "\"a\":{\"channel\":\"" + maxChannelKey(a) + "\",";
+      json += "\"config\":\"" + hex2(spiRead8(a, REG_CONFIG)) + "\",";
+      json += "\"fault\":\"" + hex2(spiRead8(a, REG_FAULT_STAT)) + "\",";
+      json += "\"raw\":\"" + hex4(spiRead16(a, REG_RTD_MSB)) + "\"},";
+      json += "\"b\":{\"channel\":\"" + maxChannelKey(b) + "\",";
+      json += "\"config\":\"" + hex2(spiRead8(b, REG_CONFIG)) + "\",";
+      json += "\"fault\":\"" + hex2(spiRead8(b, REG_FAULT_STAT)) + "\",";
+      json += "\"raw\":\"" + hex4(spiRead16(b, REG_RTD_MSB)) + "\"}";
+      json += "}";
+    }
+    json += "]";
+  }
+
+  void appendFaultTraceChannelJson(String& json, AppContext& ctx, MaxChannel ch) {
+    const MaxChannelConfig& c = cfgFor(ctx, ch);
+    const uint8_t csBit = maxCsBit(ch);
+
+    json += "{";
+    json += "\"channel\":\"" + maxChannelKey(ch) + "\",";
+    json += "\"label\":\"" + maxChannelLabel(ch) + "\",";
+    json += "\"enabled\":" + String(c.enabled ? "true" : "false") + ",";
+    json += "\"csBit\":" + String(csBit) + ",";
+
+    const uint16_t highRaw = spiRead16(ch, REG_HFAULT_MSB);
+    const uint16_t lowRaw = spiRead16(ch, REG_LFAULT_MSB);
+    json += "\"thresholds\":{";
+    json += "\"highRaw\":\"" + hex4(highRaw) + "\",";
+    json += "\"highCode\":" + String(highRaw >> 1) + ",";
+    json += "\"highOhm\":" + String(thresholdRawToResistance(highRaw), 2) + ",";
+    json += "\"lowRaw\":\"" + hex4(lowRaw) + "\",";
+    json += "\"lowCode\":" + String(lowRaw >> 1) + ",";
+    json += "\"lowOhm\":" + String(thresholdRawToResistance(lowRaw), 2);
+    json += "},";
+
+    json += "\"before\":";
+    appendTraceSnapshotJson(json, ch);
+
+    if (!c.enabled) {
+      json += ",\"skipped\":true";
+      json += "}";
+      return;
+    }
+
+    clearFault(ch);
+    settleUs(2000);
+    json += ",\"afterFaultClear\":";
+    appendTraceSnapshotJson(json, ch);
+
+    setBiasOn(ch);
+    settleUs(MAX_BIAS_WAIT_US);
+    json += ",\"afterBias\":";
+    appendTraceSnapshotJson(json, ch);
+
+    startOneShot(ch);
+    json += ",\"afterOneShotStart\":";
+    appendTraceSnapshotJson(json, ch);
+
+    settleUs(MAX_CONV_WAIT_US);
+    json += ",\"afterConversion\":";
+    appendTraceSnapshotJson(json, ch);
+
+    // Restore the same clean, biased configuration used by the normal reader.
+    // Threshold registers are never written by this diagnostic endpoint.
+    clearFault(ch);
+    settleUs(2000);
+    setBiasOn(ch);
+    json += ",\"restored\":true";
+    json += "}";
+  }
   void appendReadingJson(String& json, const MaxChannelReading& r) {
     json += "\"present\":" + String(r.present ? "true" : "false") + ",";
     json += "\"valid\":" + String(r.valid ? "true" : "false") + ",";
@@ -448,7 +640,7 @@ bool begin(AppContext& ctx) {
   Serial.println("MAX runtime reset...");
   Serial.flush();
 
-  for (uint8_t i = 0; i < 3; i++) {
+  for (uint8_t i = 0; i < MAX_MAX31865_CHANNELS; i++) {
     ctx.maxRuntime[i].step = MaxReadStep::IDLE;
     ctx.maxRuntime[i].tMarkUs = 0;
     ctx.maxRuntime[i].cycleDone = true;
@@ -516,6 +708,7 @@ void readAllNow(AppContext& ctx) {
   readChannelNow(ctx, MaxChannel::CH1);
   readChannelNow(ctx, MaxChannel::CH2);
   readChannelNow(ctx, MaxChannel::CH3);
+  readChannelNow(ctx, MaxChannel::CH4);
   HeatSourceAssignments::resolveHeatSources(ctx);
 }
 
@@ -571,9 +764,82 @@ String debugJson(AppContext& ctx, bool runOneShot) {
   appendMaxDebugChannelJson(json, ctx, MaxChannel::CH2, runOneShot);
   json += ",";
   appendMaxDebugChannelJson(json, ctx, MaxChannel::CH3, runOneShot);
+  json += ",";
+  appendMaxDebugChannelJson(json, ctx, MaxChannel::CH4, runOneShot);
   json += "]}";
 
   Pcf8574Io::deselectMaxCs();
+  return json;
+}
+
+String faultTraceJson(AppContext& ctx) {
+  String json = "{";
+  json += "\"started\":" + String(g_started ? "true" : "false") + ",";
+  json += "\"spiHz\":" + String(MAX_SPI_HZ) + ",";
+  json += "\"spiMode\":\"MODE1\",";
+  json += "\"biasWaitUs\":" + String(MAX_BIAS_WAIT_US) + ",";
+  json += "\"conversionWaitUs\":" + String(MAX_CONV_WAIT_US) + ",";
+  json += "\"rNominalOhm\":" + String(MAX31865_RNOMINAL, 2) + ",";
+  json += "\"rRefOhm\":" + String(MAX31865_RREF, 2) + ",";
+  json += "\"note\":\"Diagnostic performs the normal fault-clear/bias/one-shot sequence and only adds register reads; threshold registers are never written.\",";
+  json += "\"channels\":[";
+  appendFaultTraceChannelJson(json, ctx, MaxChannel::CH1);
+  json += ",";
+  appendFaultTraceChannelJson(json, ctx, MaxChannel::CH2);
+  json += ",";
+  appendFaultTraceChannelJson(json, ctx, MaxChannel::CH3);
+  json += ",";
+  appendFaultTraceChannelJson(json, ctx, MaxChannel::CH4);
+  json += "]}";
+  Pcf8574Io::deselectMaxCs();
+  return json;
+}
+
+String sequenceDiagnosticJson(AppContext& ctx) {
+  (void)ctx;
+  String json = "{";
+  json += "\"started\":" + String(g_started ? "true" : "false") + ",";
+  json += "\"spiHz\":" + String(MAX_SPI_HZ) + ",";
+  json += "\"spiMode\":\"MODE1\",";
+  json += "\"note\":\"Diagnostic writes CONFIG only; threshold registers are never written. Normal MAX configuration is restored at the end.\",";
+
+  json += "\"adc3Timing\":{";
+  const uint32_t waits[] = {10000, 50000, 100000, 250000};
+  const char* names[] = {"10ms", "50ms", "100ms", "250ms"};
+  for (uint8_t i = 0; i < 4; ++i) {
+    if (i) json += ",";
+    json += "\"" + String(names[i]) + "\":";
+    appendTimingCaseJson(json, MaxChannel::CH3, waits[i]);
+  }
+  json += "},";
+
+  json += "\"adc4ResetAndOneShot\":";
+  appendHardResetAndOneShotJson(json, MaxChannel::CH4);
+  json += ",";
+
+  // Put both reference channels into the same normal clean biased state before
+  // alternating reads. This test is intended to reveal CS/channel cross-talk.
+  clearFault(MaxChannel::CH3);
+  settleUs(2000);
+  setBiasOn(MaxChannel::CH3);
+  clearFault(MaxChannel::CH4);
+  settleUs(2000);
+  setBiasOn(MaxChannel::CH4);
+  settleUs(10000);
+  json += "\"csStability\":";
+  appendCsStabilityJson(json, MaxChannel::CH3, MaxChannel::CH4, 20);
+
+  // Restore the normal reader state. Do not touch thresholds or application
+  // configuration/readings.
+  clearFault(MaxChannel::CH3);
+  settleUs(2000);
+  setBiasOn(MaxChannel::CH3);
+  clearFault(MaxChannel::CH4);
+  settleUs(2000);
+  setBiasOn(MaxChannel::CH4);
+  Pcf8574Io::deselectMaxCs();
+
+  json += "}";
   return json;
 }
 

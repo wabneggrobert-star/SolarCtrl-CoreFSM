@@ -1,5 +1,6 @@
 #include "feature_sensor_assignments.h"
 #include "feature_sink_ds18b20.h"
+#include "feature_sensor_roles.h"
 #include <string.h>
 
 namespace {
@@ -116,10 +117,22 @@ bool autoAssignSingleSensorAsActiveSink(const Ds18b20Inventory& inventory, const
 bool resolveAssignments(const Ds18b20Inventory& inventory, const ConfigData& config, SensorAssignmentTable& table) {
   if (inventory.count == 0) return false;
 
+  // Legacy-Prioritaet weiterhin zuerst akzeptieren.
   Ds18Role sinkRole = activeSinkRole(config);
   Ds18RoleAssignment a;
   if (getAssignment(table, sinkRole, a) && inventoryContainsAddress(inventory, a.address)) {
     return true;
+  }
+
+  // Feldtest-Fix: Ein Speicherziel ist nicht auf Boiler Top / Puffer Top beschraenkt.
+  // Jede bereits zugewiesene, aktuell vorhandene Speicherrolle ist eine gueltige
+  // Grundlage fuer die Initialisierung. Die eigentliche Pumpenroute validiert spaeter
+  // genau den fuer sie konfigurierten Ziel-Sensor.
+  for (uint8_t i = 0; i < table.count; i++) {
+    const Ds18RoleAssignment& item = table.items[i];
+    if (!item.assigned) continue;
+    if (!SensorRoles::isSinkRole(item.role)) continue;
+    if (inventoryContainsAddress(inventory, item.address)) return true;
   }
 
   if (inventory.count == 1) {

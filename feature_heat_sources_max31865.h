@@ -19,4 +19,15 @@ namespace HeatSourcesMax {
   // and optionally triggers one-shot conversions for diagnosis.
   String debugJson(AppContext& ctx, bool runOneShot);
 
+  // Detailed MAX31865 fault trace. Executes the same fault-clear / bias /
+  // one-shot sequence as the normal reader and records CONFIG, RTD, FAULT and
+  // threshold registers after each stage. It never writes threshold registers.
+  String faultTraceJson(AppContext& ctx);
+
+  // Targeted sequence diagnostic: compares ADC3 bias-settling times, forces
+  // ADC4 through an explicit idle/reset/one-shot sequence, and alternates
+  // ADC3/ADC4 register reads to expose possible CS cross-talk. CONFIG is
+  // restored afterwards; threshold registers are never written.
+  String sequenceDiagnosticJson(AppContext& ctx);
+
 }

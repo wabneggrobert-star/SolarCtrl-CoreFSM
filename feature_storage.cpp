@@ -231,11 +231,47 @@ namespace {
     copyText(cfg.staSsid, sizeof(cfg.staSsid), "");
     copyText(cfg.staPassword, sizeof(cfg.staPassword), "");
     copyText(cfg.hostName, sizeof(cfg.hostName), DEFAULT_HOSTNAME);
+
+    cfg.ntpEnabled = true;
+    copyText(cfg.ntpServer, sizeof(cfg.ntpServer), "pool.ntp.org");
+    copyText(cfg.ntpTimezone, sizeof(cfg.ntpTimezone), "CET-1CEST,M3.5.0,M10.5.0/3");
+    cfg.ntpSyncIntervalMs = 86400000UL;
+
+    cfg.forecastEnabled = false;
+    cfg.forecastLatitude = 46.7536f;
+    cfg.forecastLongitude = 15.3697f;
+    cfg.forecastIntervalMs = 1800000UL;
+    cfg.forecastAuxDelayEnabled = false;
+    cfg.forecastAuxMaxWaitMs = 10800000UL;
+    cfg.forecastSolarPriorityEnabled = false;
+
+    cfg.mqttEnabled = false;
+    copyText(cfg.mqttHost, sizeof(cfg.mqttHost), "");
+    cfg.mqttPort = 1883;
+    copyText(cfg.mqttUser, sizeof(cfg.mqttUser), "");
+    copyText(cfg.mqttPassword, sizeof(cfg.mqttPassword), "");
+    copyText(cfg.mqttClientId, sizeof(cfg.mqttClientId), "SolarCtrl");
+    copyText(cfg.mqttBaseTopic, sizeof(cfg.mqttBaseTopic), "haus/solarctrl");
+    cfg.mqttDiscoveryEnabled = true;
+    cfg.mqttPublishIntervalMs = 10000UL;
+
     copyText(cfg.servicePin, sizeof(cfg.servicePin), DEFAULT_SERVICE_PIN);
 
     cfg.solarFluidType = SolarFluidType::GLYCOL;
     cfg.solarHydraulicType = SolarHydraulicType::CLOSED_PRESSURIZED;
     cfg.solarCollectorType = SolarCollectorType::FLAT_PLATE;
+    cfg.collectorApertureM2 = 1.0f;
+    cfg.collectorTiltDeg = 25.0f;
+    cfg.collectorAzimuthDeg = 235.0f;
+    cfg.glycolType = GlycolType::PROPYLENE;
+    cfg.glycolMeasuredFreezeProtectionC = -25.0f;
+    cfg.bufferVolumeLiters = 0.0f;
+    cfg.boilerVolumeLiters = 0.0f;
+    cfg.mlMode = MlMode::AUTOMATIC;
+    for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+      cfg.heatingCircuitAreaM2[i] = 0.0f;
+      cfg.heatingCircuitEmitterType[i] = HeatingEmitterType::UNKNOWN;
+    }
 
     cfg.frostEnabled = DEFAULT_FROST_ENABLED;
     cfg.frostCollectorOnC = DEFAULT_FROST_COLLECTOR_ON_C;
@@ -244,6 +280,8 @@ namespace {
     cfg.frostPumpPercent = DEFAULT_FROST_PUMP_PERCENT;
     cfg.frostProtectionStorageRole = Ds18Role::SINK_BUFFER_TOP;
     cfg.frostSafeCollectorTemperatureC = 8.0f;
+    cfg.frostRequiredProtectionC = -20.0f;
+    cfg.frostProtectionReserveK = 5.0f;
 
     cfg.stagnationEnabled = DEFAULT_STAGNATION_ENABLED;
     cfg.stagnationCollectorOnC = DEFAULT_STAGNATION_COLLECTOR_ON_C;
@@ -280,6 +318,10 @@ namespace {
     cfg.max3.enabled = false;
     cfg.max3.offsetC = 0.0f;
     cfg.max3.calFactor = 1.0f;
+
+    cfg.max4.enabled = false;
+    cfg.max4.offsetC = 0.0f;
+    cfg.max4.calFactor = 1.0f;
 
     for (uint8_t i = 0; i < RELAY_COUNT; i++) {
       cfg.relays[i].enabled = false;
@@ -344,6 +386,7 @@ namespace {
     }
 
     cfg.auxHeater.enabled = false;
+    cfg.auxHeater.userReleaseEnabled = true;
     cfg.auxHeater.minimumTemperatureC = 45.0f;
     cfg.auxHeater.targetTemperatureC = 55.0f;
     cfg.auxHeater.hysteresisC = 2.0f;
@@ -370,6 +413,8 @@ namespace {
       hk.pumpOutput = OutputRef{};
       hk.pumpMinPercent = 30;
       hk.pumpMaxPercent = 100;
+      hk.pumpTargetDeltaC = 5.0f;
+      hk.pumpFullDeltaC = 12.0f;
       hk.flowSensorRole = Ds18Role::NONE;
       hk.returnSensorRole = Ds18Role::NONE;
       hk.roomSensorRole = Ds18Role::NONE;
@@ -378,8 +423,13 @@ namespace {
       hk.fixedFlowTemperatureC = 35.0f;
       hk.maximumFlowTemperatureC = 55.0f;
       hk.minimumFlowTemperatureC = 20.0f;
+      hk.roomControlEnabled = false;
       hk.roomTargetTemperatureC = 21.0f;
       hk.roomInfluenceK = 3.0f;
+      hk.nightSetbackEnabled = false;
+      hk.nightSetbackStartMinute = 22 * 60;
+      hk.nightSetbackEndMinute = 6 * 60;
+      hk.nightSetbackK = 2.0f;
       hk.heatingCurveBaseC = 25.0f;
       hk.heatingCurveSlope = 1.0f;
       hk.frostProtectionEnabled = true;
@@ -487,6 +537,42 @@ bool loadConfig(ConfigData& cfg) {
   v = valueOf(text, "hostName");
   if (v.length()) copyText(cfg.hostName, sizeof(cfg.hostName), v.c_str());
 
+  v = valueOf(text, "ntpEnabled"); if (v.length()) cfg.ntpEnabled = (v.toInt() != 0);
+  v = valueOf(text, "ntpServer"); if (v.length()) copyText(cfg.ntpServer, sizeof(cfg.ntpServer), v.c_str());
+  v = valueOf(text, "ntpTimezone"); if (v.length()) copyText(cfg.ntpTimezone, sizeof(cfg.ntpTimezone), v.c_str());
+  v = valueOf(text, "ntpSyncIntervalMs"); if (v.length()) cfg.ntpSyncIntervalMs = max((uint32_t)3600000UL, (uint32_t)v.toInt());
+  v = valueOf(text, "forecastEnabled"); if (v.length()) cfg.forecastEnabled = (v.toInt() != 0);
+  v = valueOf(text, "forecastLatitude"); if (v.length()) cfg.forecastLatitude = v.toFloat();
+  v = valueOf(text, "forecastLongitude"); if (v.length()) cfg.forecastLongitude = v.toFloat();
+  v = valueOf(text, "forecastIntervalMs"); if (v.length()) cfg.forecastIntervalMs = max((uint32_t)900000UL, (uint32_t)v.toInt());
+  v = valueOf(text, "forecastAuxDelayEnabled"); if (v.length()) cfg.forecastAuxDelayEnabled = (v.toInt() != 0);
+  v = valueOf(text, "forecastAuxMaxWaitMs"); if (v.length()) cfg.forecastAuxMaxWaitMs = max((uint32_t)600000UL, (uint32_t)v.toInt());
+  v = valueOf(text, "forecastSolarPriorityEnabled"); if (v.length()) cfg.forecastSolarPriorityEnabled = (v.toInt() != 0);
+
+  v = valueOf(text, "mqttEnabled");
+  if (v.length()) cfg.mqttEnabled = (v.toInt() != 0);
+  v = valueOf(text, "mqttHost");
+  if (v.length()) copyText(cfg.mqttHost, sizeof(cfg.mqttHost), v.c_str());
+  v = valueOf(text, "mqttPort");
+  if (v.length()) { const int port = v.toInt(); if (port > 0 && port <= 65535) cfg.mqttPort = (uint16_t)port; }
+  v = valueOf(text, "mqttUser");
+  if (v.length()) copyText(cfg.mqttUser, sizeof(cfg.mqttUser), v.c_str());
+  v = valueOf(text, "mqttPassword");
+  if (v.length()) copyText(cfg.mqttPassword, sizeof(cfg.mqttPassword), v.c_str());
+  v = valueOf(text, "mqttClientId");
+  if (v.length()) copyText(cfg.mqttClientId, sizeof(cfg.mqttClientId), v.c_str());
+  v = valueOf(text, "mqttBaseTopic");
+  if (v.length()) copyText(cfg.mqttBaseTopic, sizeof(cfg.mqttBaseTopic), v.c_str());
+  v = valueOf(text, "mqttDiscoveryEnabled");
+  if (v.length()) cfg.mqttDiscoveryEnabled = (v.toInt() != 0);
+  v = valueOf(text, "mqttPublishIntervalMs");
+  if (v.length()) {
+    uint32_t interval = (uint32_t)v.toInt();
+    if (interval < 2000UL) interval = 2000UL;
+    if (interval > 300000UL) interval = 300000UL;
+    cfg.mqttPublishIntervalMs = interval;
+  }
+
   v = valueOf(text, "servicePin");
   if (v.length()) copyText(cfg.servicePin, sizeof(cfg.servicePin), v.c_str());
 
@@ -498,6 +584,19 @@ bool loadConfig(ConfigData& cfg) {
 
   v = valueOf(text, "solarCollectorType");
   if (v.length()) cfg.solarCollectorType = (v.toInt() == 1) ? SolarCollectorType::EVACUATED_TUBE : SolarCollectorType::FLAT_PLATE;
+  v = valueOf(text, "collectorApertureM2"); if (v.length()) cfg.collectorApertureM2 = v.toFloat();
+  v = valueOf(text, "collectorTiltDeg"); if (v.length()) cfg.collectorTiltDeg = v.toFloat();
+  v = valueOf(text, "collectorAzimuthDeg"); if (v.length()) cfg.collectorAzimuthDeg = v.toFloat();
+
+  v = valueOf(text, "glycolType"); if (v.length()) cfg.glycolType = (v.toInt() == 1) ? GlycolType::ETHYLENE : GlycolType::PROPYLENE;
+  v = valueOf(text, "glycolMeasuredFreezeProtectionC"); if (v.length()) cfg.glycolMeasuredFreezeProtectionC = v.toFloat();
+  v = valueOf(text, "bufferVolumeLiters"); if (v.length()) cfg.bufferVolumeLiters = max(0.0f, v.toFloat());
+  v = valueOf(text, "boilerVolumeLiters"); if (v.length()) cfg.boilerVolumeLiters = max(0.0f, v.toFloat());
+  v = valueOf(text, "mlMode"); if (v.length()) { int m=v.toInt(); cfg.mlMode = m==2 ? MlMode::AUTOMATIC : (m==1 ? MlMode::LEARN_ONLY : MlMode::OFF); }
+  for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+    v = valueOf(text, String("heatingCircuitAreaM2_") + String(i)); if (v.length()) cfg.heatingCircuitAreaM2[i] = max(0.0f, v.toFloat());
+    v = valueOf(text, String("heatingCircuitEmitterType_") + String(i)); if (v.length()) { int e=v.toInt(); cfg.heatingCircuitEmitterType[i] = (e>=0 && e<=3) ? (HeatingEmitterType)e : HeatingEmitterType::UNKNOWN; }
+  }
 
   v = valueOf(text, "energyMeterEnabled");
   if (v.length()) cfg.energyMeter.enabled = (v.toInt() != 0);
@@ -534,6 +633,10 @@ bool loadConfig(ConfigData& cfg) {
 
   v = valueOf(text, "frostSafeCollectorTemperatureC");
   if (v.length()) cfg.frostSafeCollectorTemperatureC = v.toFloat();
+  v = valueOf(text, "frostRequiredProtectionC");
+  if (v.length()) cfg.frostRequiredProtectionC = v.toFloat();
+  v = valueOf(text, "frostProtectionReserveK");
+  if (v.length()) cfg.frostProtectionReserveK = max(0.0f, v.toFloat());
 
   v = valueOf(text, "stagnationEnabled");
   if (v.length()) cfg.stagnationEnabled = (v.toInt() != 0);
@@ -600,6 +703,16 @@ bool loadConfig(ConfigData& cfg) {
 
   v = valueOf(text, "max3CalFactor");
   if (v.length()) cfg.max3.calFactor = v.toFloat();
+
+  // MAX4
+  v = valueOf(text, "max4Enabled");
+  if (v.length()) cfg.max4.enabled = (v.toInt() != 0);
+
+  v = valueOf(text, "max4OffsetC");
+  if (v.length()) cfg.max4.offsetC = v.toFloat();
+
+  v = valueOf(text, "max4CalFactor");
+  if (v.length()) cfg.max4.calFactor = v.toFloat();
 
   // Relais-Konfiguration
   for (uint8_t i = 0; i < RELAY_COUNT; i++) {
@@ -731,6 +844,9 @@ bool loadConfig(ConfigData& cfg) {
       v = valueOf(text, tPrefix + "hysteresisOverride");
       if (v.length()) cfg.pumps[i].targets[t].hysteresisOverride = v.toFloat();
 
+      v = valueOf(text, tPrefix + "minTempC");
+      if (v.length()) cfg.pumps[i].targets[t].minTempC = v.toFloat();
+
       v = valueOf(text, tPrefix + "maxTempC");
       if (v.length()) cfg.pumps[i].targets[t].maxTempC = v.toFloat();
     }
@@ -778,6 +894,9 @@ bool loadConfig(ConfigData& cfg) {
 
   v = valueOf(text, "auxHeaterEnabled");
   if (v.length()) cfg.auxHeater.enabled = (v.toInt() != 0);
+
+  v = valueOf(text, "auxHeaterUserReleaseEnabled");
+  if (v.length()) cfg.auxHeater.userReleaseEnabled = (v.toInt() != 0);
 
   v = valueOf(text, "auxHeaterMinimumTemperatureC");
   if (v.length()) cfg.auxHeater.minimumTemperatureC = v.toFloat();
@@ -967,6 +1086,10 @@ bool loadConfig(ConfigData& cfg) {
     if (v.length()) hk.pumpMinPercent = (uint8_t)v.toInt();
     v = valueOf(text, prefix + "pumpMaxPercent");
     if (v.length()) hk.pumpMaxPercent = (uint8_t)v.toInt();
+    v = valueOf(text, prefix + "pumpTargetDeltaC");
+    if (v.length()) hk.pumpTargetDeltaC = v.toFloat();
+    v = valueOf(text, prefix + "pumpFullDeltaC");
+    if (v.length()) hk.pumpFullDeltaC = v.toFloat();
 
     v = valueOf(text, prefix + "flowSensorRole");
     if (v.length()) hk.flowSensorRole = ds18RoleFromInt(v.toInt());
@@ -985,10 +1108,20 @@ bool loadConfig(ConfigData& cfg) {
     if (v.length()) hk.maximumFlowTemperatureC = v.toFloat();
     v = valueOf(text, prefix + "minimumFlowTemperatureC");
     if (v.length()) hk.minimumFlowTemperatureC = v.toFloat();
+    v = valueOf(text, prefix + "roomControlEnabled");
+    if (v.length()) hk.roomControlEnabled = (v.toInt() != 0);
     v = valueOf(text, prefix + "roomTargetTemperatureC");
     if (v.length()) hk.roomTargetTemperatureC = v.toFloat();
     v = valueOf(text, prefix + "roomInfluenceK");
     if (v.length()) hk.roomInfluenceK = v.toFloat();
+    v = valueOf(text, prefix + "nightSetbackEnabled");
+    if (v.length()) hk.nightSetbackEnabled = (v.toInt() != 0);
+    v = valueOf(text, prefix + "nightSetbackStartMinute");
+    if (v.length()) hk.nightSetbackStartMinute = (uint16_t)constrain(v.toInt(), 0, 1439);
+    v = valueOf(text, prefix + "nightSetbackEndMinute");
+    if (v.length()) hk.nightSetbackEndMinute = (uint16_t)constrain(v.toInt(), 0, 1439);
+    v = valueOf(text, prefix + "nightSetbackK");
+    if (v.length()) hk.nightSetbackK = constrain(v.toFloat(), 0.0f, 10.0f);
     v = valueOf(text, prefix + "heatingCurveBaseC");
     if (v.length()) hk.heatingCurveBaseC = v.toFloat();
     v = valueOf(text, prefix + "heatingCurveSlope");
@@ -1033,11 +1166,47 @@ bool saveConfig(const ConfigData& cfg) {
   text += "staSsid=" + String(cfg.staSsid) + "\n";
   text += "staPassword=" + String(cfg.staPassword) + "\n";
   text += "hostName=" + String(cfg.hostName) + "\n";
+
+  text += "ntpEnabled=" + String(cfg.ntpEnabled ? 1 : 0) + "\n";
+  text += "ntpServer=" + String(cfg.ntpServer) + "\n";
+  text += "ntpTimezone=" + String(cfg.ntpTimezone) + "\n";
+  text += "ntpSyncIntervalMs=" + String(cfg.ntpSyncIntervalMs) + "\n";
+  text += "forecastEnabled=" + String(cfg.forecastEnabled ? 1 : 0) + "\n";
+  text += "forecastLatitude=" + String(cfg.forecastLatitude, 5) + "\n";
+  text += "forecastLongitude=" + String(cfg.forecastLongitude, 5) + "\n";
+  text += "forecastIntervalMs=" + String(cfg.forecastIntervalMs) + "\n";
+  text += "forecastAuxDelayEnabled=" + String(cfg.forecastAuxDelayEnabled ? 1 : 0) + "\n";
+  text += "forecastAuxMaxWaitMs=" + String(cfg.forecastAuxMaxWaitMs) + "\n";
+  text += "forecastSolarPriorityEnabled=" + String(cfg.forecastSolarPriorityEnabled ? 1 : 0) + "\n";
+
+  text += "mqttEnabled=" + String(cfg.mqttEnabled ? 1 : 0) + "\n";
+  text += "mqttHost=" + String(cfg.mqttHost) + "\n";
+  text += "mqttPort=" + String(cfg.mqttPort) + "\n";
+  text += "mqttUser=" + String(cfg.mqttUser) + "\n";
+  text += "mqttPassword=" + String(cfg.mqttPassword) + "\n";
+  text += "mqttClientId=" + String(cfg.mqttClientId) + "\n";
+  text += "mqttBaseTopic=" + String(cfg.mqttBaseTopic) + "\n";
+  text += "mqttDiscoveryEnabled=" + String(cfg.mqttDiscoveryEnabled ? 1 : 0) + "\n";
+  text += "mqttPublishIntervalMs=" + String(cfg.mqttPublishIntervalMs) + "\n";
+
   text += "servicePin=" + String(cfg.servicePin) + "\n";
 
   text += "solarFluidType=" + String((int)cfg.solarFluidType) + "\n";
   text += "solarHydraulicType=" + String((int)cfg.solarHydraulicType) + "\n";
   text += "solarCollectorType=" + String((int)cfg.solarCollectorType) + "\n";
+  text += "collectorApertureM2=" + String(cfg.collectorApertureM2, 3) + "\n";
+  text += "collectorTiltDeg=" + String(cfg.collectorTiltDeg, 2) + "\n";
+  text += "collectorAzimuthDeg=" + String(cfg.collectorAzimuthDeg, 2) + "\n";
+
+  text += "glycolType=" + String((int)cfg.glycolType) + "\n";
+  text += "glycolMeasuredFreezeProtectionC=" + String(cfg.glycolMeasuredFreezeProtectionC, 2) + "\n";
+  text += "bufferVolumeLiters=" + String(cfg.bufferVolumeLiters, 1) + "\n";
+  text += "boilerVolumeLiters=" + String(cfg.boilerVolumeLiters, 1) + "\n";
+  text += "mlMode=" + String((int)cfg.mlMode) + "\n";
+  for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+    text += "heatingCircuitAreaM2_" + String(i) + "=" + String(cfg.heatingCircuitAreaM2[i], 1) + "\n";
+    text += "heatingCircuitEmitterType_" + String(i) + "=" + String((int)cfg.heatingCircuitEmitterType[i]) + "\n";
+  }
 
   text += "energyMeterEnabled=" + String(cfg.energyMeter.enabled ? 1 : 0) + "\n";
   text += "energyMeterFeedbackInputIndex=" + String(cfg.energyMeter.feedbackInputIndex) + "\n";
@@ -1054,6 +1223,8 @@ bool saveConfig(const ConfigData& cfg) {
   text += "frostPumpPercent=" + String(cfg.frostPumpPercent) + "\n";
   text += "frostProtectionStorageRole=" + String(ds18RoleToInt(cfg.frostProtectionStorageRole)) + "\n";
   text += "frostSafeCollectorTemperatureC=" + String(cfg.frostSafeCollectorTemperatureC, 2) + "\n";
+  text += "frostRequiredProtectionC=" + String(cfg.frostRequiredProtectionC, 2) + "\n";
+  text += "frostProtectionReserveK=" + String(cfg.frostProtectionReserveK, 2) + "\n";
 
   text += "stagnationEnabled=" + String(cfg.stagnationEnabled ? 1 : 0) + "\n";
   text += "stagnationCollectorOnC=" + String(cfg.stagnationCollectorOnC, 2) + "\n";
@@ -1084,6 +1255,11 @@ bool saveConfig(const ConfigData& cfg) {
   text += "max3Enabled=" + String(cfg.max3.enabled ? 1 : 0) + "\n";
   text += "max3OffsetC=" + String(cfg.max3.offsetC, 2) + "\n";
   text += "max3CalFactor=" + String(cfg.max3.calFactor, 4) + "\n";
+
+  // MAX4
+  text += "max4Enabled=" + String(cfg.max4.enabled ? 1 : 0) + "\n";
+  text += "max4OffsetC=" + String(cfg.max4.offsetC, 2) + "\n";
+  text += "max4CalFactor=" + String(cfg.max4.calFactor, 4) + "\n";
 
   // Relais-Konfiguration
   for (uint8_t i = 0; i < RELAY_COUNT; i++) {
@@ -1149,6 +1325,7 @@ bool saveConfig(const ConfigData& cfg) {
   }
 
   text += "auxHeaterEnabled=" + String(cfg.auxHeater.enabled ? 1 : 0) + "\n";
+  text += "auxHeaterUserReleaseEnabled=" + String(cfg.auxHeater.userReleaseEnabled ? 1 : 0) + "\n";
   text += "auxHeaterMinimumTemperatureC=" + String(cfg.auxHeater.minimumTemperatureC, 2) + "\n";
   text += "auxHeaterTargetTemperatureC=" + String(cfg.auxHeater.targetTemperatureC, 2) + "\n";
   text += "auxHeaterHysteresisC=" + String(cfg.auxHeater.hysteresisC, 2) + "\n";
@@ -1218,6 +1395,8 @@ bool saveConfig(const ConfigData& cfg) {
     text += prefix + "pumpOutputIndex=" + String(hk.pumpOutput.index) + "\n";
     text += prefix + "pumpMinPercent=" + String(hk.pumpMinPercent) + "\n";
     text += prefix + "pumpMaxPercent=" + String(hk.pumpMaxPercent) + "\n";
+    text += prefix + "pumpTargetDeltaC=" + String(hk.pumpTargetDeltaC, 2) + "\n";
+    text += prefix + "pumpFullDeltaC=" + String(hk.pumpFullDeltaC, 2) + "\n";
     text += prefix + "flowSensorRole=" + String(ds18RoleToInt(hk.flowSensorRole)) + "\n";
     text += prefix + "returnSensorRole=" + String(ds18RoleToInt(hk.returnSensorRole)) + "\n";
     text += prefix + "roomSensorRole=" + String(ds18RoleToInt(hk.roomSensorRole)) + "\n";
@@ -1226,8 +1405,13 @@ bool saveConfig(const ConfigData& cfg) {
     text += prefix + "fixedFlowTemperatureC=" + String(hk.fixedFlowTemperatureC, 2) + "\n";
     text += prefix + "maximumFlowTemperatureC=" + String(hk.maximumFlowTemperatureC, 2) + "\n";
     text += prefix + "minimumFlowTemperatureC=" + String(hk.minimumFlowTemperatureC, 2) + "\n";
+    text += prefix + "roomControlEnabled=" + String(hk.roomControlEnabled ? 1 : 0) + "\n";
     text += prefix + "roomTargetTemperatureC=" + String(hk.roomTargetTemperatureC, 2) + "\n";
     text += prefix + "roomInfluenceK=" + String(hk.roomInfluenceK, 2) + "\n";
+    text += prefix + "nightSetbackEnabled=" + String(hk.nightSetbackEnabled ? 1 : 0) + "\n";
+    text += prefix + "nightSetbackStartMinute=" + String(hk.nightSetbackStartMinute) + "\n";
+    text += prefix + "nightSetbackEndMinute=" + String(hk.nightSetbackEndMinute) + "\n";
+    text += prefix + "nightSetbackK=" + String(hk.nightSetbackK, 2) + "\n";
     text += prefix + "heatingCurveBaseC=" + String(hk.heatingCurveBaseC, 2) + "\n";
     text += prefix + "heatingCurveSlope=" + String(hk.heatingCurveSlope, 3) + "\n";
     text += prefix + "frostProtectionEnabled=" + String(hk.frostProtectionEnabled ? 1 : 0) + "\n";

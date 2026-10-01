@@ -2,7 +2,8 @@
 #include <Arduino.h>
 
 static constexpr uint8_t MAX_DS18B20_SENSORS = 20;
-static constexpr uint8_t MAX_HEAT_SOURCE_ASSIGNMENTS = 3;
+static constexpr uint8_t MAX_HEAT_SOURCE_ASSIGNMENTS = 4;
+static constexpr uint8_t MAX_MAX31865_CHANNELS = 4;
 static constexpr uint8_t PIN_UNUSED = 255;
 static constexpr uint8_t RELAY_COUNT = 8;
 static constexpr uint8_t PWM_OUTPUT_COUNT = 8;
@@ -44,6 +45,24 @@ enum class ProtectionMode : uint8_t {
 enum class SolarFluidType : uint8_t {
   GLYCOL = 0,
   WATER = 1
+};
+
+enum class GlycolType : uint8_t {
+  PROPYLENE = 0,
+  ETHYLENE = 1
+};
+
+enum class MlMode : uint8_t {
+  OFF = 0,
+  LEARN_ONLY = 1,
+  AUTOMATIC = 2
+};
+
+enum class HeatingEmitterType : uint8_t {
+  UNKNOWN = 0,
+  UNDERFLOOR = 1,
+  RADIATOR = 2,
+  OTHER = 3
 };
 
 enum class SolarHydraulicType : uint8_t {
@@ -121,7 +140,8 @@ enum class SinkTarget : uint8_t {
 enum class MaxChannel : uint8_t {
   CH1 = 0,
   CH2,
-  CH3
+  CH3,
+  CH4
 };
 
 enum class HeatSourceRole : uint8_t {
@@ -135,7 +155,7 @@ enum class HeatSourceRole : uint8_t {
   ALT_SOURCE_OTHER,
 
   // Sensorrollen fuer ADC/MAX31865. Solar/Ofen bleiben echte Waermequellen,
-  // die folgenden Rollen duerfen ADC1..ADC3 ebenfalls verwenden.
+  // die folgenden Rollen duerfen ADC1..ADC4 ebenfalls verwenden.
   SENSOR_BOILER_TOP,
   SENSOR_BOILER_BOTTOM,
   SENSOR_BUFFER_TOP,
@@ -467,6 +487,12 @@ struct OutputRef {
 struct AuxHeaterConfig {
   bool enabled = false;
 
+  // Manuelle Betriebsfreigabe aus der Anlagenuebersicht. Diese Freigabe ist
+  // bewusst getrennt von "enabled": enabled beschreibt, ob die Zusatzheizung
+  // konfiguriert ist; userReleaseEnabled darf den normalen Heizbetrieb sperren,
+  // aber niemals Safety-Funktionen beeinflussen oder umgehen.
+  bool userReleaseEnabled = true;
+
   float minimumTemperatureC = 45.0f;
   float targetTemperatureC = 55.0f;
   float hysteresisC = 2.0f;
@@ -603,6 +629,13 @@ struct HeatingCircuitConfig {
   float roomTargetTemperatureC = 21.0f;
   float roomInfluenceK = 3.0f;
 
+  // Optionale Nachtabsenkung. Sie veraendert nur den wirksamen Raum-Sollwert;
+  // Safety und die Grundregelung bleiben davon unabhaengig.
+  bool nightSetbackEnabled = false;
+  uint16_t nightSetbackStartMinute = 22 * 60;
+  uint16_t nightSetbackEndMinute = 6 * 60;
+  float nightSetbackK = 2.0f;
+
   // PWM-Heizkreispumpe: Regelung nach Spreizung Vorlauf/Ruecklauf.
   // Die Hardware/PWM-Ausgaenge bleiben zentral im Pumpenmenue.
   float pumpTargetDeltaC = 5.0f;
@@ -632,6 +665,8 @@ struct HeatingCircuitRuntime {
   float roomTemperatureC = NAN;
   float outsideTemperatureC = NAN;
   float targetFlowTemperatureC = NAN;
+  float effectiveRoomTargetTemperatureC = NAN;
+  bool nightSetbackActive = false;
   uint8_t pumpPercent = 0;
   int16_t estimatedMixerPositionPercent = 50;
   uint32_t lastMixerActionMs = 0;
@@ -691,11 +726,51 @@ struct ConfigData {
   char staPassword[64] = "";
   char hostName[32] = "solarctrl";
 
+  // Internet-Zeit / Forecast sind reine Komfortfunktionen.
+  // Die Grundregelung darf niemals von Internet, NTP oder Forecast abhaengen.
+  bool ntpEnabled = true;
+  char ntpServer[64] = "pool.ntp.org";
+  char ntpTimezone[64] = "CET-1CEST,M3.5.0,M10.5.0/3";
+  uint32_t ntpSyncIntervalMs = 86400000UL;
+
+  bool forecastEnabled = false;
+  float forecastLatitude = 46.7536f;
+  float forecastLongitude = 15.3697f;
+  uint32_t forecastIntervalMs = 1800000UL;
+  bool forecastAuxDelayEnabled = false;
+  uint32_t forecastAuxMaxWaitMs = 10800000UL;
+  bool forecastSolarPriorityEnabled = false;
+
+  // MQTT / Home Assistant. Netzwerk- und Zugangsdaten bleiben nur lokal konfigurierbar.
+  bool mqttEnabled = false;
+  char mqttHost[64] = "";
+  uint16_t mqttPort = 1883;
+  char mqttUser[48] = "";
+  char mqttPassword[64] = "";
+  char mqttClientId[32] = "SolarCtrl";
+  char mqttBaseTopic[64] = "haus/solarctrl";
+  bool mqttDiscoveryEnabled = true;
+  uint32_t mqttPublishIntervalMs = 10000UL;
+
   char servicePin[16] = "1234";
 
+  // Physikalische Anlagendaten. Sie beschreiben die Anlage, blockieren aber
+  // weder Grundregelung noch Safety wenn Werte fehlen oder unplausibel sind.
   SolarFluidType solarFluidType = SolarFluidType::GLYCOL;
+  GlycolType glycolType = GlycolType::PROPYLENE;
+  float glycolMeasuredFreezeProtectionC = -25.0f;
   SolarHydraulicType solarHydraulicType = SolarHydraulicType::CLOSED_PRESSURIZED;
   SolarCollectorType solarCollectorType = SolarCollectorType::FLAT_PLATE;
+  float collectorApertureM2 = 1.0f;
+  float collectorTiltDeg = 25.0f;
+  float collectorAzimuthDeg = 235.0f;
+  float bufferVolumeLiters = 0.0f;
+  float boilerVolumeLiters = 0.0f;
+  float heatingCircuitAreaM2[MAX_HEATING_CIRCUITS] = {};
+  HeatingEmitterType heatingCircuitEmitterType[MAX_HEATING_CIRCUITS] = {};
+
+  // ML ist ein optionaler Optimierungs-Layer. OFF/NUR LERNEN/AUTOMATISCH.
+  MlMode mlMode = MlMode::AUTOMATIC;
 
   bool frostEnabled = true;
   float frostCollectorOnC = 4.0f;
@@ -704,6 +779,8 @@ struct ConfigData {
   uint8_t frostPumpPercent = 40;
   Ds18Role frostProtectionStorageRole = Ds18Role::SINK_BUFFER_TOP;
   float frostSafeCollectorTemperatureC = 8.0f;
+  float frostRequiredProtectionC = -20.0f;
+  float frostProtectionReserveK = 5.0f;
 
   bool stagnationEnabled = true;
   float stagnationCollectorOnC = 110.0f;
@@ -723,6 +800,7 @@ struct ConfigData {
   MaxChannelConfig max1 = { true, 0.0f, 1.0f };
   MaxChannelConfig max2 = { false, 0.0f, 1.0f };
   MaxChannelConfig max3 = { false, 0.0f, 1.0f };
+  MaxChannelConfig max4 = { false, 0.0f, 1.0f };
 
   RelayOutputConfig relays[RELAY_COUNT];
   PwmOutputConfig pwmOutputs[PWM_OUTPUT_COUNT];
@@ -781,8 +859,8 @@ struct AppContext {
   Ds18b20Inventory ds18b20;
   SensorAssignmentTable assignments;
 
-  MaxChannelReading maxReadings[3];
-  MaxChannelRuntime maxRuntime[3];
+  MaxChannelReading maxReadings[MAX_MAX31865_CHANNELS];
+  MaxChannelRuntime maxRuntime[MAX_MAX31865_CHANNELS];
 
   HeatSourceAssignmentTable heatSourceAssignments;
 

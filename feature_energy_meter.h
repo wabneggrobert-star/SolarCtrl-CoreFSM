@@ -7,4 +7,5 @@ namespace EnergyMeter {
   void process(AppContext& ctx);
   void saveRuntime(const AppContext& ctx);
   uint8_t gpioForFeedbackInput(uint8_t inputIndex);
+  float effectiveEnergyFactorWhPerLiterK(const ConfigData& cfg, float meanFluidTemperatureC = 40.0f);
 }

@@ -2,6 +2,10 @@
 
 #include "feature_pumps.h"
 #include "feature_sensor_assignments.h"
+#include "feature_alarms.h"
+#include "feature_aux_heater.h"
+#include "feature_oven.h"
+#include "feature_heating_circuits.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -14,6 +18,13 @@ static constexpr float SENSOR_MAX_VALID_C = 180.0f;
 static constexpr uint32_t ONE_DAY_MS = 24UL * 60UL * 60UL * 1000UL;
 
 SafetyManager::SafetyStatus g_status;
+bool g_storageMaximumLatched = false;
+bool g_storageCriticalLatched = false;
+
+static constexpr float STORAGE_MAX_HYSTERESIS_C = 2.0f;
+static constexpr float STORAGE_CRITICAL_HYSTERESIS_C = 3.0f;
+static constexpr float STORAGE_COOLING_MIN_DELTA_C = 5.0f;
+static constexpr float STORAGE_COOLING_PWM_PERCENT = 100.0f;
 
 bool isValidTemperature(float value) {
   return !isnan(value) &&
@@ -58,6 +69,7 @@ bool maxChannelRelevantForSafety(const AppContext& ctx, MaxChannel channel) {
     case MaxChannel::CH1: config = &ctx.config.max1; break;
     case MaxChannel::CH2: config = &ctx.config.max2; break;
     case MaxChannel::CH3: config = &ctx.config.max3; break;
+    case MaxChannel::CH4: config = &ctx.config.max4; break;
   }
 
   if (config == nullptr || !config->enabled) {
@@ -120,20 +132,28 @@ void updateDs18StorageTemperatures(AppContext& ctx) {
   g_status.highestStorageTemperatureC = NAN;
   g_status.ds18SensorMissing = (ctx.ds18b20.count == 0);
 
-  for (uint8_t i = 0; i < ctx.ds18b20.count; i++) {
-    const Ds18b20DeviceInfo& device = ctx.ds18b20.devices[i];
+  // IMPORTANT: Die Rollen der DS18B20 werden in ctx.assignments gespeichert.
+  // inventory.devices[].role ist nach dem Scan nicht die verlaessliche Quelle
+  // fuer die aktuelle Zuordnung. Der alte Safety-Code hat deshalb konfigurierte
+  // Puffer-/Boilersensoren uebersehen und keine Uebertemperatur erkannt.
+  static const Ds18Role storageRoles[] = {
+    Ds18Role::SINK_BOILER_TOP,
+    Ds18Role::BOILER_BOTTOM,
+    Ds18Role::SINK_BUFFER_TOP,
+    Ds18Role::BUFFER_HIGH,
+    Ds18Role::BUFFER_MID,
+    Ds18Role::BUFFER_BOTTOM
+  };
 
-    if (!device.present || !device.lastValid || !isValidTemperature(device.lastTempC)) {
-      continue;
-    }
-
-    if (!isStorageRole(device.role)) {
-      continue;
-    }
+  for (Ds18Role role : storageRoles) {
+    float temperatureC = NAN;
+    bool valid = false;
+    if (!SensorAssignments::readByRole(ctx.assignments, role, temperatureC, valid)) continue;
+    if (!valid || !isValidTemperature(temperatureC)) continue;
 
     if (isnan(g_status.highestStorageTemperatureC) ||
-        device.lastTempC > g_status.highestStorageTemperatureC) {
-      g_status.highestStorageTemperatureC = device.lastTempC;
+        temperatureC > g_status.highestStorageTemperatureC) {
+      g_status.highestStorageTemperatureC = temperatureC;
     }
   }
 
@@ -195,6 +215,7 @@ void evaluateSensorFaults(const AppContext& ctx) {
   checkMax(0, MaxChannel::CH1, ctx.maxReadings[0]);
   checkMax(1, MaxChannel::CH2, ctx.maxReadings[1]);
   checkMax(2, MaxChannel::CH3, ctx.maxReadings[2]);
+  checkMax(3, MaxChannel::CH4, ctx.maxReadings[3]);
 
   // Keine DS18B20 bedeutet: keine Solar-/Speichersteuerung.
   // Der Ofen wird später separat über die Ofenlogik betreibbar bleiben.
@@ -268,21 +289,63 @@ void evaluateCollectorStagnation(const AppContext& ctx) {
 }
 
 void evaluateStorageOvertemperature(const AppContext& ctx) {
-  if (!ctx.config.storageProtectionEnabled) return;
-  if (isnan(g_status.highestStorageTemperatureC)) return;
+  if (!ctx.config.storageProtectionEnabled || isnan(g_status.highestStorageTemperatureC)) {
+    g_storageMaximumLatched = false;
+    g_storageCriticalLatched = false;
+    return;
+  }
 
-  if (g_status.highestStorageTemperatureC >= ctx.config.sinkMaxC) {
-    g_status.storageOvertemperatureActive = true;
+  const float storageC = g_status.highestStorageTemperatureC;
+  const float maximumC = ctx.config.sinkMaxC;
+  const float criticalC = ctx.config.storageCriticalTemperatureC;
+
+  if (!g_storageMaximumLatched && storageC >= maximumC) g_storageMaximumLatched = true;
+  if (g_storageMaximumLatched && storageC <= maximumC - STORAGE_MAX_HYSTERESIS_C) g_storageMaximumLatched = false;
+
+  if (!g_storageCriticalLatched && storageC >= criticalC) g_storageCriticalLatched = true;
+  if (g_storageCriticalLatched && storageC <= criticalC - STORAGE_CRITICAL_HYSTERESIS_C) g_storageCriticalLatched = false;
+
+  g_status.storageMaximumActive = g_storageMaximumLatched;
+  g_status.storageCriticalOvertemperatureActive = g_storageCriticalLatched;
+  g_status.storageOvertemperatureActive = g_storageMaximumLatched || g_storageCriticalLatched;
+
+  if (g_status.storageMaximumActive) {
     g_status.blockNormalPumpControl = true;
     g_status.mode = SafetyManager::SafetyMode::STORAGE_OVERTEMPERATURE;
     setMessage("Speicher-Maximaltemperatur erreicht");
   }
 
-  if (g_status.highestStorageTemperatureC >= ctx.config.storageCriticalTemperatureC) {
-    g_status.storageOvertemperatureActive = true;
+  if (g_status.storageCriticalOvertemperatureActive) {
     g_status.blockNormalPumpControl = true;
     g_status.mode = SafetyManager::SafetyMode::STORAGE_OVERTEMPERATURE;
-    setMessage("Speicher kritisch heiß");
+    setMessage("KRITISCH: Speicher-Uebertemperatur - Zwangskuehlung aktiv");
+  }
+}
+
+void syncStorageTemperatureAlarms(const AppContext& ctx) {
+  if (!ctx.config.storageProtectionEnabled || isnan(g_status.highestStorageTemperatureC)) {
+    Alarms::clear("safety_storage_maximum");
+    Alarms::clear("safety_storage_overtemperature");
+    return;
+  }
+
+  char message[120];
+  if (g_status.storageCriticalOvertemperatureActive) {
+    snprintf(message, sizeof(message),
+             "KRITISCHE Speichertemperatur %.1f C (Grenze %.1f C) - Zwangskuehlung",
+             g_status.highestStorageTemperatureC, ctx.config.storageCriticalTemperatureC);
+    Alarms::raise("safety_storage_overtemperature", Alarms::Severity::CRITICAL, message, false);
+    Alarms::clear("safety_storage_maximum");
+  } else {
+    Alarms::clear("safety_storage_overtemperature");
+    if (g_status.storageMaximumActive) {
+      snprintf(message, sizeof(message),
+               "Speicher-Maximaltemperatur %.1f C erreicht (Grenze %.1f C)",
+               g_status.highestStorageTemperatureC, ctx.config.sinkMaxC);
+      Alarms::raise("safety_storage_maximum", Alarms::Severity::WARNING, message, true);
+    } else {
+      Alarms::clear("safety_storage_maximum");
+    }
   }
 }
 
@@ -399,6 +462,9 @@ void evaluate(AppContext& ctx) {
   evaluateCollectorStagnation(ctx);
   evaluateFrostProtection(ctx);
 
+  // Alarm synchron zum schnellen Safety-Zyklus erzeugen, nicht erst im 60-s-Runtime-Update.
+  syncStorageTemperatureAlarms(ctx);
+
   if (g_status.mode != SafetyMode::NORMAL) {
     Serial.print("SAFETY: ");
     Serial.print(modeToText(g_status.mode));
@@ -435,15 +501,53 @@ void applyOutputs(AppContext& ctx) {
   Serial.println(s.message);
   Serial.flush();
 
+  // Kritische Speicheruebertemperatur hat Vorrang vor einem gleichzeitigen
+  // allgemeinen Sensorfehler. Jede einzelne Notkuehlroute prueft ihre benoetigten
+  // Sensoren nochmals, sodass nur sicher messbare Wege aktiviert werden.
+  if (s.storageCriticalOvertemperatureActive) {
+    // Keine aktive Waermeerzeugung mehr in den Speicher. Der Ofen kann physisch
+    // nicht abrupt gestoppt werden, deshalb nur Luftklappe sicher schliessen und
+    // seine Pumpenhardware nicht zwangsweise abschalten.
+    AuxHeater::allOff(ctx);
+    OvenControl::applyStandbyServoPosition(ctx);
+    Pumps::safetyAllOffExceptOven(ctx);
+
+    g_status.storageForcedCoolingPumpCount = Pumps::safetyForceStorageCooling(
+      ctx,
+      ctx.config.storageCriticalTemperatureC - STORAGE_CRITICAL_HYSTERESIS_C,
+      STORAGE_COOLING_MIN_DELTA_C,
+      STORAGE_COOLING_PWM_PERCENT
+    );
+    g_status.storageForcedCoolingPumpCount += HeatingCircuits::safetyHeatDump(
+      ctx,
+      ctx.config.storageCriticalTemperatureC - STORAGE_CRITICAL_HYSTERESIS_C,
+      STORAGE_COOLING_MIN_DELTA_C
+    );
+    g_status.storageForcedCoolingActive = g_status.storageForcedCoolingPumpCount > 0;
+
+    if (!g_status.storageForcedCoolingActive) {
+      setMessage("KRITISCH: Speicher heiss - kein ausreichend kuehler konfigurierter Abnehmer verfuegbar");
+    }
+    return;
+  }
+
   if (s.sensorFaultActive) {
-    // Ofenbetrieb wird später separat über die Ofenlogik zugelassen.
+    // Ofenbetrieb wird spaeter separat ueber die Ofenlogik zugelassen.
     // Solar-/Speicherpumpen werden hier sicher abgeschaltet.
     Pumps::safetyAllOffExceptOven(ctx);
     return;
   }
 
-  if (s.storageOvertemperatureActive) {
-    Pumps::safetyAllOff(ctx);
+  if (s.storageMaximumActive) {
+    // Maximaltemperatur ist noch nicht die kritische Stufe. Falls die explizit
+    // konfigurierte Nachtkuehlung moeglich ist, darf sie arbeiten; andernfalls
+    // wird weitere Speicherbeladung sicher gestoppt.
+    AuxHeater::allOff(ctx);
+    if (s.safetyNightCoolingActive) {
+      Pumps::safetyForceNightCooling(ctx, s.nightCoolingPumpPercent);
+    } else {
+      Pumps::safetyAllOffExceptOven(ctx);
+    }
     return;
   }
 

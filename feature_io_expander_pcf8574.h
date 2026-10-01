@@ -15,5 +15,8 @@ namespace Pcf8574Io {
 
   bool deselectMaxCs();
   bool selectMax(MaxChannel ch);
+  // Diagnostic helper: set all PCF outputs HIGH, then pull exactly one bit LOW.
+  // Used only by MAX31865 bus diagnostics.
+  bool selectSingleBitLow(uint8_t bitIndex);
   bool deselectAllCs();
 }

@@ -21,3 +21,9 @@ Desktop.ini
 
 # Temporary
 *.tmp
+# SD runtime / private configuration (if sd/ is stored in this repository)
+sd/logs/
+sd/runtime/
+sd/config/system.cfg
+sd/config/sensors.cfg
+sd/config/heat_sources.cfg

@@ -73,9 +73,22 @@ void setDuty(uint8_t channel, uint8_t percent, PwmProfile profile) {
 
   g_dutyPercent[channel] = percent;
 
-  // HEATING = direkte Logik, SOLAR = elektrisch invertiert.
-  // SOLAR: logisch EIN/100% ergibt physikalisch 0%/LOW.
-  uint8_t effectivePercent = (profile == PwmProfile::SOLAR) ? (100 - percent) : percent;
+  // "percent" ist immer die gewuenschte Pumpenleistung: 0 % = AUS, 100 % = MAX.
+  //
+  // Die reale SolarCtrl-Ausgangsstufe mit TLP293-4 ist netto NICHT invertierend:
+  // PCA LOW  -> Optokoppler EIN  -> PWM_OUT LOW
+  // PCA HIGH -> Optokoppler AUS  -> PWM_OUT HIGH
+  // Das Tastverhaeltnis am PCA entspricht daher dem Tastverhaeltnis an PWM_OUT.
+  //
+  //   UPM3 Profil C / SOLAR:
+  //     Pumpeneingang soll mit der Leistung steigen.
+  //     => PCA/PWM_OUT = Pumpenleistung.
+  //
+  //   UPM3 Profil A / HEATING:
+  //     Pumpeneingang muss mit steigender Leistung fallen.
+  //     => PCA/PWM_OUT = 100 - Pumpenleistung.
+  const uint8_t effectivePercent =
+      (profile == PwmProfile::HEATING) ? (100 - percent) : percent;
 
   // Wichtiger Schutz fuer Schaltausgaenge: Wenn derselbe physikalische
   // Sollwert bereits am PCA9685 anliegt, nicht erneut schreiben. Damit kann
@@ -124,11 +137,9 @@ void allOff() {
 void allOff(const ConfigData& config) {
   if (!g_started) return;
 
-  // Jeder verwendbare PO-Kanal wird logisch AUS geschaltet. Die elektrische
-  // Pegellage ergibt sich aus dem jeweiligen Profil:
-  //   SOLAR   -> logisch AUS = physikalisch 100 % / HIGH
-  //   HEATING -> logisch AUS = physikalisch   0 % / LOW
-  // Damit ist ein globales All-Off nicht mehr auf ein einziges Profil festgelegt.
+  // Jeder verwendbare PO-Kanal wird mit 0 % logischer Pumpenleistung AUS
+  // geschaltet. setDuty() bildet diesen logischen Wert profil- und PCB-gerecht
+  // auf das physikalische PCA9685-Signal ab.
   for (uint8_t ch = 0; ch < PWM_OUTPUT_COUNT; ch++) {
     setDuty(ch, 0, config.pwmOutputs[ch].profile);
   }

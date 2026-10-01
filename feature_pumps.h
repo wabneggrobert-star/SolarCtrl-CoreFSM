@@ -11,6 +11,10 @@ namespace Pumps {
   bool safetyForceRunForSource(AppContext& ctx, HeatSourceRole sourceRole, float pwmPercent);
   bool safetyForceHeatDumpForSource(AppContext& ctx, HeatSourceRole sourceRole, float pwmPercent);
   bool safetyForceNightCooling(AppContext& ctx, float pwmPercent);
+  // Critical storage overtemperature: use only configured hydraulic paths whose
+  // measured destination/collector is sufficiently cooler than the hot storage.
+  // Returns the number of pumps that are actually running for heat dump.
+  uint8_t safetyForceStorageCooling(AppContext& ctx, float criticalTemperatureC, float minimumDeltaC, float pwmPercent);
 
   // Spezialanforderung der Ofenlogik: Die Pumpe wird weiterhin im Pumpenmenue
   // konfiguriert. Das Ofenmodul entscheidet nur, ob Waerme abgefuehrt werden soll.

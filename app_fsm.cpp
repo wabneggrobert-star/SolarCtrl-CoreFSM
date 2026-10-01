@@ -9,6 +9,7 @@
 #include "feature_relay_outputs.h"
 #include "feature_sdcard.h"
 #include "feature_sensor_assignments.h"
+#include "feature_sensor_roles.h"
 #include "feature_sink_ds18b20.h"
 #include "feature_storage.h"
 #include "feature_ui.h"
@@ -19,6 +20,12 @@
 #include "feature_alarms.h"
 #include "feature_output_validation.h"
 #include "feature_energy_meter.h"
+#include "feature_mqtt.h"
+#include "feature_time.h"
+#include "feature_forecast.h"
+#include "feature_ml_optimizer.h"
+#include "feature_fluid_properties.h"
+#include "feature_history.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -48,6 +55,63 @@ namespace {
   bool validSoftApIp() {
     IPAddress ip = WiFi.softAPIP();
     return !(ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] == 0);
+  }
+
+  // Die zentrale FSM darf keinen festen Top-Sensor mehr als einzigen Sink erzwingen.
+  // Die Pumpen-/Routinglogik arbeitet bereits mit frei konfigurierten Speicherrollen.
+  // Fuer den globalen Plausibilitaetscheck wird deshalb zuerst ein tatsaechlich
+  // konfiguriertes Pumpenziel gesucht. Nur wenn keines vorhanden ist, folgen die
+  // Legacy-Prioritaet und zuletzt irgendein gueltig zugewiesener Speichersensor.
+  bool readConfiguredStorageSink(AppContext& ctx, Ds18Role& role, float& tempC, bool& valid) {
+    role = Ds18Role::NONE;
+    tempC = NAN;
+    valid = false;
+
+    auto tryRole = [&](Ds18Role candidate) -> bool {
+      if (!SensorRoles::isSinkRole(candidate)) return false;
+      float candidateC = NAN;
+      bool candidateValid = false;
+      if (!SensorAssignments::readByRole(ctx.assignments, candidate, candidateC, candidateValid)) return false;
+      if (!candidateValid || isnan(candidateC)) return false;
+      role = candidate;
+      tempC = candidateC;
+      valid = true;
+      return true;
+    };
+
+    // 1) Reale Ziele aktivierter Pumpen haben Vorrang.
+    for (uint8_t p = 0; p < MAX_PUMPS; p++) {
+      const PumpConfig& pump = ctx.config.pumps[p];
+      if (!pump.enabled || pump.mode == PumpMode::OFF) continue;
+
+      for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
+        const PumpRouteTargetConfig& target = pump.targets[t];
+        if (target.enabled && tryRole(target.sinkRole)) return true;
+      }
+
+      if (tryRole(pump.sinkRole)) return true;
+    }
+
+    // 2) Rueckwaertskompatibilitaet fuer alte Ein-Sink-Konfigurationen.
+    if (tryRole(SensorAssignments::activeSinkRole(ctx.config))) return true;
+
+    // 3) Falls noch kein Pumpenziel konfiguriert ist, akzeptiere jeden gueltig
+    //    zugewiesenen Speicher-Sink. Das verhindert einen falschen globalen Fault
+    //    nur wegen fehlendem Boiler-Top/Puffer-Top.
+    static const Ds18Role storageRoles[] = {
+      Ds18Role::SINK_BOILER_TOP,
+      Ds18Role::BOILER_BOTTOM,
+      Ds18Role::SINK_BUFFER_TOP,
+      Ds18Role::BUFFER_HIGH,
+      Ds18Role::BUFFER_MID,
+      Ds18Role::BUFFER_BOTTOM
+    };
+
+    for (Ds18Role candidate : storageRoles) {
+      if (tryRole(candidate)) return true;
+    }
+
+    return false;
   }
 }
 
@@ -138,6 +202,18 @@ void AppFSM::loop() {
 
   if (ctx_.networkInitialized) {
     serviceNetwork();
+    TimeService::process(ctx_);
+    Forecast::process(ctx_);
+    MqttBridge::process(ctx_);
+  }
+  // ML ist ein optionaler Overlay-Layer. Es darf weder Safety noch die normale
+  // FSM blockieren; bei fehlenden Daten bleibt es automatisch passiv.
+  MlOptimizer::process(ctx_, ctx_.commissioning.active || UI::commissioningTestActive());
+  // History ist optional und laeuft nur in einer freien IDLE-Phase. Bei aktivem
+  // Safety-Eingriff wird bewusst nicht auf SD geschrieben, damit Schutz und
+  // normale Regelung immer Vorrang vor Logging haben.
+  if (ctx_.state == SystemState::IDLE && !SafetyManager::status().blockNormalPumpControl) {
+    History::process(ctx_);
   }
   Alarms::process(ctx_);
 }
@@ -204,6 +280,10 @@ void AppFSM::stateLoadConfig() {
 
   OvenControl::begin(ctx_);
   EnergyMeter::begin(ctx_);
+  TimeService::begin(ctx_);
+  Forecast::begin(ctx_);
+  MlOptimizer::begin(ctx_);
+  History::begin(ctx_);
 
   ctx_.diag.bootCount++;
   Storage::saveDiagnostics(ctx_.diag);
@@ -343,6 +423,9 @@ void AppFSM::stateInitNetwork() {
     Serial.println("WLAN-Client deaktiviert. Nur SoftAP aktiv.");
   }
 
+  // MQTT ist rein additiv. Fehlender Broker/WLAN darf die Regelung nie blockieren.
+  MqttBridge::begin(ctx_);
+
   changeState(SystemState::INIT_UI);
 }
 
@@ -467,9 +550,9 @@ void AppFSM::stateSelfTest() {
 
   EnergyMeter::process(ctx_);
 
-  Ds18Role sinkRole = SensorAssignments::activeSinkRole(ctx_.config);
-  SensorAssignments::readByRole(
-    ctx_.assignments,
+  Ds18Role sinkRole = Ds18Role::NONE;
+  readConfiguredStorageSink(
+    ctx_,
     sinkRole,
     ctx_.sensors.sinkC,
     ctx_.sensors.sinkValid
@@ -534,9 +617,9 @@ void AppFSM::stateValidateSensors() {
 
   EnergyMeter::process(ctx_);
 
-  Ds18Role sinkRole = SensorAssignments::activeSinkRole(ctx_.config);
-  SensorAssignments::readByRole(
-    ctx_.assignments,
+  Ds18Role sinkRole = Ds18Role::NONE;
+  readConfiguredStorageSink(
+    ctx_,
     sinkRole,
     ctx_.sensors.sinkC,
     ctx_.sensors.sinkValid
@@ -570,18 +653,33 @@ void AppFSM::stateValidateSensors() {
 }
 
 void AppFSM::stateComputeControl() {
-  if (ctx_.commissioning.active) {
-
-  Serial.println("TESTMODUS AKTIV - Regelung pausiert");
-  Serial.flush();
-
-  return;
-}
   if (ctx_.sensors.activeHeatSource.valid && ctx_.sensors.sinkValid) {
     ctx_.control.diffC = ctx_.sensors.activeHeatSource.tempC - ctx_.sensors.sinkC;
   } else {
     ctx_.control.diffC = NAN;
   }
+
+  // Safety wird auch im Service-/Inbetriebnahme-Test ausgewertet. Ein manueller
+  // Test darf einen echten kritischen Speicherzustand nicht maskieren.
+  SafetyManager::evaluate(ctx_);
+  const auto& safetyStatus = SafetyManager::status();
+
+  if (safetyStatus.blockNormalPumpControl) {
+    Serial.print("SAFETY ACTIVE: ");
+    Serial.println(safetyStatus.message);
+    Serial.flush();
+
+    SafetyManager::applyOutputs(ctx_);
+    changeState(SystemState::IDLE);
+    return;
+  }
+
+  if (ctx_.commissioning.active) {
+    Serial.println("TESTMODUS AKTIV - Regelung pausiert");
+    Serial.flush();
+    return;
+  }
+
   if (UI::commissioningTestActive()) {
     Serial.println("INBETRIEBNAHME TESTMODUS: normale Ausgangslogik pausiert");
     Serial.flush();
@@ -589,31 +687,11 @@ void AppFSM::stateComputeControl() {
     return;
   }
 
-  SafetyManager::evaluate(ctx_);
-  const auto& safetyStatus = SafetyManager::status();
-
-  // Safety hat Vorrang
-  if (safetyStatus.blockNormalPumpControl) {
-    
-    Serial.print("SAFETY ACTIVE: ");
-    Serial.println(safetyStatus.message);
-    Serial.flush();
-
-    // Beispiel:
-    // Hier später:
-   SafetyManager::applyOutputs(ctx_);
-
-    // Normale Pumpenlogik blockieren
-    changeState(SystemState::IDLE);
-    return;
-  }
-
-  Valves::process(ctx_);  
+  Valves::process(ctx_);
   AuxHeater::process(ctx_);
   OvenControl::process(ctx_);
   Pumps::process(ctx_);
   HeatingCircuits::process(ctx_);
-
 
   ctx_.diag.lastCollectorC = ctx_.sensors.activeHeatSource.tempC;
   ctx_.diag.lastSinkC = ctx_.sensors.sinkC;
@@ -642,6 +720,20 @@ void AppFSM::stateUpdateRuntime() {
     Alarms::clear("wifi_sta_disconnected");
   }
 
+  // Plausibilitaetswarnung zwischen gemessenem Glykol-Frostschutz und Safety-Auslegung.
+  // Reine Warnung: sie blockiert weder Grundregelung noch Safety-Ausgaenge.
+  if (ctx_.config.solarFluidType == SolarFluidType::GLYCOL) {
+    const FluidProperties::Result fluid = FluidProperties::evaluate(ctx_.config, 40.0f);
+    if (!fluid.safetyCompatible) {
+      Alarms::raise("glycol_freeze_protection_mismatch", Alarms::Severity::WARNING,
+                    "Gemessener Glykol-Frostschutz reicht fuer die Safety-Auslegung nicht aus", true);
+    } else {
+      Alarms::clear("glycol_freeze_protection_mismatch");
+    }
+  } else {
+    Alarms::clear("glycol_freeze_protection_mismatch");
+  }
+
   String outputValidationError;
   if (!OutputValidation::validateAll(ctx_, outputValidationError)) {
     Alarms::raise("output_config_invalid", Alarms::Severity::CRITICAL, outputValidationError.c_str(), false);
@@ -656,9 +748,9 @@ void AppFSM::stateUpdateRuntime() {
     Alarms::clear("safety_collector_stagnation");
   }
 
-  if (safetyStatus.storageOvertemperatureActive) {
-    Alarms::raise("safety_storage_overtemperature", Alarms::Severity::CRITICAL, "Speicher-Uebertemperatur aktiv", false);
-  } else {
+  // Speicheralarme werden direkt im schnellen Safety-Zyklus synchronisiert,
+  // damit die kritische Temperatur nicht vom Runtime-Save-Intervall abhaengt.
+  if (!safetyStatus.storageCriticalOvertemperatureActive) {
     Alarms::clear("safety_storage_overtemperature");
   }
 

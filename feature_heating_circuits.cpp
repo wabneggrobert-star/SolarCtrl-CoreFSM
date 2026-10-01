@@ -5,6 +5,8 @@
 #include "feature_pwm_pca9685.h"
 #include "feature_alarms.h"
 #include "feature_pumps.h"
+#include "feature_ml_optimizer.h"
+#include "feature_time.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -74,11 +76,32 @@ Ds18Role fallbackRoomRole(uint8_t circuitIndex, const HeatingCircuitConfig& cfg)
   }
 }
 
+bool nightSetbackIsActive(const HeatingCircuitConfig& cfg) {
+  if (!cfg.nightSetbackEnabled) return false;
+  uint16_t nowMinute = 0;
+  if (!TimeService::localMinutesOfDay(nowMinute)) return false;
+
+  const uint16_t start = cfg.nightSetbackStartMinute > 1439 ? 1439 : cfg.nightSetbackStartMinute;
+  const uint16_t end = cfg.nightSetbackEndMinute > 1439 ? 1439 : cfg.nightSetbackEndMinute;
+  if (start == end) return true;
+  if (start < end) return nowMinute >= start && nowMinute < end;
+  return nowMinute >= start || nowMinute < end;
+}
+
+float effectiveRoomTarget(const HeatingCircuitConfig& cfg, bool nightActive) {
+  // Bei deaktivierter Nachtabsenkung bleibt die bestehende Regelung exakt erhalten.
+  if (!nightActive) return cfg.roomTargetTemperatureC;
+  const float target = cfg.roomTargetTemperatureC - clampFloat(cfg.nightSetbackK, 0.0f, 10.0f);
+  return clampFloat(target, 16.0f, 30.0f);
+}
+
 float targetFlowTemperature(AppContext& ctx, uint8_t circuitIndex, const HeatingCircuitConfig& cfg, HeatingCircuitRuntime& rt) {
   float target = cfg.fixedFlowTemperatureC;
 
   rt.outsideTemperatureC = NAN;
   rt.roomTemperatureC = NAN;
+  rt.nightSetbackActive = nightSetbackIsActive(cfg);
+  rt.effectiveRoomTargetTemperatureC = effectiveRoomTarget(cfg, rt.nightSetbackActive);
 
   if (cfg.controlMode == HeatingCircuitControlMode::WEATHER_COMPENSATED) {
     float outsideC = NAN;
@@ -94,7 +117,7 @@ float targetFlowTemperature(AppContext& ctx, uint8_t circuitIndex, const Heating
     bool roomValid = false;
     if (readDs18(ctx, fallbackRoomRole(circuitIndex, cfg), roomC, roomValid)) {
       rt.roomTemperatureC = roomC;
-      target += (cfg.roomTargetTemperatureC - roomC) * cfg.roomInfluenceK;
+      target += (rt.effectiveRoomTargetTemperatureC - roomC) * cfg.roomInfluenceK;
     }
   }
 
@@ -255,6 +278,82 @@ void allOff(AppContext& ctx) {
   }
 }
 
+
+uint8_t safetyHeatDump(AppContext& ctx, float criticalStorageTemperatureC, float minimumDeltaC) {
+  uint8_t running = 0;
+  minimumDeltaC = minimumDeltaC < 1.0f ? 1.0f : minimumDeltaC;
+
+  for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+    HeatingCircuitConfig& cfg = ctx.config.heatingCircuits[i];
+    HeatingCircuitRuntime& rt = ctx.heatingCircuitRuntime[i];
+
+    if (!cfg.enabled || cfg.bufferReferenceRole == Ds18Role::NONE) {
+      stopMixer(ctx, cfg, rt);
+      Pumps::applyHeatingCircuitPumpRequest(ctx, i, false, 0, NAN, NAN, false);
+      continue;
+    }
+
+    float storageC = NAN; bool storageValid = false;
+    float flowC = NAN; bool flowValid = false;
+    float returnC = NAN; bool returnValid = false;
+
+    readDs18(ctx, cfg.bufferReferenceRole, storageC, storageValid);
+    readDs18(ctx, effectiveFlowSensorRole(i, cfg), flowC, flowValid);
+    readDs18(ctx, effectiveReturnSensorRole(i, cfg), returnC, returnValid);
+
+    if (!storageValid || !flowValid || !returnValid ||
+        storageC < criticalStorageTemperatureC ||
+        (storageC - returnC) < minimumDeltaC ||
+        Pumps::configuredHeatingCircuitPumpIndex(ctx, i) < 0) {
+      stopMixer(ctx, cfg, rt);
+      Pumps::applyHeatingCircuitPumpRequest(ctx, i, false, 0, flowC, returnC, returnValid);
+      continue;
+    }
+
+    rt.active = true;
+    rt.flowTemperatureC = flowC;
+    rt.returnTemperatureC = returnC;
+    rt.spreadTemperatureC = flowC - returnC;
+    rt.targetFlowTemperatureC = cfg.maximumFlowTemperatureC;
+
+    // Hard safety boundary: never deliberately circulate an over-temperature
+    // floor/radiator supply. Close the mixer first; pump remains off until the
+    // measured flow is back at or below the configured maximum.
+    if (flowC > cfg.maximumFlowTemperatureC) {
+      pulseMixer(ctx, cfg, rt, -1);
+      Pumps::applyHeatingCircuitPumpRequest(ctx, i, false, 0, flowC, returnC, true);
+      rt.pumpActive = false;
+      rt.pumpPercent = 0;
+      continue;
+    }
+
+    const float marginC = 1.5f;
+    if (flowC < cfg.maximumFlowTemperatureC - marginC) {
+      pulseMixer(ctx, cfg, rt, +1);
+    } else {
+      stopMixer(ctx, cfg, rt);
+    }
+
+    const int8_t pumpIndex = Pumps::configuredHeatingCircuitPumpIndex(ctx, i);
+    const PumpConfig& pumpCfg = ctx.config.pumps[(uint8_t)pumpIndex];
+    const uint8_t percent = (uint8_t)roundf(clampFloat(pumpCfg.maxPwmPercent, pumpCfg.minPwmPercent, 100.0f));
+    const bool applied = Pumps::applyHeatingCircuitPumpRequest(ctx, i, true, percent, flowC, returnC, true);
+    rt.pumpActive = applied;
+    rt.pumpPercent = applied ? percent : 0;
+    if (applied) {
+      running++;
+      Serial.print("SAFETY HK-WAERMEABLEITUNG HK"); Serial.print(i + 1);
+      Serial.print(" | Speicher="); Serial.print(storageC);
+      Serial.print(" C | VL="); Serial.print(flowC);
+      Serial.print(" C | RL="); Serial.print(returnC);
+      Serial.print(" C | MaxVL="); Serial.println(cfg.maximumFlowTemperatureC);
+      Serial.flush();
+    }
+  }
+
+  return running;
+}
+
 void process(AppContext& ctx) {
   for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
     HeatingCircuitConfig& cfg = ctx.config.heatingCircuits[i];
@@ -271,6 +370,8 @@ void process(AppContext& ctx) {
       rt.roomTemperatureC = NAN;
       rt.outsideTemperatureC = NAN;
       rt.targetFlowTemperatureC = NAN;
+      rt.effectiveRoomTargetTemperatureC = NAN;
+      rt.nightSetbackActive = false;
       rt.spreadTemperatureC = NAN;
       rt.pumpPercent = 0;
       Alarms::clear(flowAlarmId(i).c_str());
@@ -296,6 +397,8 @@ void process(AppContext& ctx) {
       rt.roomTemperatureC = NAN;
       rt.outsideTemperatureC = NAN;
       rt.targetFlowTemperatureC = NAN;
+      rt.effectiveRoomTargetTemperatureC = NAN;
+      rt.nightSetbackActive = false;
       rt.spreadTemperatureC = NAN;
       rt.pumpPercent = 0;
       const String msg = flowAlarmMessage(i, flowRole);
@@ -317,6 +420,9 @@ void process(AppContext& ctx) {
     }
 
     float targetC = targetFlowTemperature(ctx, i, cfg, rt);
+    // ML darf den errechneten Vorlauf-Sollwert nur als Overlay und nur innerhalb
+    // der bereits konfigurierten Min-/Max-Grenzen verschieben.
+    targetC = MlOptimizer::adjustHeatingTarget(ctx, i, targetC, rt.roomTemperatureC, rt.outsideTemperatureC);
 
     // Frostschutz ueber Aussentemperatur oder Raum/Vorlauf.
     bool frostActive = false;

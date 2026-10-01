@@ -28,6 +28,10 @@ void recordInfo(const char* id, const char* message);
 
 bool acknowledge(const char* id);
 uint8_t acknowledgeAllNonCritical();
+void setBuzzerMuted(bool muted);
+bool buzzerMuted();
+const char* currentMessage();
+Severity currentSeverity();
 void clearHistory();
 void resetAll();
 

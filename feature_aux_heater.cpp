@@ -3,6 +3,8 @@
 #include "feature_pwm_pca9685.h"
 #include "feature_safety_manager.h"
 #include "feature_sensor_assignments.h"
+#include "feature_forecast.h"
+#include "feature_ml_optimizer.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -13,6 +15,7 @@ enum class AuxState : uint8_t {
   IDLE,
   PRE_RUN,
   HEATING,
+  RELEASE_RAMPDOWN,
   COOLDOWN
 };
 
@@ -260,6 +263,24 @@ void enterCooldown(AppContext& ctx) {
   g_stateStartedMs = millis();
 }
 
+void beginReleaseRampdown(AppContext& ctx, uint32_t now) {
+  // Manuelle Freigabe entzogen: niemals die Heizstaebe hart gemeinsam abschalten.
+  // Eine aktive Stufe wird sofort herausgenommen, weitere folgen mit dem gleichen
+  // Stufenabstand wie beim Zuschalten. Die Pumpe bleibt durchgehend aktiv.
+  setPump(ctx, true);
+  if (g_activeStageCount > 0) {
+    setHeaterStageCount(ctx, g_activeStageCount - 1);
+    g_lastStageChangeMs = now;
+  }
+  if (g_activeStageCount == 0) {
+    g_state = AuxState::COOLDOWN;
+    g_stateStartedMs = now;
+  } else {
+    g_state = AuxState::RELEASE_RAMPDOWN;
+    g_stateStartedMs = now;
+  }
+}
+
 } // namespace
 
 namespace AuxHeater {
@@ -294,11 +315,31 @@ void resumeAfterTestMode() {
 }
 
 bool heatingActive() {
-  return g_state == AuxState::HEATING;
+  // Waerend des geordneten manuellen Abschaltens koennen noch Heizstufen aktiv sein.
+  return g_state == AuxState::HEATING || g_state == AuxState::RELEASE_RAMPDOWN;
 }
 
 bool cooldownActive() {
   return g_state == AuxState::COOLDOWN;
+}
+
+bool pumpActive() {
+  return g_pumpApplied && g_pumpDesired;
+}
+
+uint8_t activeStageCount() {
+  return g_activeStageCount;
+}
+
+const char* stateText() {
+  switch (g_state) {
+    case AuxState::PRE_RUN: return "Vorlauf";
+    case AuxState::HEATING: return "Heizen";
+    case AuxState::RELEASE_RAMPDOWN: return "Abschalten";
+    case AuxState::COOLDOWN: return "Nachlauf";
+    case AuxState::IDLE:
+    default: return "Standby";
+  }
 }
 
 void process(AppContext& ctx) {
@@ -328,7 +369,16 @@ void process(AppContext& ctx) {
       heatersOff(ctx);
       setPump(ctx, false);
 
+      // Manuell gesperrt: Zusatzheizung bleibt betriebsbereit konfiguriert,
+      // startet aber keinen neuen Heizzyklus. Safety bleibt davon unberuehrt.
+      if (!cfg.userReleaseEnabled) break;
+
       if (targetTemperatureC < cfg.minimumTemperatureC) {
+        if (MlOptimizer::shouldDelayAuxHeater(ctx, targetTemperatureC)) {
+          // Komfortfunktion: nur verzögern, niemals Grundregelung oder Safety ersetzen.
+          Serial.println("AUX HEATER: Forecast-Verzoegerung aktiv");
+          break;
+        }
         setPump(ctx, true);
         g_state = AuxState::PRE_RUN;
         g_stateStartedMs = now;
@@ -339,6 +389,12 @@ void process(AppContext& ctx) {
     case AuxState::PRE_RUN:
       heatersOff(ctx);
       setPump(ctx, true);
+
+      if (!cfg.userReleaseEnabled) {
+        Serial.println("AUX HEATER: Freigabe im Vorlauf entzogen, Nachlauf gestartet");
+        enterCooldown(ctx);
+        break;
+      }
 
       // Falls der Speicher waehrend des Pumpenvorlaufs bereits durch eine andere
       // Waermequelle auf Ziel + Hysterese steigt, wird die Zusatzheizung abgebrochen.
@@ -361,6 +417,20 @@ void process(AppContext& ctx) {
     case AuxState::HEATING: {
       setPump(ctx, true);
 
+      if (!cfg.userReleaseEnabled) {
+        Serial.println("AUX HEATER: Freigabe entzogen, geordnetes Abschalten gestartet");
+        beginReleaseRampdown(ctx, now);
+        break;
+      }
+
+      // Optionaler ML-Overlay: nur bei freigegebenem Modell und niemals unterhalb
+      // der vom Nutzer gesetzten Mindesttemperatur. Safety bleibt davor dominant.
+      if (MlOptimizer::shouldStopAuxHeaterEarly(ctx, targetTemperatureC)) {
+        Serial.println("AUX HEATER: ML empfiehlt fruehes Abschalten, Nachlauf gestartet");
+        enterCooldown(ctx);
+        break;
+      }
+
       const uint8_t requestedStages = requestedStageCount(cfg, targetTemperatureC);
 
       if (requestedStages == 0) {
@@ -372,6 +442,24 @@ void process(AppContext& ctx) {
       applyStageRequest(ctx, requestedStages, now);
       break;
     }
+
+    case AuxState::RELEASE_RAMPDOWN:
+      setPump(ctx, true);
+
+      if (g_activeStageCount > 0 &&
+          (uint32_t)(now - g_lastStageChangeMs) >= AUX_STAGE_STEP_DELAY_MS) {
+        setHeaterStageCount(ctx, g_activeStageCount - 1);
+        g_lastStageChangeMs = now;
+        Serial.print("AUX HEATER: Freigabe aus - Reststufen ");
+        Serial.println(g_activeStageCount);
+      }
+
+      if (g_activeStageCount == 0) {
+        g_state = AuxState::COOLDOWN;
+        g_stateStartedMs = now;
+        Serial.println("AUX HEATER: Heizstaebe aus, Pumpennachlauf gestartet");
+      }
+      break;
 
     case AuxState::COOLDOWN:
       heatersOff(ctx);

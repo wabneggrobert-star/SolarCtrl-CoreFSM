@@ -2,6 +2,8 @@
 #include "config.h"
 #include "feature_sensor_assignments.h"
 #include "feature_storage.h"
+#include "feature_time.h"
+#include "feature_fluid_properties.h"
 #include <Arduino.h>
 #include <SD.h>
 #include <math.h>
@@ -42,11 +44,25 @@ void detachFeedback() {
 
 bool ensureLogFile() {
   if (!SD.exists("/logs")) SD.mkdir("/logs");
-  const bool needsHeader = !SD.exists(FILE_ENERGY_METER_LOG);
+  bool needsHeader = !SD.exists(FILE_ENERGY_METER_LOG);
+  if (!needsHeader) {
+    File check = SD.open(FILE_ENERGY_METER_LOG, FILE_READ);
+    if (check) {
+      String first = check.readStringUntil('\n');
+      check.close();
+      first.trim();
+      if (!first.startsWith("timestamp,") || first.indexOf("glycol_type") < 0) {
+        const char* legacy = "/logs/energy_meter_legacy.csv";
+        if (SD.exists(legacy)) SD.remove(legacy);
+        SD.rename(FILE_ENERGY_METER_LOG, legacy);
+        needsHeader = true;
+      }
+    }
+  }
   File f = SD.open(FILE_ENERGY_METER_LOG, FILE_APPEND);
   if (!f) return false;
   if (needsHeader || f.size() == 0) {
-    f.println("boot_count,uptime_s,pulses_total,volume_l_total,flow_l_min,flow_temp_c,return_temp_c,delta_t_k,power_kw,energy_kwh_total,temp_valid");
+    f.println("timestamp,boot_count,uptime_s,pulses_total,volume_l_total,flow_l_min,flow_temp_c,return_temp_c,delta_t_k,power_kw,energy_kwh_total,temp_valid,fluid_type,glycol_type,freeze_protection_c,glycol_pct,energy_factor_wh_per_l_k");
   }
   f.close();
   return true;
@@ -63,6 +79,7 @@ void appendLog(const AppContext& ctx) {
   const EnergyMeterRuntime& rt = ctx.energyMeter;
   File f = SD.open(FILE_ENERGY_METER_LOG, FILE_APPEND);
   if (!f) return;
+  f.print(TimeService::valid() ? TimeService::isoTimestamp() : String("")); f.print(',');
   f.print(ctx.diag.bootCount); f.print(',');
   f.print(millis() / 1000UL); f.print(',');
   f.print(rt.totalPulses); f.print(',');
@@ -73,7 +90,12 @@ void appendLog(const AppContext& ctx) {
   f.print(csvFloat(rt.deltaTemperatureK, 2)); f.print(',');
   f.print(rt.thermalPowerKw, 3); f.print(',');
   f.print(rt.totalEnergyKWh, 5); f.print(',');
-  f.println(rt.temperatureValid ? 1 : 0);
+  f.print(rt.temperatureValid ? 1 : 0); f.print(',');
+  f.print((int)ctx.config.solarFluidType); f.print(',');
+  f.print((int)ctx.config.glycolType); f.print(',');
+  f.print(ctx.config.glycolMeasuredFreezeProtectionC, 1); f.print(',');
+  f.print(FluidProperties::glycolConcentrationPercent(ctx.config), 1); f.print(',');
+  f.println(EnergyMeter::effectiveEnergyFactorWhPerLiterK(ctx.config, rt.temperatureValid ? 0.5f*(rt.flowTemperatureC+rt.returnTemperatureC) : 40.0f), 5);
   f.close();
 }
 
@@ -98,6 +120,10 @@ bool sampleTemperatures(AppContext& ctx) {
 }
 
 namespace EnergyMeter {
+float effectiveEnergyFactorWhPerLiterK(const ConfigData& cfg, float meanFluidTemperatureC) {
+  return FluidProperties::volumetricHeatCapacityWhPerLiterK(cfg, meanFluidTemperatureC);
+}
+
 uint8_t gpioForFeedbackInput(uint8_t inputIndex) {
   if (inputIndex >= FEEDBACK_INPUT_COUNT) return PIN_UNUSED;
   return FEEDBACK_INPUT_PINS[inputIndex];
@@ -157,10 +183,12 @@ void process(AppContext& ctx) {
     rt.lastTemperatureSampleMs = now;
     sampleTemperatures(ctx);
   }
-  if (rt.temperatureValid && !isnan(rt.deltaTemperatureK) && rt.deltaTemperatureK > 0.0f && cfg.energyFactorWhPerLiterK > 0.0f) {
-    const double energyWh = liters * (double)rt.deltaTemperatureK * (double)cfg.energyFactorWhPerLiterK;
+  const float meanFluidC = rt.temperatureValid ? 0.5f * (rt.flowTemperatureC + rt.returnTemperatureC) : 40.0f;
+  const float energyFactor = effectiveEnergyFactorWhPerLiterK(ctx.config, meanFluidC);
+  if (rt.temperatureValid && !isnan(rt.deltaTemperatureK) && rt.deltaTemperatureK > 0.0f && energyFactor > 0.0f) {
+    const double energyWh = liters * (double)rt.deltaTemperatureK * (double)energyFactor;
     rt.totalEnergyKWh += energyWh / 1000.0;
-    rt.thermalPowerKw = rt.flowLitersPerMinute * rt.deltaTemperatureK * cfg.energyFactorWhPerLiterK * 0.06f;
+    rt.thermalPowerKw = rt.flowLitersPerMinute * rt.deltaTemperatureK * energyFactor * 0.06f;
   } else {
     rt.thermalPowerKw = 0.0f;
   }

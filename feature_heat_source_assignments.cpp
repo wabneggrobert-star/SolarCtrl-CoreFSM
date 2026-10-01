@@ -25,6 +25,7 @@ namespace {
       case MaxChannel::CH1: return 0;
       case MaxChannel::CH2: return 1;
       case MaxChannel::CH3: return 2;
+      case MaxChannel::CH4: return 3;
       default: return -1;
     }
   }
@@ -263,7 +264,7 @@ bool resolveHeatSources(AppContext& ctx) {
     }
 
     int idx = channelToIndex(a.channel);
-    if (idx < 0 || idx >= 3) {
+    if (idx < 0 || idx >= MAX_MAX31865_CHANNELS) {
       continue;
     }
 
