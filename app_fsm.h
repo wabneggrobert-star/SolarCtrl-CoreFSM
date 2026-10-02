@@ -14,6 +14,10 @@ public:
 
 private:
   AppContext ctx_;
+  bool selfTestSensorCycleStarted_ = false;
+  uint32_t lastFastControlAtMs_ = 0;
+
+  void runFastControlScheduler();
 
   void changeState(SystemState next);
   void ensureSoftAp();

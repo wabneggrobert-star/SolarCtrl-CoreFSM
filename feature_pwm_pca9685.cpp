@@ -5,6 +5,7 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
+#include "feature_build_flags.h"
 namespace {
   Adafruit_PWMServoDriver g_pwm = Adafruit_PWMServoDriver(PCA9685_ADDR);
   bool g_started = false;
@@ -30,9 +31,9 @@ bool begin() {
 
   if (!i2cDevicePresent(PCA9685_ADDR)) {
     g_started = false;
-    Serial.print("PCA9685 PWM begin 0x");
-    Serial.print(PCA9685_ADDR, HEX);
-    Serial.println(": NICHT GEFUNDEN");
+    DBG_PRINT("PCA9685 PWM begin 0x");
+    DBG_PRINT(PCA9685_ADDR, HEX);
+    DBG_PRINTLN(": NICHT GEFUNDEN");
     return false;
   }
 
@@ -52,9 +53,9 @@ bool begin() {
   // hat zu diesem Zeitpunkt bereits die Config geladen und ruft direkt
   // danach allOff(config) mit den echten SOLAR-/HEATING-Profilen auf.
 
-  Serial.print("PCA9685 PWM begin 0x");
-  Serial.print(PCA9685_ADDR, HEX);
-  Serial.println(": OK");
+  DBG_PRINT("PCA9685 PWM begin 0x");
+  DBG_PRINT(PCA9685_ADDR, HEX);
+  DBG_PRINTLN(": OK");
   return true;
 }
 

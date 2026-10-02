@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 
+#include "feature_build_flags.h"
 namespace {
   uint8_t g_state = 0xFF;
   bool g_started = false;
@@ -29,19 +30,19 @@ namespace {
 namespace Pcf8574Io {
 
 bool begin() {
-  Serial.println("Pcf8574Io::begin MAX-PCF");
-  Serial.flush();
+  DBG_PRINTLN("Pcf8574Io::begin MAX-PCF");
+  DBG_FLUSH();
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
 
   Wire.beginTransmission(PCF8574_MAX_ADDR);
   uint8_t errMax = Wire.endTransmission();
 
-  Serial.print("MAX-PCF 0x");
-  Serial.print(PCF8574_MAX_ADDR, HEX);
-  Serial.print(" -> ");
-  Serial.println(errMax);
-  Serial.flush();
+  DBG_PRINT("MAX-PCF 0x");
+  DBG_PRINT(PCF8574_MAX_ADDR, HEX);
+  DBG_PRINT(" -> ");
+  DBG_PRINTLN(errMax);
+  DBG_FLUSH();
 
   if (errMax != 0) {
     g_started = false;
@@ -53,9 +54,9 @@ bool begin() {
 
   g_started = applyState();
 
-  Serial.print("MAX-PCF write -> ");
-  Serial.println(g_started ? "OK" : "FEHLER");
-  Serial.flush();
+  DBG_PRINT("MAX-PCF write -> ");
+  DBG_PRINTLN(g_started ? "OK" : "FEHLER");
+  DBG_FLUSH();
 
   return g_started;
 }

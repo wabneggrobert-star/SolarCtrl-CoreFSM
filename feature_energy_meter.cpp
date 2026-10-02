@@ -109,8 +109,8 @@ bool sampleTemperatures(AppContext& ctx) {
   if (cfg.flowSensorRole == Ds18Role::NONE || cfg.returnSensorRole == Ds18Role::NONE) return false;
   float flowC = NAN, returnC = NAN;
   bool flowValid = false, returnValid = false;
-  const bool flowRead = SensorAssignments::readByRole(ctx.assignments, cfg.flowSensorRole, flowC, flowValid);
-  const bool returnRead = SensorAssignments::readByRole(ctx.assignments, cfg.returnSensorRole, returnC, returnValid);
+  const bool flowRead = SensorAssignments::readByRole(ctx.ds18b20, ctx.assignments, cfg.flowSensorRole, flowC, flowValid);
+  const bool returnRead = SensorAssignments::readByRole(ctx.ds18b20, ctx.assignments, cfg.returnSensorRole, returnC, returnValid);
   rt.flowTemperatureC = flowC;
   rt.returnTemperatureC = returnC;
   rt.temperatureValid = flowRead && returnRead && flowValid && returnValid && !isnan(flowC) && !isnan(returnC);

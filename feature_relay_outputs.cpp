@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 
+#include "feature_build_flags.h"
 namespace {
   uint8_t g_state = 0xFF;
   bool g_started = false;
@@ -43,10 +44,10 @@ bool begin(AppContext& ctx) {
   g_state = 0xFF;
   g_started = applyState();
 
-  Serial.print("Relais-PCF 0x");
-  Serial.print(PCF8574_RELAY_ADDR, HEX);
-  Serial.print(": ");
-  Serial.println(g_started ? "OK" : "FEHLER");
+  DBG_PRINT("Relais-PCF 0x");
+  DBG_PRINT(PCF8574_RELAY_ADDR, HEX);
+  DBG_PRINT(": ");
+  DBG_PRINTLN(g_started ? "OK" : "FEHLER");
 
   for (uint8_t i = 0; i < RELAY_COUNT; i++) {
     ctx.relayRuntime[i].state = false;
@@ -68,52 +69,52 @@ bool set(AppContext& ctx, uint8_t relayIndex, bool on) {
   setRawBit(relayIndex, cfg.activeLow, on);
 
   if (!applyState()) {
-    Serial.print("RELAIS ");
-    Serial.print(relayIndex);
-    Serial.println(" -> PCF FEHLER");
-    Serial.flush();
+    DBG_PRINT("RELAIS ");
+    DBG_PRINT(relayIndex);
+    DBG_PRINTLN(" -> PCF FEHLER");
+    DBG_FLUSH();
     return false;
   }
 
   ctx.relayRuntime[relayIndex].state = on;
 
-  Serial.print("RELAIS ");
-  Serial.print(relayIndex);
-  Serial.print(" -> ");
-  Serial.print(on ? "EIN" : "AUS");
+  DBG_PRINT("RELAIS ");
+  DBG_PRINT(relayIndex);
+  DBG_PRINT(" -> ");
+  DBG_PRINT(on ? "EIN" : "AUS");
 
-  Serial.print(" | Funktion: ");
+  DBG_PRINT(" | Funktion: ");
 
   switch (cfg.function) {
     case RelayFunction::PUMP_ENABLE:
-      Serial.print("PUMPE");
+      DBG_PRINT("PUMPE");
       break;
 
     case RelayFunction::ZONE_VALVE:
-      Serial.print("ZONENVENTIL");
+      DBG_PRINT("ZONENVENTIL");
       break;
 
     case RelayFunction::HEATER_ROD:
-      Serial.print("HEIZSTAB");
+      DBG_PRINT("HEIZSTAB");
       break;
 
     case RelayFunction::MIXER:
-      Serial.print("MISCHER");
+      DBG_PRINT("MISCHER");
       break;
 
     case RelayFunction::ALARM_BUZZER:
-      Serial.print("SUMMER/ALARM");
+      DBG_PRINT("SUMMER/ALARM");
       break;
 
     case RelayFunction::NONE:
     default:
-      Serial.print("NONE");
+      DBG_PRINT("NONE");
       break;
   }
 
-  Serial.print(" | ActiveLow=");
-  Serial.println(cfg.activeLow ? "true" : "false");
-  Serial.flush();
+  DBG_PRINT(" | ActiveLow=");
+  DBG_PRINTLN(cfg.activeLow ? "true" : "false");
+  DBG_FLUSH();
 
   return true;
 }
@@ -126,20 +127,20 @@ bool testSetRaw(AppContext& ctx, uint8_t relayIndex, bool on) {
   setRawBit(relayIndex, activeLow, on);
 
   if (!applyState()) {
-    Serial.print("TEST RELAIS ");
-    Serial.print(relayIndex + 1);
-    Serial.println(" -> PCF FEHLER");
-    Serial.flush();
+    DBG_PRINT("TEST RELAIS ");
+    DBG_PRINT(relayIndex + 1);
+    DBG_PRINTLN(" -> PCF FEHLER");
+    DBG_FLUSH();
     return false;
   }
 
   ctx.relayRuntime[relayIndex].state = on;
 
-  Serial.print("TEST RELAIS ");
-  Serial.print(relayIndex + 1);
-  Serial.print(" -> ");
-  Serial.println(on ? "EIN" : "AUS");
-  Serial.flush();
+  DBG_PRINT("TEST RELAIS ");
+  DBG_PRINT(relayIndex + 1);
+  DBG_PRINT(" -> ");
+  DBG_PRINTLN(on ? "EIN" : "AUS");
+  DBG_FLUSH();
 
   return true;
 }

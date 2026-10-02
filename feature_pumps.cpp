@@ -14,31 +14,195 @@
 #include <SD.h>
 #include <math.h>
 
+#include "feature_build_flags.h"
 namespace {
   struct PidState {
     float integral = 0.0f;
     float lastError = 0.0f;
+    uint32_t lastUpdateMs = 0;
+    bool initialized = false;
+
+    // Diagnosewerte des letzten echten PID-Schritts.
+    float dtSeconds = 0.0f;
+    float pTerm = 0.0f;
+    float iTerm = 0.0f;
+    float dTerm = 0.0f;
+    float rawOutput = 0.0f;
+    float finalOutput = 0.0f;
+    int8_t limitState = 0; // -1=min, 0=frei, +1=max
   };
 
   PidState pid[MAX_PUMPS];
 
-  // Feldtest-Diagnose: PWM-Regelverlauf fuer spaetere PID-Analyse.
-  // Bewusst nur Logging; die eigentliche Pumpenregelung wird nicht veraendert.
-  constexpr const char* PWM_TRACE_PATH = "/logs/pwm_trace.csv";
+  // -------------------------------------------------------------------------
+  // Pump Feedback V2 - nonblocking edge capture
+  // -------------------------------------------------------------------------
+  // Das PWM-Feedback (~75 Hz) wird nicht mehr aktiv vermessen. Ein CHANGE-
+  // Interrupt speichert nur Flanken/Zeitstempel; der normale Pumpenprozess
+  // liest spaeter einen konsistenten Snapshot.
+  struct FeedbackCapture {
+    volatile uint32_t lastRiseUs = 0;
+    volatile uint32_t pendingHighUs = 0;
+    volatile uint32_t sampleHighUs = 0;
+    volatile uint32_t samplePeriodUs = 0;
+    volatile uint32_t lastEdgeUs = 0;
+    volatile uint32_t sequence = 0;
+
+    uint8_t attachedPin = PIN_UNUSED;
+    uint8_t pumpIndex = 0;
+  };
+
+  FeedbackCapture feedbackCapture[MAX_PUMPS];
+  uint32_t feedbackConsumedSequence[MAX_PUMPS] = {};
+  bool feedbackRunArmed[MAX_PUMPS] = {};
+  portMUX_TYPE feedbackMux = portMUX_INITIALIZER_UNLOCKED;
+
+  // Bei nominell ~75 Hz entspricht das rund 7,5 Perioden ohne Flanke.
+  constexpr uint32_t FEEDBACK_SIGNAL_TIMEOUT_US = 100000UL;
+
+  void IRAM_ATTR feedbackEdgeIsr(void* arg) {
+    FeedbackCapture* c = static_cast<FeedbackCapture*>(arg);
+    if (!c) return;
+
+    const uint8_t pin = c->attachedPin;
+    if (pin == PIN_UNUSED) return;
+
+    const uint32_t nowUs = micros();
+    const bool high = digitalRead(pin) == HIGH;
+
+    portENTER_CRITICAL_ISR(&feedbackMux);
+
+    c->lastEdgeUs = nowUs;
+
+    if (high) {
+      if (c->lastRiseUs != 0) {
+        const uint32_t periodUs = (uint32_t)(nowUs - c->lastRiseUs);
+        const uint32_t highUs = c->pendingHighUs;
+
+        if (periodUs > 0 && highUs > 0 && highUs <= periodUs) {
+          c->sampleHighUs = highUs;
+          c->samplePeriodUs = periodUs;
+          c->sequence++;
+        }
+      }
+
+      c->lastRiseUs = nowUs;
+      c->pendingHighUs = 0;
+    } else {
+      if (c->lastRiseUs != 0) {
+        c->pendingHighUs = (uint32_t)(nowUs - c->lastRiseUs);
+      }
+    }
+
+    portEXIT_CRITICAL_ISR(&feedbackMux);
+  }
+
+  void clearFeedbackCaptureState(uint8_t pumpIndex) {
+    if (pumpIndex >= MAX_PUMPS) return;
+
+    portENTER_CRITICAL(&feedbackMux);
+    FeedbackCapture& c = feedbackCapture[pumpIndex];
+    c.lastRiseUs = 0;
+    c.pendingHighUs = 0;
+    c.sampleHighUs = 0;
+    c.samplePeriodUs = 0;
+    c.lastEdgeUs = 0;
+    c.sequence = 0;
+    portEXIT_CRITICAL(&feedbackMux);
+
+    feedbackConsumedSequence[pumpIndex] = 0;
+    feedbackRunArmed[pumpIndex] = false;
+  }
+
+  void detachFeedbackCapture(uint8_t pumpIndex) {
+    if (pumpIndex >= MAX_PUMPS) return;
+
+    FeedbackCapture& c = feedbackCapture[pumpIndex];
+    const uint8_t oldPin = c.attachedPin;
+
+    if (oldPin != PIN_UNUSED) {
+      detachInterrupt(oldPin);
+    }
+
+    c.attachedPin = PIN_UNUSED;
+    clearFeedbackCaptureState(pumpIndex);
+  }
+
+  void ensureFeedbackCapture(uint8_t pumpIndex, const PumpConfig& pump) {
+    if (pumpIndex >= MAX_PUMPS) return;
+
+    const uint8_t wantedPin =
+      (pump.mode == PumpMode::PWM && pump.feedbackPin != PIN_UNUSED)
+        ? pump.feedbackPin
+        : PIN_UNUSED;
+
+    FeedbackCapture& c = feedbackCapture[pumpIndex];
+    if (c.attachedPin == wantedPin) return;
+
+    detachFeedbackCapture(pumpIndex);
+
+    if (wantedPin == PIN_UNUSED) return;
+
+    pinMode(wantedPin, INPUT);
+
+    c.pumpIndex = pumpIndex;
+    c.attachedPin = wantedPin;
+    clearFeedbackCaptureState(pumpIndex);
+
+    attachInterruptArg(
+      wantedPin,
+      feedbackEdgeIsr,
+      &c,
+      CHANGE
+    );
+  }
+
+  void discardPendingFeedbackSample(uint8_t pumpIndex) {
+    if (pumpIndex >= MAX_PUMPS) return;
+
+    uint32_t sequence = 0;
+    portENTER_CRITICAL(&feedbackMux);
+    sequence = feedbackCapture[pumpIndex].sequence;
+    portEXIT_CRITICAL(&feedbackMux);
+
+    feedbackConsumedSequence[pumpIndex] = sequence;
+    feedbackRunArmed[pumpIndex] = false;
+  }
+
+  // Feldtest-Diagnose fuer PID V2. Der neue Trace bleibt getrennt vom alten
+  // pwm_trace.csv, damit Alt- und Neudaten nicht mit unterschiedlichen Spalten
+  // in derselben Datei landen.
+  constexpr const char* PWM_TRACE_PATH = "/logs/pwm_trace_v2.csv";
   constexpr uint32_t PWM_TRACE_INTERVAL_MS = 5000UL;
   uint32_t pwmTraceLastMs[MAX_PUMPS] = {};
 
-  float effectiveTargetDiffForTrace(const PumpConfig& p) {
-    float target = p.targetDiff;
+  float effectiveTargetDiffForTrace(
+    const AppContext& ctx,
+    uint8_t pumpIndex,
+    const PumpConfig& p
+  ) {
+    const MlOptimizer::SolarControlParams ml =
+      MlOptimizer::solarControlParams(ctx, pumpIndex, p);
+
+    float target = ml.effectiveTargetDiffC;
     if (p.activeTargetIndex < PUMP_ROUTE_TARGET_COUNT) {
       const PumpRouteTargetConfig& t = p.targets[p.activeTargetIndex];
+      // Ein explizites Ziel-Override ist eine harte Benutzerentscheidung und
+      // bleibt ueber ML.
       if (t.enabled && t.targetDiffOverride > 0.0f) target = t.targetDiffOverride;
     }
     return target;
   }
 
-  float effectiveHysteresisForTrace(const PumpConfig& p) {
-    float hyst = p.hysteresis;
+  float effectiveHysteresisForTrace(
+    const AppContext& ctx,
+    uint8_t pumpIndex,
+    const PumpConfig& p
+  ) {
+    const MlOptimizer::SolarControlParams ml =
+      MlOptimizer::solarControlParams(ctx, pumpIndex, p);
+
+    float hyst = ml.effectiveHysteresisC;
     if (p.activeTargetIndex < PUMP_ROUTE_TARGET_COUNT) {
       const PumpRouteTargetConfig& t = p.targets[p.activeTargetIndex];
       if (t.enabled && t.hysteresisOverride > 0.0f) hyst = t.hysteresisOverride;
@@ -66,7 +230,7 @@ namespace {
     if (!f) return;
 
     if (fresh) {
-      f.println("timestamp,uptime_ms,pump_index,state,active_target,source_c,sink_c,diff_c,target_diff_c,start_diff_c,hysteresis_c,pwm_pct,min_pwm_pct,max_pwm_pct,pid_kp,pid_ki,pid_kd,pid_error,pid_integral");
+      f.println("timestamp,uptime_ms,pump_index,state,active_target,source_c,sink_c,diff_c,target_diff_base_c,start_diff_base_c,hysteresis_base_c,target_diff_effective_c,start_diff_effective_c,hysteresis_effective_c,pwm_pct,flow_l_min,min_pwm_pct,max_pwm_pct,pid_kp_base,pid_ki_base,pid_kd_base,pid_kp_effective,pid_ki_effective,pid_kd_effective,pid_error,pid_dt_s,p_term,i_term,d_term,pid_raw_pct,pid_final_pct,limit_state");
     }
 
     const String timestamp = TimeService::isoTimestamp();
@@ -76,9 +240,20 @@ namespace {
       if (!p.enabled || p.mode != PumpMode::PWM) continue;
       if (pwmTraceLastMs[i] != 0 && (uint32_t)(nowMs - pwmTraceLastMs[i]) < PWM_TRACE_INTERVAL_MS) continue;
 
-      const float targetDiff = effectiveTargetDiffForTrace(p);
-      const float hysteresis = effectiveHysteresisForTrace(p);
-      const float error = isfinite(p.lastDiffC) ? (p.lastDiffC - targetDiff) : NAN;
+      const MlOptimizer::SolarControlParams traceControl =
+        MlOptimizer::solarControlParams(ctx, i, p);
+
+      const float targetDiff =
+        effectiveTargetDiffForTrace(ctx, i, p);
+      const float hysteresis =
+        effectiveHysteresisForTrace(ctx, i, p);
+      const float startDiff =
+        traceControl.effectiveStartDiffC;
+
+      const float error =
+        isfinite(p.lastDiffC)
+          ? (p.lastDiffC - targetDiff)
+          : NAN;
 
       f.print(timestamp); f.print(',');
       f.print(nowMs); f.print(',');
@@ -93,18 +268,36 @@ namespace {
       f.print(',');
       if (isfinite(p.lastDiffC)) f.print(p.lastDiffC, 2);
       f.print(',');
-      f.print(targetDiff, 2); f.print(',');
+      f.print(p.targetDiff, 2); f.print(',');
       f.print(p.startDiff, 2); f.print(',');
+      f.print(p.hysteresis, 2); f.print(',');
+      f.print(targetDiff, 2); f.print(',');
+      f.print(startDiff, 2); f.print(',');
       f.print(hysteresis, 2); f.print(',');
       f.print(p.lastPwmPercent, 1); f.print(',');
+      f.print(ctx.energyMeter.flowLitersPerMinute, 3); f.print(',');
       f.print(p.minPwmPercent, 1); f.print(',');
       f.print(p.maxPwmPercent, 1); f.print(',');
       f.print(p.pidKp, 4); f.print(',');
       f.print(p.pidKi, 4); f.print(',');
       f.print(p.pidKd, 4); f.print(',');
+
+      const MlOptimizer::PidGains traceGains =
+        MlOptimizer::effectiveSolarPidGains(ctx, i, p);
+
+      f.print(traceGains.kp, 4); f.print(',');
+      f.print(traceGains.ki, 5); f.print(',');
+      f.print(traceGains.kd, 5); f.print(',');
+
       if (isfinite(error)) f.print(error, 2);
       f.print(',');
-      f.println(pid[i].integral, 4);
+      f.print(pid[i].dtSeconds, 3); f.print(',');
+      f.print(pid[i].pTerm, 4); f.print(',');
+      f.print(pid[i].iTerm, 4); f.print(',');
+      f.print(pid[i].dTerm, 4); f.print(',');
+      f.print(pid[i].rawOutput, 4); f.print(',');
+      f.print(pid[i].finalOutput, 4); f.print(',');
+      f.println(pid[i].limitState);
 
       pwmTraceLastMs[i] = nowMs;
     }
@@ -166,17 +359,58 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
     p.feedbackLastCheckedMs = 0;
   }
 
-  float computePID(uint8_t i, PumpConfig& cfg, float error) {
+  float computePID(AppContext& ctx, uint8_t i, PumpConfig& cfg, float error) {
     PidState& s = pid[i];
+    const uint32_t nowMs = millis();
 
-    s.integral += error * cfg.pidKi;
-    s.integral = clampFloat(s.integral, -100.0f, 100.0f);
+    float dt = 0.0f;
+    if (s.initialized && s.lastUpdateMs != 0) {
+      dt = (float)((uint32_t)(nowMs - s.lastUpdateMs)) / 1000.0f;
+      // Schutz gegen Ausreisser durch lange Pausen/Debugging. Die thermische
+      // Regelung soll nach einer Pause nicht mit einem riesigen I/D-Schritt reagieren.
+      dt = clampFloat(dt, 0.05f, 10.0f);
+    }
 
-    float derivative = (error - s.lastError) * cfg.pidKd;
+    const MlOptimizer::PidGains effectiveGains =
+      MlOptimizer::effectiveSolarPidGains(ctx, i, cfg);
+
+    const float pTerm = effectiveGains.kp * error;
+    float dTerm = 0.0f;
+    if (s.initialized && dt > 0.0f) {
+      dTerm = effectiveGains.kd * ((error - s.lastError) / dt);
+    }
+
+    // Zeitnormierter I-Anteil. Anti-Windup: Ein neuer Integralwert wird nur
+    // uebernommen, wenn er den Ausgang nicht weiter in eine bereits erreichte
+    // Saettigung hineintreibt.
+    float candidateIntegral = s.integral;
+    if (s.initialized && dt > 0.0f) {
+      candidateIntegral += error * effectiveGains.ki * dt;
+    }
+    candidateIntegral = clampFloat(candidateIntegral, -100.0f, 100.0f);
+
+    const float candidateRaw = cfg.minPwmPercent + pTerm + candidateIntegral + dTerm;
+    const bool saturatingHigh = candidateRaw > cfg.maxPwmPercent && error > 0.0f;
+    const bool saturatingLow  = candidateRaw < cfg.minPwmPercent && error < 0.0f;
+    if (!saturatingHigh && !saturatingLow) {
+      s.integral = candidateIntegral;
+    }
+
+    const float raw = cfg.minPwmPercent + pTerm + s.integral + dTerm;
+    const float out = clampFloat(raw, cfg.minPwmPercent, cfg.maxPwmPercent);
+
     s.lastError = error;
+    s.lastUpdateMs = nowMs;
+    s.initialized = true;
+    s.dtSeconds = dt;
+    s.pTerm = pTerm;
+    s.iTerm = s.integral;
+    s.dTerm = dTerm;
+    s.rawOutput = raw;
+    s.finalOutput = out;
+    s.limitState = (raw < cfg.minPwmPercent) ? -1 : ((raw > cfg.maxPwmPercent) ? 1 : 0);
 
-    float out = cfg.pidKp * error + s.integral + derivative;
-    return clampFloat(out, 0.0f, 100.0f);
+    return out;
   }
 
   bool heatSourceTempByRole(const SensorSnapshot& sensors, HeatSourceRole role, float& tempC, bool& valid) {
@@ -223,7 +457,7 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
       return false;
     }
 
-    SensorAssignments::readByRole(ctx.assignments, role, temperatureC, valid);
+    SensorAssignments::readByRole(ctx.ds18b20, ctx.assignments, role, temperatureC, valid);
     return valid && !isnan(temperatureC);
   }
 
@@ -386,10 +620,10 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
     if (Valves::isMoving(pump.valveIndex)) {
       stopPumpZeroPercent(ctx, pumpIndex, pump);
 
-      Serial.print("NACHTKUEHLUNG PUMPE ");
-      Serial.print(pumpIndex + 1);
-      Serial.println(": Ventil V2 faehrt auf Ziel B - Pumpe bleibt AUS");
-      Serial.flush();
+      DBG_PRINT("NACHTKUEHLUNG PUMPE ");
+      DBG_PRINT(pumpIndex + 1);
+      DBG_PRINTLN(": Ventil V2 faehrt auf Ziel B - Pumpe bleibt AUS");
+      DBG_FLUSH();
       return false;
     }
 
@@ -431,11 +665,11 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
 
     if (Valves::isMoving(pump.valveIndex)) {
       stopPumpZeroPercent(ctx, pumpIndex, pump);
-      Serial.print("SAFETY SPEICHERKUEHLUNG P");
-      Serial.print(pumpIndex + 1);
-      Serial.print(": Ventil faehrt auf Ziel ");
-      Serial.println(targetIndex == 1 ? "B" : "A");
-      Serial.flush();
+      DBG_PRINT("SAFETY SPEICHERKUEHLUNG P");
+      DBG_PRINT(pumpIndex + 1);
+      DBG_PRINT(": Ventil faehrt auf Ziel ");
+      DBG_PRINTLN(targetIndex == 1 ? "B" : "A");
+      DBG_FLUSH();
       return false;
     }
 
@@ -457,6 +691,7 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
     PumpRouting::closeAllTargets(ctx, i);
 
     resetPumpRuntime(p);
+    discardPendingFeedbackSample(i);
     pid[i] = {};
 
     if (p.relayIndex != PIN_UNUSED) {
@@ -474,68 +709,106 @@ uint8_t defaultFeedbackPinFor(uint8_t pumpIndex) {
     setPwmPercent(p, 0.0f);
 }
 
-  void updatePumpFeedback(PumpConfig& p) {
-    if (p.mode != PumpMode::PWM || p.feedbackPin == PIN_UNUSED || !p.state || p.lastPwmPercent < 10.0f) {
+  void updatePumpFeedback(uint8_t pumpIndex, PumpConfig& p) {
+    if (pumpIndex >= MAX_PUMPS) return;
+
+    ensureFeedbackCapture(pumpIndex, p);
+
+    uint32_t sampleHighUs = 0;
+    uint32_t samplePeriodUs = 0;
+    uint32_t lastEdgeUs = 0;
+    uint32_t sequence = 0;
+
+    portENTER_CRITICAL(&feedbackMux);
+    const FeedbackCapture& c = feedbackCapture[pumpIndex];
+    sampleHighUs = c.sampleHighUs;
+    samplePeriodUs = c.samplePeriodUs;
+    lastEdgeUs = c.lastEdgeUs;
+    sequence = c.sequence;
+    portEXIT_CRITICAL(&feedbackMux);
+
+    const uint32_t nowMs = millis();
+    const uint32_t nowUs = micros();
+    p.feedbackLastCheckedMs = nowMs;
+
+    const bool feedbackExpected =
+      p.mode == PumpMode::PWM &&
+      p.feedbackPin != PIN_UNUSED &&
+      p.state &&
+      p.lastPwmPercent >= 10.0f;
+
+    if (!feedbackExpected) {
+      p.feedbackSignalPresent = false;
+      p.feedbackError = false;
+      p.feedbackDutyPercent = NAN;
+      feedbackConsumedSequence[pumpIndex] = sequence;
+      feedbackRunArmed[pumpIndex] = false;
+      return;
+    }
+
+    if (!feedbackRunArmed[pumpIndex]) {
+      feedbackConsumedSequence[pumpIndex] = sequence;
+      feedbackRunArmed[pumpIndex] = true;
       p.feedbackSignalPresent = false;
       p.feedbackError = false;
       p.feedbackDutyPercent = NAN;
       return;
     }
 
-    const uint32_t now = millis();
-    if ((uint32_t)(now - p.feedbackLastCheckedMs) < 2000UL) {
-      return;
-    }
-    p.feedbackLastCheckedMs = now;
+    const bool signalFresh =
+      lastEdgeUs != 0 &&
+      (uint32_t)(nowUs - lastEdgeUs) <= FEEDBACK_SIGNAL_TIMEOUT_US;
 
-    // Feedback der PWM-Pumpe: ca. 75 Hz, Status ueber Duty Cycle.
-    // Timeout 20 ms deckt eine Periode bei 75 Hz ab, blockiert aber nicht dauerhaft.
-    const unsigned long highUs = pulseIn(p.feedbackPin, HIGH, 20000UL);
-    const unsigned long lowUs  = pulseIn(p.feedbackPin, LOW,  20000UL);
-
-    if (highUs == 0 || lowUs == 0) {
+    if (!signalFresh) {
       p.feedbackSignalPresent = false;
       p.feedbackError = true;
       p.feedbackDutyPercent = NAN;
       return;
     }
 
-    const float periodUs = (float)highUs + (float)lowUs;
-    if (periodUs <= 0.0f) {
+    if (sequence == 0 ||
+        samplePeriodUs == 0 ||
+        sampleHighUs == 0 ||
+        sampleHighUs > samplePeriodUs) {
       p.feedbackSignalPresent = false;
-      p.feedbackError = true;
+      p.feedbackError = false;
       p.feedbackDutyPercent = NAN;
       return;
     }
 
-    p.feedbackDutyPercent = ((float)highUs * 100.0f) / periodUs;
+    if (sequence != feedbackConsumedSequence[pumpIndex]) {
+      p.feedbackDutyPercent =
+        ((float)sampleHighUs * 100.0f) / (float)samplePeriodUs;
+      feedbackConsumedSequence[pumpIndex] = sequence;
+    }
+
     p.feedbackSignalPresent = true;
     p.feedbackError = false;
   }
 
   void printPumpSwitch(uint8_t index, bool on, const PumpConfig& p) {
-    Serial.print("PUMPE ");
-    Serial.print(index + 1);
-    Serial.print(" -> ");
-    Serial.print(on ? "EIN" : "AUS");
-    Serial.print(" | Relais=");
-    Serial.print(p.relayIndex);
-    Serial.print(" | Temperaturdifferenz=");
-    Serial.print(p.lastDiffC);
-    Serial.print(" | PWM=");
-    Serial.print(p.lastPwmPercent);
+    DBG_PRINT("PUMPE ");
+    DBG_PRINT(index + 1);
+    DBG_PRINT(" -> ");
+    DBG_PRINT(on ? "EIN" : "AUS");
+    DBG_PRINT(" | Relais=");
+    DBG_PRINT(p.relayIndex);
+    DBG_PRINT(" | Temperaturdifferenz=");
+    DBG_PRINT(p.lastDiffC);
+    DBG_PRINT(" | PWM=");
+    DBG_PRINT(p.lastPwmPercent);
 
     if (p.valveIndex != PIN_UNUSED) {
-      Serial.print(" | Ventil V2=");
-      Serial.print(p.valveIndex);
-      Serial.print(" | Ziel=");
-      if (p.activeTargetIndex == 0) Serial.print("A");
-      else if (p.activeTargetIndex == 1) Serial.print("B");
-      else Serial.print("-");
+      DBG_PRINT(" | Ventil V2=");
+      DBG_PRINT(p.valveIndex);
+      DBG_PRINT(" | Ziel=");
+      if (p.activeTargetIndex == 0) DBG_PRINT("A");
+      else if (p.activeTargetIndex == 1) DBG_PRINT("B");
+      else DBG_PRINT("-");
     }
 
-    Serial.println();
-    Serial.flush();
+    DBG_PRINTLN();
+    DBG_FLUSH();
   }
 }
 
@@ -553,12 +826,11 @@ void begin(AppContext& ctx) {
       p.feedbackPin = defaultFeedbackPinFor(i);
     }
 
-    if (p.feedbackPin != PIN_UNUSED) {
-      pinMode(p.feedbackPin, INPUT);
-    }
+    ensureFeedbackCapture(i, p);
 
     pid[i] = {};
     resetPumpRuntime(p);
+    discardPendingFeedbackSample(i);
 
     setPwmPercent(p, 0.0f);
 
@@ -578,6 +850,24 @@ void allOff(AppContext& ctx) {
 
   ctx.control.relayEnable = false;
   ctx.control.pwmPercent = 0;
+}
+
+void processFast(AppContext& ctx) {
+  // Absichtlich KEINE Regelung hier:
+  // - kein PumpRouting::resolve()
+  // - kein computePID()
+  // - keine Sollwertentscheidung
+  //
+  // Der Fast-Control-Scheduler darf denselben 2-s-Sensorsnapshot beliebig oft
+  // sehen, ohne den PID-Integrator mehrfach zu fuettern. Nur die per Interrupt
+  // erfasste Pumpenrueckmeldung wird ausgewertet.
+  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
+    PumpConfig& p = ctx.config.pumps[i];
+
+    // ensureFeedbackCapture() steckt in updatePumpFeedback() und bindet einen
+    // geaenderten feedbackPin/PumpMode bei Bedarf ohne Neustart neu.
+    updatePumpFeedback(i, p);
+  }
 }
 
 void process(AppContext& ctx) {
@@ -635,11 +925,11 @@ void process(AppContext& ctx) {
       RelayOutputs::set(ctx, p.relayIndex, false);
       setPwmPercent(p, 0.0f);
 
-      Serial.print("PUMPE ");
-      Serial.print(i + 1);
-      Serial.print(" wartet auf Umschaltventil | Verbleibende Umschaltzeit ms=");
-      Serial.println(route.valveMoveRemainingMs);
-      Serial.flush();
+      DBG_PRINT("PUMPE ");
+      DBG_PRINT(i + 1);
+      DBG_PRINT(" wartet auf Umschaltventil | Verbleibende Umschaltzeit ms=");
+      DBG_PRINTLN(route.valveMoveRemainingMs);
+      DBG_FLUSH();
       continue;
     }
 
@@ -648,8 +938,43 @@ void process(AppContext& ctx) {
       firstDiff = false;
     }
 
-    const float effectiveTargetDiff = isnan(route.targetDiff) ? p.targetDiff : route.targetDiff;
-    const float effectiveHysteresis = isnan(route.hysteresis) ? p.hysteresis : route.hysteresis;
+    const MlOptimizer::SolarControlParams mlControl =
+      MlOptimizer::solarControlParams(ctx, i, p);
+
+    float effectiveTargetDiff =
+      mlControl.effectiveTargetDiffC;
+    float effectiveHysteresis =
+      mlControl.effectiveHysteresisC;
+    const float effectiveStartDiff =
+      mlControl.effectiveStartDiffC;
+
+    // Explizite Ziel-Overrides bleiben harte Benutzerwerte und werden nicht
+    // von ML veraendert.
+    if (p.activeTargetIndex < PUMP_ROUTE_TARGET_COUNT) {
+      const PumpRouteTargetConfig& activeTarget =
+        p.targets[p.activeTargetIndex];
+
+      if (activeTarget.enabled &&
+          activeTarget.targetDiffOverride > 0.0f) {
+        effectiveTargetDiff =
+          activeTarget.targetDiffOverride;
+      } else if (!isnan(route.targetDiff) &&
+                 !isSolarCollectorPump(p)) {
+        effectiveTargetDiff = route.targetDiff;
+      }
+
+      if (activeTarget.enabled &&
+          activeTarget.hysteresisOverride > 0.0f) {
+        effectiveHysteresis =
+          activeTarget.hysteresisOverride;
+      } else if (!isnan(route.hysteresis) &&
+                 !isSolarCollectorPump(p)) {
+        effectiveHysteresis = route.hysteresis;
+      }
+    } else if (!isSolarCollectorPump(p)) {
+      if (!isnan(route.targetDiff)) effectiveTargetDiff = route.targetDiff;
+      if (!isnan(route.hysteresis)) effectiveHysteresis = route.hysteresis;
+    }
 
     if (p.mode == PumpMode::RELAY) {
       if (!p.state && p.lastDiffC >= (effectiveTargetDiff + effectiveHysteresis)) {
@@ -662,7 +987,22 @@ void process(AppContext& ctx) {
     }
 
     if (p.mode == PumpMode::PWM) {
-      if (p.lastDiffC < p.startDiff) {
+      // Echte Start/Stop-Hysterese:
+      // AUS -> EIN erst ab startDiff.
+      // EIN -> AUS erst unter startDiff - hysteresis.
+      // Damit wird die bisher ungenutzte Hysterese bei PWM-Pumpen tatsaechlich
+      // wirksam und kurze Ein/Aus-Zyklen werden vermieden.
+      const float stopDiff =
+        max(
+          0.1f,
+          effectiveStartDiff - max(0.0f, effectiveHysteresis)
+        );
+
+      const bool shouldStop =
+        (!p.state && p.lastDiffC < effectiveStartDiff) ||
+        (p.state && p.lastDiffC <= stopDiff);
+
+      if (shouldStop) {
         p.state = false;
         pid[i] = {};
         relayOn = false;
@@ -671,13 +1011,20 @@ void process(AppContext& ctx) {
         p.state = true;
         relayOn = true;
 
-        // Ziel: Temperaturdifferenz halten. Ist die Temperaturdifferenz groesser als Ziel, wird die Pumpenleistung erhoeht.
-        float error = p.lastDiffC - effectiveTargetDiff;
-        pwmPercent = computePID(i, p, error);
-        pwmPercent = clampFloat(pwmPercent, p.minPwmPercent, p.maxPwmPercent);
-        // ML darf nur innerhalb der vom Nutzer gesetzten Pumpengrenzen feinoptimieren.
-        // Bei nicht aktivem/ungueltigem Modell wird der Wert unveraendert zurueckgegeben.
-        pwmPercent = MlOptimizer::adjustSolarPumpPwm(ctx, i, pwmPercent);
+        float error =
+          p.lastDiffC - effectiveTargetDiff;
+
+        pwmPercent =
+          computePID(ctx, i, p, error);
+
+        // Ab ML V2 Block 2 ist dieser Hook absichtlich ein No-op. Er bleibt
+        // nur fuer API-/Altcode-Kompatibilitaet bestehen.
+        pwmPercent =
+          MlOptimizer::adjustSolarPumpPwm(
+            ctx,
+            i,
+            pwmPercent
+          );
       }
     }
 
@@ -721,11 +1068,11 @@ void process(AppContext& ctx) {
     if (relayOn && p.mode == PumpMode::PWM) {
       setPwmPercent(p, pwmPercent);
       p.lastPwmPercent = pwmPercent;
-      updatePumpFeedback(p);
+      updatePumpFeedback(i, p);
     } else {
       setPwmPercent(p, 0.0f);
       p.lastPwmPercent = 0.0f;
-      updatePumpFeedback(p);
+      updatePumpFeedback(i, p);
     }
 
     if (wasOn != relayOn) {
@@ -827,7 +1174,7 @@ bool applyHeatingCircuitPumpRequest(AppContext& ctx, uint8_t circuitIndex, bool 
     setPwmPercent(pump, percent);
   }
 
-  updatePumpFeedback(pump);
+  updatePumpFeedback((uint8_t)pumpIndex, pump);
 
   if (!wasOn) {
     printPumpSwitch((uint8_t)pumpIndex, true, pump);
@@ -881,7 +1228,7 @@ bool applyOvenPumpRequest(AppContext& ctx, bool run, float ovenTemperatureC, flo
     setPwmPercent(pump, pwmPercent);
   }
 
-  updatePumpFeedback(pump);
+  updatePumpFeedback((uint8_t)pumpIndex, pump);
 
   if (!wasOn) {
     printPumpSwitch((uint8_t)pumpIndex, true, pump);
@@ -955,13 +1302,13 @@ bool safetyForceRunForSource(AppContext& ctx, HeatSourceRole sourceRole, float p
       setPwmPercent(pump, pwmPercent);
     }
 
-    Serial.print("SAFETY PUMPE ");
-    Serial.print(i + 1);
-    Serial.print(" ERZWUNGEN | Quelle=");
-    Serial.print((int)sourceRole);
-    Serial.print(" | PWM=");
-    Serial.println(pwmPercent);
-    Serial.flush();
+    DBG_PRINT("SAFETY PUMPE ");
+    DBG_PRINT(i + 1);
+    DBG_PRINT(" ERZWUNGEN | Quelle=");
+    DBG_PRINT((int)sourceRole);
+    DBG_PRINT(" | PWM=");
+    DBG_PRINTLN(pwmPercent);
+    DBG_FLUSH();
 
     anyStarted = true;
   }
@@ -1067,22 +1414,22 @@ bool safetyForceNightCooling(AppContext& ctx, float pwmPercent) {
       setPwmPercent(pump, 0.0f);
     }
 
-    Serial.print("SAFETY NACHTKUEHLUNG P");
-    Serial.print(i + 1);
-    Serial.print(" | Quelle=");
-    Serial.print((int)pump.sourceRole);
-    Serial.print(" | Ziel=");
-    Serial.print((int)sinkRole);
-    Serial.print(hasValve ? " (Ventil Ziel B)" : " (Direktziel)");
-    Serial.print(" | Kollektor=");
-    Serial.print(collectorC);
-    Serial.print(" C | Speicher=");
-    Serial.print(sinkC);
-    Serial.print(" C | Delta=");
-    Serial.print(coolingDeltaC);
-    Serial.print(" K | PWM=");
-    Serial.println(pwmPercent);
-    Serial.flush();
+    DBG_PRINT("SAFETY NACHTKUEHLUNG P");
+    DBG_PRINT(i + 1);
+    DBG_PRINT(" | Quelle=");
+    DBG_PRINT((int)pump.sourceRole);
+    DBG_PRINT(" | Ziel=");
+    DBG_PRINT((int)sinkRole);
+    DBG_PRINT(hasValve ? " (Ventil Ziel B)" : " (Direktziel)");
+    DBG_PRINT(" | Kollektor=");
+    DBG_PRINT(collectorC);
+    DBG_PRINT(" C | Speicher=");
+    DBG_PRINT(sinkC);
+    DBG_PRINT(" C | Delta=");
+    DBG_PRINT(coolingDeltaC);
+    DBG_PRINT(" K | PWM=");
+    DBG_PRINTLN(pwmPercent);
+    DBG_FLUSH();
 
     anyHandled = true;
     anyPumpOn = true;
@@ -1158,13 +1505,13 @@ uint8_t safetyForceStorageCooling(AppContext& ctx, float criticalTemperatureC, f
     pump.lastPwmPercent = pwmPercent;
     if (pump.mode == PumpMode::PWM && pump.pwmChannel != PIN_UNUSED) setPwmPercent(pump, pwmPercent);
 
-    Serial.print("SAFETY SPEICHERKUEHLUNG P");
-    Serial.print(i + 1);
-    Serial.print(" | Speicher="); Serial.print(sourceC);
-    Serial.print(" C | Ziel="); Serial.print(route.sinkC);
-    Serial.print(" C | Delta="); Serial.print(route.diffC);
-    Serial.print(" K | PWM="); Serial.println(pwmPercent);
-    Serial.flush();
+    DBG_PRINT("SAFETY SPEICHERKUEHLUNG P");
+    DBG_PRINT(i + 1);
+    DBG_PRINT(" | Speicher="); DBG_PRINT(sourceC);
+    DBG_PRINT(" C | Ziel="); DBG_PRINT(route.sinkC);
+    DBG_PRINT(" C | Delta="); DBG_PRINT(route.diffC);
+    DBG_PRINT(" K | PWM="); DBG_PRINTLN(pwmPercent);
+    DBG_FLUSH();
     runningCount++;
   }
 
@@ -1235,13 +1582,13 @@ uint8_t safetyForceStorageCooling(AppContext& ctx, float criticalTemperatureC, f
     pump.lastPwmPercent = pwmPercent;
     if (pump.mode == PumpMode::PWM && pump.pwmChannel != PIN_UNUSED) setPwmPercent(pump, pwmPercent);
 
-    Serial.print("SAFETY SOLAR-RUECKKUEHLUNG P");
-    Serial.print(i + 1);
-    Serial.print(" | Speicher="); Serial.print(hotStorageC);
-    Serial.print(" C | Kollektor="); Serial.print(collectorC);
-    Serial.print(" C | Delta="); Serial.print(hotStorageC - collectorC);
-    Serial.print(" K | PWM="); Serial.println(pwmPercent);
-    Serial.flush();
+    DBG_PRINT("SAFETY SOLAR-RUECKKUEHLUNG P");
+    DBG_PRINT(i + 1);
+    DBG_PRINT(" | Speicher="); DBG_PRINT(hotStorageC);
+    DBG_PRINT(" C | Kollektor="); DBG_PRINT(collectorC);
+    DBG_PRINT(" C | Delta="); DBG_PRINT(hotStorageC - collectorC);
+    DBG_PRINT(" K | PWM="); DBG_PRINTLN(pwmPercent);
+    DBG_FLUSH();
     runningCount++;
   }
 
@@ -1319,15 +1666,15 @@ uint8_t safetyForceStorageCooling(AppContext& ctx, float criticalTemperatureC, f
     pump.lastPwmPercent = pwmPercent;
     if (pump.mode == PumpMode::PWM && pump.pwmChannel != PIN_UNUSED) setPwmPercent(pump, pwmPercent);
 
-    Serial.print(pump.sourceRole == HeatSourceRole::ALT_SOURCE_OVEN
+    DBG_PRINT(pump.sourceRole == HeatSourceRole::ALT_SOURCE_OVEN
       ? "SAFETY OFEN-RUECKKUEHLUNG P"
       : "SAFETY QUELLEN-RUECKKUEHLUNG P");
-    Serial.print(i + 1);
-    Serial.print(" | Speicher="); Serial.print(hotStorageC);
-    Serial.print(" C | Quelle="); Serial.print(sourceC);
-    Serial.print(" C | Delta="); Serial.print(hotStorageC - sourceC);
-    Serial.print(" K | PWM="); Serial.println(pwmPercent);
-    Serial.flush();
+    DBG_PRINT(i + 1);
+    DBG_PRINT(" | Speicher="); DBG_PRINT(hotStorageC);
+    DBG_PRINT(" C | Quelle="); DBG_PRINT(sourceC);
+    DBG_PRINT(" C | Delta="); DBG_PRINT(hotStorageC - sourceC);
+    DBG_PRINT(" K | PWM="); DBG_PRINTLN(pwmPercent);
+    DBG_FLUSH();
     runningCount++;
   }
 
@@ -1378,15 +1725,15 @@ bool safetyForceHeatDumpForSource(AppContext& ctx, HeatSourceRole sourceRole, fl
       setPwmPercent(pump, pwmPercent);
     }
 
-    Serial.print("SAFETY WAERMEABLEITUNG P");
-    Serial.print(i + 1);
-    Serial.print(" | Zieltemperatur=");
-    Serial.print(route.sinkC);
-    Serial.print(" | Temperaturdifferenz=");
-    Serial.print(route.diffC);
-    Serial.print(" | PWM=");
-    Serial.println(pwmPercent);
-    Serial.flush();
+    DBG_PRINT("SAFETY WAERMEABLEITUNG P");
+    DBG_PRINT(i + 1);
+    DBG_PRINT(" | Zieltemperatur=");
+    DBG_PRINT(route.sinkC);
+    DBG_PRINT(" | Temperaturdifferenz=");
+    DBG_PRINT(route.diffC);
+    DBG_PRINT(" | PWM=");
+    DBG_PRINTLN(pwmPercent);
+    DBG_FLUSH();
 
     anyStarted = true;
   }

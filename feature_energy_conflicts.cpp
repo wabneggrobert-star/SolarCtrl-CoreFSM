@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 
+#include "feature_build_flags.h"
 namespace {
 
   bool validPumpIndex(uint8_t pumpIndex) {
@@ -54,19 +55,19 @@ namespace {
     uint8_t requestedPump,
     const EnergyRouteReservation& existing
   ) {
-    Serial.print("ENERGIE KONFLIKT: ");
-    Serial.print(reason);
-    Serial.print(" | Anfrage P");
-    Serial.print(requestedPump + 1);
-    Serial.print(" kollidiert mit P");
-    Serial.print(existing.pumpIndex + 1);
-    Serial.print(" | Sink=");
-    Serial.print((int)existing.sinkRole);
-    Serial.print(" | PumpRelais=");
-    Serial.print(existing.pumpRelayIndex);
-    Serial.print(" | VentilAusgang=");
-    Serial.println(outputRefLabel(reservationValveOutput(existing)));
-    Serial.flush();
+    DBG_PRINT("ENERGIE KONFLIKT: ");
+    DBG_PRINT(reason);
+    DBG_PRINT(" | Anfrage P");
+    DBG_PRINT(requestedPump + 1);
+    DBG_PRINT(" kollidiert mit P");
+    DBG_PRINT(existing.pumpIndex + 1);
+    DBG_PRINT(" | Sink=");
+    DBG_PRINT((int)existing.sinkRole);
+    DBG_PRINT(" | PumpRelais=");
+    DBG_PRINT(existing.pumpRelayIndex);
+    DBG_PRINT(" | VentilAusgang=");
+    DBG_PRINTLN(outputRefLabel(reservationValveOutput(existing)));
+    DBG_FLUSH();
   }
 
 }
@@ -144,17 +145,17 @@ void reserveRoute(
   r.valveOutputIndex = valveOutput.index;
   r.valveRelayIndex = legacyRelayIndex(valveOutput);
 
-  Serial.print("ENERGIE ROUTE RESERVIERT: P");
-  Serial.print(pumpIndex + 1);
-  Serial.print(" Quelle=");
-  Serial.print((int)sourceRole);
-  Serial.print(" Sink=");
-  Serial.print((int)sinkRole);
-  Serial.print(" PumpRelais=");
-  Serial.print(pumpRelayIndex);
-  Serial.print(" VentilAusgang=");
-  Serial.println(outputRefLabel(valveOutput));
-  Serial.flush();
+  DBG_PRINT("ENERGIE ROUTE RESERVIERT: P");
+  DBG_PRINT(pumpIndex + 1);
+  DBG_PRINT(" Quelle=");
+  DBG_PRINT((int)sourceRole);
+  DBG_PRINT(" Sink=");
+  DBG_PRINT((int)sinkRole);
+  DBG_PRINT(" PumpRelais=");
+  DBG_PRINT(pumpRelayIndex);
+  DBG_PRINT(" VentilAusgang=");
+  DBG_PRINTLN(outputRefLabel(valveOutput));
+  DBG_FLUSH();
 }
 
 }

@@ -11,46 +11,79 @@ namespace {
   DallasTemperature ds18b20(&oneWire);
   bool g_started = false;
 
+  enum class DsFsmStep : uint8_t {
+    IDLE = 0,
+    WAIT_CONVERSION,
+    READ_DEVICE
+  };
+
+  DsFsmStep g_step = DsFsmStep::IDLE;
+  uint32_t g_conversionStartedMs = 0;
+  uint8_t g_readIndex = 0;
+  bool g_cycleDone = false;
+
   bool plausible(float t) {
     return !isnan(t) && t >= SINK_TEMP_MIN_C && t <= SINK_TEMP_MAX_C;
   }
 
-  bool readByAddress(const uint8_t address[8], float& tempC, bool& valid) {
-    tempC = NAN;
-    valid = false;
-
-    if (!g_started) return false;
-
-    ds18b20.requestTemperatures();
-    delay(SENSOR_CONVERSION_WAIT_MS);
-
-    tempC = ds18b20.getTempC(address);
-    if (tempC == DEVICE_DISCONNECTED_C) {
-      tempC = NAN;
-      valid = false;
-      return false;
+  bool sameAddress(const uint8_t a[8], const uint8_t b[8]) {
+    for (uint8_t i = 0; i < 8; i++) {
+      if (a[i] != b[i]) return false;
     }
+    return true;
+  }
 
-    valid = plausible(tempC);
-    if (!valid) tempC = NAN;
-
-    return valid;
+  const Ds18b20DeviceInfo* findOldDevice(
+    const Ds18b20Inventory& inventory,
+    const uint8_t address[8]
+  ) {
+    for (uint8_t i = 0; i < inventory.count; i++) {
+      if (inventory.devices[i].present && sameAddress(inventory.devices[i].address, address)) {
+        return &inventory.devices[i];
+      }
+    }
+    return nullptr;
   }
 
   void clearInventory(Ds18b20Inventory& inventory) {
     inventory.count = 0;
 
     for (uint8_t i = 0; i < MAX_DS18B20_SENSORS; i++) {
-      inventory.devices[i].present = false;
-      inventory.devices[i].addressText[0] = '\0';
-      inventory.devices[i].lastTempC = NAN;
-      inventory.devices[i].lastValid = false;
-      inventory.devices[i].role = Ds18Role::NONE;
-
-      for (uint8_t j = 0; j < 8; j++) {
-        inventory.devices[i].address[j] = 0;
-      }
+      inventory.devices[i] = Ds18b20DeviceInfo{};
+      inventory.devices[i].error = Ds18Error::NOT_READ;
     }
+  }
+
+  void finishCycle() {
+    g_step = DsFsmStep::IDLE;
+    g_readIndex = 0;
+    g_cycleDone = true;
+  }
+
+  void updateDeviceReading(Ds18b20DeviceInfo& dev) {
+    const uint32_t now = millis();
+    const float t = ds18b20.getTempC(dev.address);
+
+    dev.lastUpdateMs = now;
+    dev.sequence++;
+
+    if (t == DEVICE_DISCONNECTED_C) {
+      dev.lastTempC = NAN;
+      dev.lastValid = false;
+      dev.error = Ds18Error::DISCONNECTED;
+      return;
+    }
+
+    if (!plausible(t)) {
+      dev.lastTempC = NAN;
+      dev.lastValid = false;
+      dev.error = Ds18Error::OUT_OF_RANGE;
+      return;
+    }
+
+    dev.lastTempC = t;
+    dev.lastValid = true;
+    dev.error = Ds18Error::NONE;
   }
 }
 
@@ -58,6 +91,16 @@ namespace SinkSensor {
 
 bool begin() {
   ds18b20.begin();
+
+  // Zentraler Punkt des Refactorings: DallasTemperature darf nicht auf die
+  // DS18B20-Conversion warten. Die Wartezeit wird von der FSM ueber millis()
+  // abgebildet, waehrend der ESP alle anderen Aufgaben weiterbearbeitet.
+  ds18b20.setWaitForConversion(false);
+
+  g_step = DsFsmStep::IDLE;
+  g_conversionStartedMs = 0;
+  g_readIndex = 0;
+  g_cycleDone = false;
   g_started = true;
   return true;
 }
@@ -93,8 +136,13 @@ bool parseAddressString(const String& text, uint8_t address[8]) {
 }
 
 uint8_t scanBus(Ds18b20Inventory& inventory) {
-  clearInventory(inventory);
   if (!g_started) return 0;
+
+  // Einen laufenden Messzyklus nicht durch einen UI-Scan zerstoeren.
+  if (cycleActive()) return inventory.count;
+
+  const Ds18b20Inventory previous = inventory;
+  clearInventory(inventory);
 
   oneWire.reset_search();
   uint8_t addr[8];
@@ -105,116 +153,111 @@ uint8_t scanBus(Ds18b20Inventory& inventory) {
     if (addr[0] != 0x28) continue;
 
     Ds18b20DeviceInfo& dev = inventory.devices[inventory.count];
-    dev.present = true;
-
-    for (uint8_t i = 0; i < 8; i++) {
-      dev.address[i] = addr[i];
+    const Ds18b20DeviceInfo* old = findOldDevice(previous, addr);
+    if (old) {
+      dev = *old; // Snapshot/Sequence bei einem Re-Scan erhalten.
+    } else {
+      dev = Ds18b20DeviceInfo{};
+      dev.error = Ds18Error::NOT_READ;
     }
+
+    dev.present = true;
+    for (uint8_t i = 0; i < 8; i++) dev.address[i] = addr[i];
 
     String txt = addressToString(addr);
     txt.toCharArray(dev.addressText, sizeof(dev.addressText));
-
     inventory.count++;
   }
 
-  refreshInventoryTemps(inventory);
   return inventory.count;
 }
 
-void refreshInventoryTemps(Ds18b20Inventory& inventory) {
-  if (!g_started) return;
+bool startCycle(Ds18b20Inventory& inventory) {
+  if (!g_started || cycleActive()) return false;
+
+  g_cycleDone = false;
+  g_readIndex = 0;
+
+  if (inventory.count == 0) {
+    finishCycle();
+    return true;
+  }
 
   ds18b20.requestTemperatures();
-  delay(SENSOR_CONVERSION_WAIT_MS);
+  g_conversionStartedMs = millis();
+  g_step = DsFsmStep::WAIT_CONVERSION;
+  return true;
+}
 
-  for (uint8_t i = 0; i < inventory.count; i++) {
-    Ds18b20DeviceInfo& dev = inventory.devices[i];
-    if (!dev.present) continue;
+void process(Ds18b20Inventory& inventory) {
+  if (!g_started || g_step == DsFsmStep::IDLE) return;
 
-    float t = ds18b20.getTempC(dev.address);
-    if (t == DEVICE_DISCONNECTED_C) {
-      dev.lastTempC = NAN;
-      dev.lastValid = false;
-      continue;
+  if (g_step == DsFsmStep::WAIT_CONVERSION) {
+    if ((uint32_t)(millis() - g_conversionStartedMs) < SENSOR_CONVERSION_WAIT_MS) {
+      return;
     }
 
-    bool valid = plausible(t);
-    dev.lastValid = valid;
-    dev.lastTempC = valid ? t : NAN;
+    g_readIndex = 0;
+    g_step = DsFsmStep::READ_DEVICE;
   }
+
+  if (g_step != DsFsmStep::READ_DEVICE) return;
+
+  // Pro loop()-Durchlauf nur einen Sensor lesen. Damit bleibt auch das Auslesen
+  // vieler DS18B20 kurz und andere FSMs erhalten Rechenzeit.
+  while (g_readIndex < inventory.count && !inventory.devices[g_readIndex].present) {
+    g_readIndex++;
+  }
+
+  if (g_readIndex >= inventory.count) {
+    finishCycle();
+    return;
+  }
+
+  updateDeviceReading(inventory.devices[g_readIndex]);
+  g_readIndex++;
+
+  if (g_readIndex >= inventory.count) {
+    finishCycle();
+  }
+}
+
+bool cycleComplete() {
+  return g_cycleDone && g_step == DsFsmStep::IDLE;
+}
+
+bool cycleActive() {
+  return g_step != DsFsmStep::IDLE;
+}
+
+bool readCachedByAddress(
+  const Ds18b20Inventory& inventory,
+  const uint8_t address[8],
+  float& tempC,
+  bool& valid
+) {
+  tempC = NAN;
+  valid = false;
+
+  for (uint8_t i = 0; i < inventory.count; i++) {
+    const Ds18b20DeviceInfo& dev = inventory.devices[i];
+    if (!dev.present || !sameAddress(dev.address, address)) continue;
+
+    tempC = dev.lastTempC;
+    valid = dev.lastValid && isfinite(dev.lastTempC);
+    return valid;
+  }
+
+  return false;
 }
 
 bool inventoryContainsAddress(const Ds18b20Inventory& inventory, const uint8_t address[8]) {
   for (uint8_t i = 0; i < inventory.count; i++) {
-    bool equal = true;
-
-    for (uint8_t j = 0; j < 8; j++) {
-      if (inventory.devices[i].address[j] != address[j]) {
-        equal = false;
-        break;
-      }
+    if (inventory.devices[i].present && sameAddress(inventory.devices[i].address, address)) {
+      return true;
     }
-
-    if (equal) return true;
   }
-
   return false;
-}
-
-bool autoAssignSink(Ds18b20Inventory& inventory, SensorAssignment& assignment) {
-  assignment.sinkAssigned = false;
-  assignment.sinkAddressText[0] = '\0';
-
-  for (uint8_t i = 0; i < 8; i++) {
-    assignment.sinkAddress[i] = 0;
-  }
-
-  if (inventory.count == 1 && inventory.devices[0].present) {
-    assignment.sinkAssigned = true;
-
-    for (uint8_t i = 0; i < 8; i++) {
-      assignment.sinkAddress[i] = inventory.devices[0].address[i];
-    }
-
-    strncpy(
-      assignment.sinkAddressText,
-      inventory.devices[0].addressText,
-      sizeof(assignment.sinkAddressText) - 1
-    );
-    assignment.sinkAddressText[sizeof(assignment.sinkAddressText) - 1] = '\0';
-
-    return true;
-  }
-
-  return false;
-}
-
-bool assignSinkByAddressText(const Ds18b20Inventory& inventory, const String& addressText, SensorAssignment& assignment) {
-  uint8_t parsed[8] = {0};
-
-  if (!parseAddressString(addressText, parsed)) return false;
-  if (!inventoryContainsAddress(inventory, parsed)) return false;
-
-  assignment.sinkAssigned = true;
-
-  for (uint8_t i = 0; i < 8; i++) {
-    assignment.sinkAddress[i] = parsed[i];
-  }
-
-  addressText.toCharArray(assignment.sinkAddressText, sizeof(assignment.sinkAddressText));
-  return true;
-}
-
-bool hasAssignedSink(const SensorAssignment& assignment) {
-  return assignment.sinkAssigned;
-}
-
-bool readAssignedSink(const SensorAssignment& assignment, float& tempC, bool& valid) {
-  tempC = NAN;
-  valid = false;
-
-  if (!assignment.sinkAssigned) return false;
-  return readByAddress(assignment.sinkAddress, tempC, valid);
 }
 
 }

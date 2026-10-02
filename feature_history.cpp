@@ -188,14 +188,8 @@ void process(AppContext& ctx){
   String old5=dayPath(g_5m.start?g_5m.start:s5), old30=monthPath(g_30m.start?g_30m.start:s30), oldD=yearPath(g_day.start?g_day.start:sd);
   advanceBucket(g_5m,s5,300,old5);advanceBucket(g_30m,s30,1800,old30);advanceBucket(g_day,sd,86400,oldD);
 
-  // DS18B20-History-Fix:
-  // ctx.ds18b20.devices[].lastTempC wird im normalen Regelpfad nicht laufend
-  // aktualisiert. Die Rollen-/Regellogik liest DS18B20 direkt per Adresse,
-  // waehrend die History den Inventory-Cache verwendet. Deshalb muss dieser
-  // Cache unmittelbar vor dem History-Snapshot einmal gemeinsam aktualisiert
-  // werden. requestTemperatures() erfolgt dabei nur einmal fuer alle Sensoren.
-  SinkSensor::refreshInventoryTemps(ctx.ds18b20);
-
+  // DS18B20-FSM: History liest ausschliesslich den bereits publizierten
+  // Inventory-Snapshot. Logging startet selbst keine Sensor-Conversion.
   addAllSensors(ctx,g_5m,g_30m,g_day);
   if(ctx.config.energyMeter.enabled && isfinite(ctx.energyMeter.totalEnergyKWh)){
     double cur=ctx.energyMeter.totalEnergyKWh;if(isfinite(g_lastEnergyKWh)){double d=(cur-g_lastEnergyKWh)*1000.0;if(d>=0 && d<100000){g_5m.energyWh+=d;g_30m.energyWh+=d;g_day.energyWh+=d;}}g_lastEnergyKWh=cur;

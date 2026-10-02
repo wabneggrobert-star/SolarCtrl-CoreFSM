@@ -11,6 +11,7 @@
 #include <math.h>
 #include <string.h>
 
+#include "feature_build_flags.h"
 namespace {
 
 static constexpr float SENSOR_MIN_VALID_C = -40.0f;
@@ -148,7 +149,7 @@ void updateDs18StorageTemperatures(AppContext& ctx) {
   for (Ds18Role role : storageRoles) {
     float temperatureC = NAN;
     bool valid = false;
-    if (!SensorAssignments::readByRole(ctx.assignments, role, temperatureC, valid)) continue;
+    if (!SensorAssignments::readByRole(ctx.ds18b20, ctx.assignments, role, temperatureC, valid)) continue;
     if (!valid || !isValidTemperature(temperatureC)) continue;
 
     if (isnan(g_status.highestStorageTemperatureC) ||
@@ -176,6 +177,7 @@ void updateFrostStorageTemperature(const AppContext& ctx) {
   bool valid = false;
 
   SensorAssignments::readByRole(
+    ctx.ds18b20,
     ctx.assignments,
     ctx.config.frostProtectionStorageRole,
     temperatureC,
@@ -206,8 +208,8 @@ void evaluateSensorFaults(const AppContext& ctx) {
     }
 
     if (!reading.valid) {
-      Serial.print("SAFETY SENSOR ERROR MAX ");
-      Serial.println(index + 1);
+      DBG_PRINT("SAFETY SENSOR ERROR MAX ");
+      DBG_PRINTLN(index + 1);
       g_status.sensorFaultActive = true;
     }
   };
@@ -370,8 +372,8 @@ void begin(AppContext& ctx) {
   (void)ctx;
   resetStatus();
 
-  Serial.println("SafetyManager::begin OK");
-  Serial.flush();
+  DBG_PRINTLN("SafetyManager::begin OK");
+  DBG_FLUSH();
 }
 
 static void evaluateNightCooling(AppContext& ctx, SafetyStatus& st)
@@ -466,11 +468,11 @@ void evaluate(AppContext& ctx) {
   syncStorageTemperatureAlarms(ctx);
 
   if (g_status.mode != SafetyMode::NORMAL) {
-    Serial.print("SAFETY: ");
-    Serial.print(modeToText(g_status.mode));
-    Serial.print(" | ");
-    Serial.println(g_status.message);
-    Serial.flush();
+    DBG_PRINT("SAFETY: ");
+    DBG_PRINT(modeToText(g_status.mode));
+    DBG_PRINT(" | ");
+    DBG_PRINTLN(g_status.message);
+    DBG_FLUSH();
   }
 }
 
@@ -497,9 +499,9 @@ void applyOutputs(AppContext& ctx) {
     return;
   }
 
-  Serial.print("SAFETY APPLY: ");
-  Serial.println(s.message);
-  Serial.flush();
+  DBG_PRINT("SAFETY APPLY: ");
+  DBG_PRINTLN(s.message);
+  DBG_FLUSH();
 
   // Kritische Speicheruebertemperatur hat Vorrang vor einem gleichzeitigen
   // allgemeinen Sensorfehler. Jede einzelne Notkuehlroute prueft ihre benoetigten
@@ -559,8 +561,8 @@ void applyOutputs(AppContext& ctx) {
 
     if (!anyStarted) {
       g_status.controlledStagnation = true;
-      Serial.println("SAFETY: Kein kuehles Ziel verfuegbar, kontrollierte Stagnation");
-      Serial.flush();
+      DBG_PRINTLN("SAFETY: Kein kuehles Ziel verfuegbar, kontrollierte Stagnation");
+      DBG_FLUSH();
     }
   }
 

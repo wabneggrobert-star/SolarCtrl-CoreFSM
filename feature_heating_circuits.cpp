@@ -11,6 +11,7 @@
 #include <Arduino.h>
 #include <math.h>
 
+#include "feature_build_flags.h"
 namespace {
 
 bool validOutput(const OutputRef& ref) {
@@ -31,28 +32,11 @@ void setOutput(AppContext& ctx, const OutputRef& ref, bool on) {
   }
 }
 
-void setPump(AppContext& ctx, const HeatingCircuitConfig& cfg, bool on, uint8_t percent) {
-  if (cfg.pumpMode == HeatingCircuitPumpMode::NONE) return;
-  if (!validOutput(cfg.pumpOutput)) return;
-
-  if (cfg.pumpOutput.kind == OutputKind::RELAY) {
-    RelayOutputs::set(ctx, cfg.pumpOutput.index, on);
-    return;
-  }
-
-  const PwmOutputConfig& po = ctx.config.pwmOutputs[cfg.pumpOutput.index];
-  if (cfg.pumpMode == HeatingCircuitPumpMode::PWM && po.mode == PwmOutputMode::PWM) {
-    PwmDriver::setDuty(cfg.pumpOutput.index, on ? percent : 0, po.profile);
-  } else if (po.mode == PwmOutputMode::SWITCH) {
-    PwmDriver::setSwitch(cfg.pumpOutput.index, on, po.profile);
-  }
-}
-
 bool readDs18(AppContext& ctx, Ds18Role role, float& value, bool& valid) {
   value = NAN;
   valid = false;
   if (role == Ds18Role::NONE) return false;
-  return SensorAssignments::readByRole(ctx.assignments, role, value, valid) && valid && !isnan(value);
+  return SensorAssignments::readByRole(ctx.ds18b20, ctx.assignments, role, value, valid) && valid && !isnan(value);
 }
 
 float clampFloat(float value, float minValue, float maxValue) {
@@ -125,33 +109,225 @@ float targetFlowTemperature(AppContext& ctx, uint8_t circuitIndex, const Heating
   return target;
 }
 
-void stopMixer(AppContext& ctx, const HeatingCircuitConfig& cfg, HeatingCircuitRuntime& rt) {
+enum class MixerFsmPhase : uint8_t {
+  IDLE = 0,
+  PULSE_OPEN,
+  PULSE_CLOSE,
+  WAIT
+};
+
+struct MixerFsmState {
+  MixerFsmPhase phase = MixerFsmPhase::IDLE;
+  int8_t normalDirection = 0;
+  int8_t safetyDirection = 0;
+  uint32_t phaseStartedMs = 0;
+};
+
+MixerFsmState mixerFsm[MAX_HEATING_CIRCUITS];
+
+uint32_t effectiveMixerPulseMs(const HeatingCircuitConfig& cfg) {
+  // Schutz gegen versehentlich 0 ms bzw. extremes Kontaktflattern.
+  return cfg.mixerPulseMs < 100UL ? 100UL : cfg.mixerPulseMs;
+}
+
+uint32_t effectiveMixerPauseMs(const HeatingCircuitConfig& cfg) {
+  return cfg.mixerPauseMs < 100UL ? 100UL : cfg.mixerPauseMs;
+}
+
+int16_t mixerPositionStepPercent(const HeatingCircuitConfig& cfg) {
+  const uint32_t pulseMs = effectiveMixerPulseMs(cfg);
+  if (cfg.mixerFullTravelMs < 1000UL) return 1;
+
+  const float step = 100.0f * ((float)pulseMs / (float)cfg.mixerFullTravelMs);
+  int16_t rounded = (int16_t)lroundf(step);
+  if (rounded < 1) rounded = 1;
+  if (rounded > 25) rounded = 25;
+  return rounded;
+}
+
+void stopMixerHardware(AppContext& ctx, const HeatingCircuitConfig& cfg, HeatingCircuitRuntime& rt) {
   setOutput(ctx, cfg.mixerOpenOutput, false);
   setOutput(ctx, cfg.mixerCloseOutput, false);
   rt.opening = false;
   rt.closing = false;
 }
 
-void pulseMixer(AppContext& ctx, const HeatingCircuitConfig& cfg, HeatingCircuitRuntime& rt, int direction) {
-  const uint32_t now = millis();
-  if ((uint32_t)(now - rt.lastMixerActionMs) < cfg.mixerPauseMs) return;
+void resetMixerFsmInternal(
+  AppContext& ctx,
+  uint8_t circuitIndex,
+  const HeatingCircuitConfig& cfg,
+  HeatingCircuitRuntime& rt
+) {
+  if (circuitIndex >= MAX_HEATING_CIRCUITS) return;
 
-  stopMixer(ctx, cfg, rt);
+  stopMixerHardware(ctx, cfg, rt);
+
+  MixerFsmState& fsm = mixerFsm[circuitIndex];
+  fsm.phase = MixerFsmPhase::IDLE;
+  fsm.normalDirection = 0;
+  fsm.safetyDirection = 0;
+  fsm.phaseStartedMs = millis();
+
+  rt.lastMixerActionMs = fsm.phaseStartedMs;
+}
+
+void requestMixerDirection(uint8_t circuitIndex, int direction, bool safetyRequest) {
+  if (circuitIndex >= MAX_HEATING_CIRCUITS) return;
+
+  int8_t requested = 0;
+  if (direction > 0) requested = 1;
+  else if (direction < 0) requested = -1;
+
+  MixerFsmState& fsm = mixerFsm[circuitIndex];
+  if (safetyRequest) {
+    fsm.safetyDirection = requested;
+  } else {
+    fsm.normalDirection = requested;
+  }
+}
+
+void startMixerPulse(
+  AppContext& ctx,
+  uint8_t circuitIndex,
+  const HeatingCircuitConfig& cfg,
+  HeatingCircuitRuntime& rt,
+  int8_t direction,
+  uint32_t now
+) {
+  if (circuitIndex >= MAX_HEATING_CIRCUITS || direction == 0) return;
+
+  stopMixerHardware(ctx, cfg, rt);
+
+  MixerFsmState& fsm = mixerFsm[circuitIndex];
 
   if (direction > 0) {
     setOutput(ctx, cfg.mixerOpenOutput, true);
     rt.opening = true;
-    rt.estimatedMixerPositionPercent += 2;
-  } else if (direction < 0) {
+    fsm.phase = MixerFsmPhase::PULSE_OPEN;
+  } else {
     setOutput(ctx, cfg.mixerCloseOutput, true);
     rt.closing = true;
-    rt.estimatedMixerPositionPercent -= 2;
+    fsm.phase = MixerFsmPhase::PULSE_CLOSE;
+  }
+
+  fsm.phaseStartedMs = now;
+  rt.lastMixerActionMs = now;
+}
+
+void finishMixerPulse(
+  AppContext& ctx,
+  uint8_t circuitIndex,
+  const HeatingCircuitConfig& cfg,
+  HeatingCircuitRuntime& rt,
+  int8_t completedDirection,
+  uint32_t now
+) {
+  stopMixerHardware(ctx, cfg, rt);
+
+  const int16_t step = mixerPositionStepPercent(cfg);
+  if (completedDirection > 0) {
+    rt.estimatedMixerPositionPercent += step;
+  } else if (completedDirection < 0) {
+    rt.estimatedMixerPositionPercent -= step;
   }
 
   if (rt.estimatedMixerPositionPercent < 0) rt.estimatedMixerPositionPercent = 0;
   if (rt.estimatedMixerPositionPercent > 100) rt.estimatedMixerPositionPercent = 100;
 
+  MixerFsmState& fsm = mixerFsm[circuitIndex];
+  fsm.phase = MixerFsmPhase::WAIT;
+  fsm.phaseStartedMs = now;
   rt.lastMixerActionMs = now;
+}
+
+void processMixerFsm(
+  AppContext& ctx,
+  uint8_t circuitIndex,
+  const HeatingCircuitConfig& cfg,
+  HeatingCircuitRuntime& rt,
+  bool safetyOverride
+) {
+  if (circuitIndex >= MAX_HEATING_CIRCUITS) return;
+
+  MixerFsmState& fsm = mixerFsm[circuitIndex];
+
+  // Sobald Safety aktiv ist, wird der alte Normalauftrag verworfen. Nach Ende
+  // des Safety-Eingriffs wartet der Mischer dadurch auf den naechsten regulaeren
+  // Sensorsnapshot und laeuft nicht mit einer alten Richtung weiter.
+  if (safetyOverride) {
+    fsm.normalDirection = 0;
+  } else {
+    fsm.safetyDirection = 0;
+  }
+
+  const int8_t requested =
+    safetyOverride ? fsm.safetyDirection : fsm.normalDirection;
+
+  const uint32_t now = millis();
+  const uint32_t pulseMs = effectiveMixerPulseMs(cfg);
+  const uint32_t pauseMs = effectiveMixerPauseMs(cfg);
+
+  if (requested == 0) {
+    if (fsm.phase != MixerFsmPhase::IDLE || rt.opening || rt.closing) {
+      stopMixerHardware(ctx, cfg, rt);
+      fsm.phase = MixerFsmPhase::IDLE;
+      fsm.phaseStartedMs = now;
+      rt.lastMixerActionMs = now;
+    }
+    return;
+  }
+
+  switch (fsm.phase) {
+    case MixerFsmPhase::IDLE:
+      startMixerPulse(ctx, circuitIndex, cfg, rt, requested, now);
+      return;
+
+    case MixerFsmPhase::PULSE_OPEN:
+    case MixerFsmPhase::PULSE_CLOSE: {
+      const int8_t activeDirection =
+        fsm.phase == MixerFsmPhase::PULSE_OPEN ? 1 : -1;
+
+      // Safety darf eine laufende Normalbewegung sofort in die sichere Richtung
+      // umkehren. Im Normalbetrieb wird bei Richtungswechsel zuerst sauber
+      // gestoppt und die konfiguriere Pause eingehalten.
+      if (requested != activeDirection) {
+        stopMixerHardware(ctx, cfg, rt);
+
+        if (safetyOverride) {
+          fsm.phase = MixerFsmPhase::IDLE;
+          fsm.phaseStartedMs = now;
+          startMixerPulse(ctx, circuitIndex, cfg, rt, requested, now);
+        } else {
+          fsm.phase = MixerFsmPhase::WAIT;
+          fsm.phaseStartedMs = now;
+          rt.lastMixerActionMs = now;
+        }
+        return;
+      }
+
+      if ((uint32_t)(now - fsm.phaseStartedMs) >= pulseMs) {
+        finishMixerPulse(
+          ctx,
+          circuitIndex,
+          cfg,
+          rt,
+          activeDirection,
+          now
+        );
+      }
+      return;
+    }
+
+    case MixerFsmPhase::WAIT:
+      stopMixerHardware(ctx, cfg, rt);
+
+      if ((uint32_t)(now - fsm.phaseStartedMs) >= pauseMs) {
+        fsm.phase = MixerFsmPhase::IDLE;
+        fsm.phaseStartedMs = now;
+        startMixerPulse(ctx, circuitIndex, cfg, rt, requested, now);
+      }
+      return;
+  }
 }
 
 bool sameOutput(const OutputRef& a, const OutputRef& b) {
@@ -160,21 +336,12 @@ bool sameOutput(const OutputRef& a, const OutputRef& b) {
 
 bool usesOutput(const HeatingCircuitConfig& cfg, const OutputRef& ref) {
   if (!validOutput(ref)) return false;
-  if (sameOutput(cfg.mixerOpenOutput, ref)) return true;
-  if (sameOutput(cfg.mixerCloseOutput, ref)) return true;
-  if (cfg.pumpMode != HeatingCircuitPumpMode::NONE && sameOutput(cfg.pumpOutput, ref)) return true;
-  return false;
+  return sameOutput(cfg.mixerOpenOutput, ref) || sameOutput(cfg.mixerCloseOutput, ref);
 }
 
-void releaseSingleOutput(AppContext& ctx, const HeatingCircuitConfig& ownerCfg, const OutputRef& ref, bool asPump) {
+void releaseSingleOutput(AppContext& ctx, const OutputRef& ref) {
   if (!validOutput(ref)) return;
-  if (asPump) {
-    HeatingCircuitConfig tmp = ownerCfg;
-    tmp.pumpOutput = ref;
-    setPump(ctx, tmp, false, 0);
-  } else {
-    setOutput(ctx, ref, false);
-  }
+  setOutput(ctx, ref, false);
 }
 
 String flowAlarmId(uint8_t index) {
@@ -196,6 +363,7 @@ namespace HeatingCircuits {
 void begin(AppContext& ctx) {
   for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
     ctx.heatingCircuitRuntime[i] = HeatingCircuitRuntime{};
+    mixerFsm[i] = MixerFsmState{};
   }
 }
 
@@ -248,20 +416,14 @@ Ds18Role effectiveOutsideSensorRole(const HeatingCircuitConfig& cfg) {
 void releaseOutputs(AppContext& ctx, const HeatingCircuitConfig& cfg) {
   setOutput(ctx, cfg.mixerOpenOutput, false);
   setOutput(ctx, cfg.mixerCloseOutput, false);
-  setPump(ctx, cfg, false, 0);
 }
 
 void releaseRemovedOutputs(AppContext& ctx, const HeatingCircuitConfig& oldCfg, const HeatingCircuitConfig& newCfg) {
   if (validOutput(oldCfg.mixerOpenOutput) && !usesOutput(newCfg, oldCfg.mixerOpenOutput)) {
-    releaseSingleOutput(ctx, oldCfg, oldCfg.mixerOpenOutput, false);
+    releaseSingleOutput(ctx, oldCfg.mixerOpenOutput);
   }
   if (validOutput(oldCfg.mixerCloseOutput) && !usesOutput(newCfg, oldCfg.mixerCloseOutput)) {
-    releaseSingleOutput(ctx, oldCfg, oldCfg.mixerCloseOutput, false);
-  }
-  if (oldCfg.pumpMode != HeatingCircuitPumpMode::NONE &&
-      validOutput(oldCfg.pumpOutput) &&
-      !usesOutput(newCfg, oldCfg.pumpOutput)) {
-    releaseSingleOutput(ctx, oldCfg, oldCfg.pumpOutput, true);
+    releaseSingleOutput(ctx, oldCfg.mixerCloseOutput);
   }
 }
 
@@ -269,11 +431,8 @@ void allOff(AppContext& ctx) {
   for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
     HeatingCircuitConfig& cfg = ctx.config.heatingCircuits[i];
     HeatingCircuitRuntime& rt = ctx.heatingCircuitRuntime[i];
-    stopMixer(ctx, cfg, rt);
+    resetMixerFsmInternal(ctx, i, cfg, rt);
     Pumps::applyHeatingCircuitPumpRequest(ctx, i, false, 0, NAN, NAN, false);
-    // Legacy-Freigabe: falls in alten Configs noch ein Heizkreis-Pumpenausgang
-    // eingetragen ist, wird er bei allOff weiterhin sicher ausgeschaltet.
-    setPump(ctx, cfg, false, 0);
     rt.pumpActive = false;
   }
 }
@@ -288,7 +447,7 @@ uint8_t safetyHeatDump(AppContext& ctx, float criticalStorageTemperatureC, float
     HeatingCircuitRuntime& rt = ctx.heatingCircuitRuntime[i];
 
     if (!cfg.enabled || cfg.bufferReferenceRole == Ds18Role::NONE) {
-      stopMixer(ctx, cfg, rt);
+      resetMixerFsmInternal(ctx, i, cfg, rt);
       Pumps::applyHeatingCircuitPumpRequest(ctx, i, false, 0, NAN, NAN, false);
       continue;
     }
@@ -305,7 +464,7 @@ uint8_t safetyHeatDump(AppContext& ctx, float criticalStorageTemperatureC, float
         storageC < criticalStorageTemperatureC ||
         (storageC - returnC) < minimumDeltaC ||
         Pumps::configuredHeatingCircuitPumpIndex(ctx, i) < 0) {
-      stopMixer(ctx, cfg, rt);
+      resetMixerFsmInternal(ctx, i, cfg, rt);
       Pumps::applyHeatingCircuitPumpRequest(ctx, i, false, 0, flowC, returnC, returnValid);
       continue;
     }
@@ -320,7 +479,7 @@ uint8_t safetyHeatDump(AppContext& ctx, float criticalStorageTemperatureC, float
     // floor/radiator supply. Close the mixer first; pump remains off until the
     // measured flow is back at or below the configured maximum.
     if (flowC > cfg.maximumFlowTemperatureC) {
-      pulseMixer(ctx, cfg, rt, -1);
+      requestMixerDirection(i, -1, true);
       Pumps::applyHeatingCircuitPumpRequest(ctx, i, false, 0, flowC, returnC, true);
       rt.pumpActive = false;
       rt.pumpPercent = 0;
@@ -329,9 +488,9 @@ uint8_t safetyHeatDump(AppContext& ctx, float criticalStorageTemperatureC, float
 
     const float marginC = 1.5f;
     if (flowC < cfg.maximumFlowTemperatureC - marginC) {
-      pulseMixer(ctx, cfg, rt, +1);
+      requestMixerDirection(i, +1, true);
     } else {
-      stopMixer(ctx, cfg, rt);
+      resetMixerFsmInternal(ctx, i, cfg, rt);
     }
 
     const int8_t pumpIndex = Pumps::configuredHeatingCircuitPumpIndex(ctx, i);
@@ -342,16 +501,47 @@ uint8_t safetyHeatDump(AppContext& ctx, float criticalStorageTemperatureC, float
     rt.pumpPercent = applied ? percent : 0;
     if (applied) {
       running++;
-      Serial.print("SAFETY HK-WAERMEABLEITUNG HK"); Serial.print(i + 1);
-      Serial.print(" | Speicher="); Serial.print(storageC);
-      Serial.print(" C | VL="); Serial.print(flowC);
-      Serial.print(" C | RL="); Serial.print(returnC);
-      Serial.print(" C | MaxVL="); Serial.println(cfg.maximumFlowTemperatureC);
-      Serial.flush();
+      DBG_PRINT("SAFETY HK-WAERMEABLEITUNG HK"); DBG_PRINT(i + 1);
+      DBG_PRINT(" | Speicher="); DBG_PRINT(storageC);
+      DBG_PRINT(" C | VL="); DBG_PRINT(flowC);
+      DBG_PRINT(" C | RL="); DBG_PRINT(returnC);
+      DBG_PRINT(" C | MaxVL="); DBG_PRINTLN(cfg.maximumFlowTemperatureC);
+      DBG_FLUSH();
     }
   }
 
   return running;
+}
+
+void prepareSafetyCycle(AppContext& ctx) {
+  (void)ctx;
+  for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+    // Jede Safety-Auswertung beginnt mit leerem Auftrag. Nur ein im aktuellen
+    // SafetyManager::applyOutputs()-Durchlauf explizit gesetzter Auftrag darf
+    // danach den Mischer bewegen.
+    mixerFsm[i].safetyDirection = 0;
+  }
+}
+
+void processFast(AppContext& ctx, bool safetyOverride) {
+  for (uint8_t i = 0; i < MAX_HEATING_CIRCUITS; i++) {
+    HeatingCircuitConfig& cfg = ctx.config.heatingCircuits[i];
+    HeatingCircuitRuntime& rt = ctx.heatingCircuitRuntime[i];
+
+    if (!cfg.enabled) {
+      resetMixerFsmInternal(ctx, i, cfg, rt);
+      continue;
+    }
+
+    processMixerFsm(ctx, i, cfg, rt, safetyOverride);
+  }
+}
+
+void resetMixerFsm(AppContext& ctx, uint8_t circuitIndex) {
+  if (circuitIndex >= MAX_HEATING_CIRCUITS) return;
+  HeatingCircuitConfig& cfg = ctx.config.heatingCircuits[circuitIndex];
+  HeatingCircuitRuntime& rt = ctx.heatingCircuitRuntime[circuitIndex];
+  resetMixerFsmInternal(ctx, circuitIndex, cfg, rt);
 }
 
 void process(AppContext& ctx) {
@@ -360,9 +550,8 @@ void process(AppContext& ctx) {
     HeatingCircuitRuntime& rt = ctx.heatingCircuitRuntime[i];
 
     if (!cfg.enabled) {
-      stopMixer(ctx, cfg, rt);
+      resetMixerFsmInternal(ctx, i, cfg, rt);
       Pumps::applyHeatingCircuitPumpRequest(ctx, i, false, 0, NAN, NAN, false);
-      setPump(ctx, cfg, false, 0);
       rt.active = false;
       rt.pumpActive = false;
       rt.flowTemperatureC = NAN;
@@ -387,9 +576,8 @@ void process(AppContext& ctx) {
       // Automatikbetrieb ist ohne gueltigen Vorlauffuehler nicht sicher.
       // Der Inbetriebnahme-Testmodus bleibt davon unberuehrt, weil die normale
       // Regelung in app_fsm.cpp waehrend des Testmodus pausiert wird.
-      stopMixer(ctx, cfg, rt);
+      resetMixerFsmInternal(ctx, i, cfg, rt);
       Pumps::applyHeatingCircuitPumpRequest(ctx, i, false, 0, NAN, NAN, false);
-      setPump(ctx, cfg, false, 0);
       rt.active = false;
       rt.pumpActive = false;
       rt.flowTemperatureC = NAN;
@@ -443,14 +631,24 @@ void process(AppContext& ctx) {
     rt.active = true;
 
     const float error = targetC - flowC;
-    const float deadband = (cfg.mixerType == HeatingCircuitMixerType::THERMAL) ? 1.5f : 0.7f;
+    const float baseDeadband =
+      (cfg.mixerType == HeatingCircuitMixerType::THERMAL)
+        ? 1.5f
+        : 0.7f;
+
+    const float deadband =
+      MlOptimizer::adjustHeatingMixerDeadband(
+        ctx,
+        i,
+        baseDeadband
+      );
 
     if (error > deadband) {
-      pulseMixer(ctx, cfg, rt, +1);
+      requestMixerDirection(i, +1, false);
     } else if (error < -deadband) {
-      pulseMixer(ctx, cfg, rt, -1);
+      requestMixerDirection(i, -1, false);
     } else {
-      stopMixer(ctx, cfg, rt);
+      resetMixerFsmInternal(ctx, i, cfg, rt);
     }
 
     const bool pumpConfigured = Pumps::configuredHeatingCircuitPumpIndex(ctx, i) >= 0;

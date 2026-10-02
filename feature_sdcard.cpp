@@ -6,6 +6,7 @@
 #include <SPI.h>
 #include <SD.h>
 
+#include "feature_build_flags.h"
 namespace {
   SPIClass sdSpi(VSPI);
   bool g_available = false;
@@ -25,16 +26,16 @@ namespace {
 namespace SDCard {
 
 bool begin() {
-  Serial.println("Initialisiere SD...");
+  DBG_PRINTLN("Initialisiere SD...");
   g_available = mountCard();
 
-  Serial.print("SD.begin: ");
-  Serial.println(g_available ? "OK" : "FEHLER");
+  DBG_PRINT("SD.begin: ");
+  DBG_PRINTLN(g_available ? "OK" : "FEHLER");
 
   if (g_available) {
     uint64_t sizeMb = SD.cardSize() / (1024ULL * 1024ULL);
-    Serial.print("SD Kartengroesse [MB]: ");
-    Serial.println((unsigned long)sizeMb);
+    DBG_PRINT("SD Kartengroesse [MB]: ");
+    DBG_PRINTLN((unsigned long)sizeMb);
   }
 
   return g_available;

@@ -8,6 +8,7 @@
 #include <Arduino.h>
 #include <math.h>
 
+#include "feature_build_flags.h"
 namespace {
 
 using RouteResult = PumpRouting::RouteResult;
@@ -19,7 +20,7 @@ bool readSinkByRole(AppContext& ctx, Ds18Role role, float& tempC, bool& valid) {
   tempC = NAN;
   valid = false;
   if (role == Ds18Role::NONE) return false;
-  SensorAssignments::readByRole(ctx.assignments, role, tempC, valid);
+  SensorAssignments::readByRole(ctx.ds18b20, ctx.assignments, role, tempC, valid);
   return valid && !isnan(tempC);
 }
 
@@ -164,11 +165,11 @@ void requestValveTarget(AppContext& ctx, PumpConfig& pump, uint8_t targetIndex, 
     r.valveMoving = Valves::isMoving(pump.valveIndex);
     r.valveMoveRemainingMs = Valves::moveRemainingMs(ctx, pump.valveIndex);
 
-    Serial.print("PUMP ROUTE Valve V2 Pumpe Ziel ");
-    Serial.print(targetIndex == 0 ? "A" : "B");
-    Serial.print(" | Ventil=");
-    Serial.println(pump.valveIndex);
-    Serial.flush();
+    DBG_PRINT("PUMP ROUTE Valve V2 Pumpe Ziel ");
+    DBG_PRINT(targetIndex == 0 ? "A" : "B");
+    DBG_PRINT(" | Ventil=");
+    DBG_PRINTLN(pump.valveIndex);
+    DBG_FLUSH();
   }
 }
 

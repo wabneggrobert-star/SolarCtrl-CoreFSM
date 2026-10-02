@@ -88,19 +88,16 @@ bool assignRoleByAddressText(const Ds18b20Inventory& inventory, const String& ad
   return false;
 }
 
-bool readByRole(const SensorAssignmentTable& table, Ds18Role role, float& tempC, bool& valid) {
+bool readByRole(const Ds18b20Inventory& inventory, const SensorAssignmentTable& table, Ds18Role role, float& tempC, bool& valid) {
   tempC = NAN;
   valid = false;
+
   Ds18RoleAssignment a;
-  if (!getAssignment(table, role, a)) return false;
+  if (!getAssignment(table, role, a) || !a.assigned) return false;
 
-  SensorAssignment legacy;
-  legacy.sinkAssigned = a.assigned;
-  for (uint8_t i = 0; i < 8; i++) legacy.sinkAddress[i] = a.address[i];
-  strncpy(legacy.sinkAddressText, a.addressText, sizeof(legacy.sinkAddressText) - 1);
-  legacy.sinkAddressText[sizeof(legacy.sinkAddressText) - 1] = '\0';
-
-  return SinkSensor::readAssignedSink(legacy, tempC, valid);
+  // Reiner Zugriff auf den letzten von der DS18B20-FSM publizierten Snapshot.
+  // Rollenauflosung loest selbst keine Busmessung mehr aus.
+  return SinkSensor::readCachedByAddress(inventory, a.address, tempC, valid);
 }
 
 Ds18Role activeSinkRole(const ConfigData& config) {

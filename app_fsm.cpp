@@ -32,6 +32,7 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "feature_build_flags.h"
 namespace {
   void copyFaultText(char* dst, size_t dstSize, const char* src) {
     if (!dst || dstSize == 0) return;
@@ -49,6 +50,12 @@ namespace {
 
   static constexpr uint32_t WIFI_STA_RECONNECT_INTERVAL_MS = 30000UL;
   static constexpr uint32_t WIFI_AP_HEALTH_INTERVAL_MS = 10000UL;
+
+  // Fast-Control V1:
+  // Zeitkritische, bereits millis()-basierte Zustandsautomaten laufen mit 10 Hz.
+  // Die eigentliche temperaturbasierte Pumpen-PID-Regelung bleibt dagegen
+  // absichtlich an einem abgeschlossenen Sensorsnapshot haengen.
+  static constexpr uint32_t FAST_CONTROL_INTERVAL_MS = 100UL;
 
   uint32_t g_lastSoftApCheckMs = 0;
 
@@ -71,7 +78,7 @@ namespace {
       if (!SensorRoles::isSinkRole(candidate)) return false;
       float candidateC = NAN;
       bool candidateValid = false;
-      if (!SensorAssignments::readByRole(ctx.assignments, candidate, candidateC, candidateValid)) return false;
+      if (!SensorAssignments::readByRole(ctx.ds18b20, ctx.assignments, candidate, candidateC, candidateValid)) return false;
       if (!candidateValid || isnan(candidateC)) return false;
       role = candidate;
       tempC = candidateC;
@@ -129,6 +136,8 @@ void AppFSM::begin() {
   ctx_.stateEnteredAtMs = millis();
   ctx_.lastSampleAtMs = 0;
   ctx_.lastRuntimeSaveAtMs = millis();
+  selfTestSensorCycleStarted_ = false;
+  lastFastControlAtMs_ = 0;
   Alarms::begin();
   Alarms::recordInfo("system_boot", "Steuerung gestartet");
 }
@@ -200,6 +209,11 @@ void AppFSM::loop() {
       break;
   }
 
+  // Zeitkritische Aktor-/Timerlogik ist vom langsamen Sensorsample getrennt.
+  // Der Scheduler arbeitet auch waehrend DS18B20/MAX31865 auf ihre Conversion
+  // warten. Safety bleibt dabei immer vorrangig.
+  runFastControlScheduler();
+
   if (ctx_.networkInitialized) {
     serviceNetwork();
     TimeService::process(ctx_);
@@ -218,18 +232,82 @@ void AppFSM::loop() {
   Alarms::process(ctx_);
 }
 
+void AppFSM::runFastControlScheduler() {
+  // Erst nach erfolgreichem Sensor-Selftest aktivieren. In Boot/Init/SELF_TEST
+  // und FAULT bleibt die bestehende FSM alleiniger Besitzer der Ausgaenge.
+  const bool runtimeState =
+    ctx_.state == SystemState::IDLE ||
+    ctx_.state == SystemState::READ_SENSORS ||
+    ctx_.state == SystemState::VALIDATE_SENSORS ||
+    ctx_.state == SystemState::COMPUTE_CONTROL ||
+    ctx_.state == SystemState::APPLY_OUTPUTS ||
+    ctx_.state == SystemState::UPDATE_RUNTIME;
+
+  if (!runtimeState) return;
+
+  const uint32_t now = millis();
+  if (lastFastControlAtMs_ != 0 &&
+      (uint32_t)(now - lastFastControlAtMs_) < FAST_CONTROL_INTERVAL_MS) {
+    return;
+  }
+  lastFastControlAtMs_ = now;
+
+  // Safety wird mit 10 Hz gegen den jeweils letzten gueltigen Sensorsnapshot
+  // bewertet. Neue Temperaturen kommen weiterhin nur aus abgeschlossenen
+  // Sensorzyklen, aber Safety-Ausgaenge/Timer muessen nicht auf den naechsten
+  // 2-s-Control-Zyklus warten.
+  SafetyManager::evaluate(ctx_);
+  const auto& safetyStatus = SafetyManager::status();
+
+  if (safetyStatus.blockNormalPumpControl) {
+    // Alte Safety-Mischerauftraege duerfen keinen neuen Safety-Zyklus ueberleben.
+    HeatingCircuits::prepareSafetyCycle(ctx_);
+    SafetyManager::applyOutputs(ctx_);
+
+    // safetyHeatDump() setzt ggf. in applyOutputs() einen expliziten
+    // OPEN/CLOSE-Auftrag. Die eigentliche Puls-/Pause-FSM laeuft danach hier.
+    HeatingCircuits::processFast(ctx_, true);
+
+    Pumps::processFast(ctx_);
+    return;
+  }
+
+  // In beiden Testmodi darf die normale Automatik keine Testausgaenge
+  // ueberschreiben. Safety wurde absichtlich bereits davor ausgewertet.
+  if (ctx_.commissioning.active || UI::commissioningTestActive()) {
+    Pumps::processFast(ctx_);
+    return;
+  }
+
+  // Diese Module besitzen bereits eigene millis()-basierte Zeitlogik und sind
+  // deshalb fuer den 100-ms-Takt geeignet.
+  Valves::process(ctx_);
+  AuxHeater::process(ctx_);
+  OvenControl::process(ctx_);
+
+  // Pumpenfeedback ist jetzt interruptbasiert und darf schnell ausgewertet.
+  // Die eigentliche Solar-/Differenz-/PID-Regelung bleibt in Pumps::process().
+  Pumps::processFast(ctx_);
+
+  // Heizkreis V2:
+  // Der langsame HeatingCircuits::process()-Pfad berechnet weiterhin nur mit
+  // neuen Temperatursnapshots die gewuenschte Richtung. Die physische
+  // PULSE->WAIT-Mischer-FSM darf dagegen mit 10 Hz laufen.
+  HeatingCircuits::processFast(ctx_, false);
+}
+
 void AppFSM::changeState(SystemState next) {
   ctx_.state = next;
   ctx_.stateEnteredAtMs = millis();
 }
 
 void AppFSM::stateInitHw() {
-  Serial.println("INIT_HW gestartet");
+  DBG_PRINTLN("INIT_HW gestartet");
 
   // I2C-Hardware initialisieren, aber fehlende Erweiterungsbausteine blockieren den AP nicht.
   bool relayOk = RelayOutputs::begin(ctx_);
-  Serial.print("Relais-PCF: ");
-  Serial.println(relayOk ? "OK" : "FEHLER/NICHT GEFUNDEN");
+  DBG_PRINT("Relais-PCF: ");
+  DBG_PRINTLN(relayOk ? "OK" : "FEHLER/NICHT GEFUNDEN");
 
   // PCA9685 und Ofen-Servo werden erst nach LOAD_CONFIG initialisiert.
   // Beide benoetigen die gespeicherten Profil-/Kalibrierwerte, damit es beim
@@ -272,8 +350,8 @@ void AppFSM::stateLoadConfig() {
   // Profil-/kalibrierungsabhaengige Hardware erst jetzt initialisieren,
   // nachdem die SD-Konfiguration geladen wurde.
   bool pwmOk = PwmDriver::begin();
-  Serial.print("PCA9685: ");
-  Serial.println(pwmOk ? "OK" : "FEHLER/NICHT GEFUNDEN");
+  DBG_PRINT("PCA9685: ");
+  DBG_PRINTLN(pwmOk ? "OK" : "FEHLER/NICHT GEFUNDEN");
   if (pwmOk) {
     PwmDriver::allOff(ctx_.config);
   }
@@ -302,7 +380,7 @@ void AppFSM::ensureSoftAp() {
   ctx_.networkWifiMode = static_cast<uint8_t>(mode);
 
   if (mode != WIFI_AP_STA) {
-    Serial.println("WLAN-Modus wurde korrigiert: WIFI_AP_STA");
+    DBG_PRINTLN("WLAN-Modus wurde korrigiert: WIFI_AP_STA");
     WiFi.mode(WIFI_AP_STA);
   }
 
@@ -310,7 +388,7 @@ void AppFSM::ensureSoftAp() {
   const char* pass = ctx_.config.apPassword[0] ? ctx_.config.apPassword : DEFAULT_AP_PASSWORD;
 
   if (!validSoftApIp()) {
-    Serial.println("SoftAP nicht aktiv - starte SoftAP erneut");
+    DBG_PRINTLN("SoftAP nicht aktiv - starte SoftAP erneut");
     WiFi.softAP(ssid, pass);
   }
 
@@ -329,8 +407,8 @@ void AppFSM::startStaConnect() {
   const char* hostName = ctx_.config.hostName[0] ? ctx_.config.hostName : DEFAULT_HOSTNAME;
   WiFi.setHostname(hostName);
 
-  Serial.print("Starte nicht-blockierenden WLAN-Client-Verbindungsversuch: ");
-  Serial.println(ctx_.config.staSsid);
+  DBG_PRINT("Starte nicht-blockierenden WLAN-Client-Verbindungsversuch: ");
+  DBG_PRINTLN(ctx_.config.staSsid);
 
   if (ctx_.config.staPassword[0]) {
     WiFi.begin(ctx_.config.staSsid, ctx_.config.staPassword);
@@ -387,7 +465,7 @@ void AppFSM::serviceNetwork() {
 }
 
 void AppFSM::stateInitNetwork() {
-  Serial.println("INIT_NETWORK gestartet");
+  DBG_PRINTLN("INIT_NETWORK gestartet");
 
   WiFi.persistent(false);
   WiFi.setSleep(false);
@@ -400,16 +478,16 @@ void AppFSM::stateInitNetwork() {
 
   WiFi.setHostname(hostName);
 
-  Serial.print("Starte AP mit SSID: ");
-  Serial.println(ssid);
+  DBG_PRINT("Starte AP mit SSID: ");
+  DBG_PRINTLN(ssid);
 
   bool ok = WiFi.softAP(ssid, pass);
 
-  Serial.print("softAP Ergebnis: ");
-  Serial.println(ok ? "OK" : "FEHLER");
+  DBG_PRINT("softAP Ergebnis: ");
+  DBG_PRINTLN(ok ? "OK" : "FEHLER");
 
-  Serial.print("AP IP: ");
-  Serial.println(WiFi.softAPIP());
+  DBG_PRINT("AP IP: ");
+  DBG_PRINTLN(WiFi.softAPIP());
 
   ctx_.networkInitialized = true;
   ctx_.networkApActive = validSoftApIp();
@@ -418,9 +496,9 @@ void AppFSM::stateInitNetwork() {
 
   if (ctx_.config.staEnabled && ctx_.config.staSsid[0]) {
     startStaConnect();
-    Serial.println("WLAN-Client-Verbindung laeuft nicht-blockierend im Hintergrund.");
+    DBG_PRINTLN("WLAN-Client-Verbindung laeuft nicht-blockierend im Hintergrund.");
   } else {
-    Serial.println("WLAN-Client deaktiviert. Nur SoftAP aktiv.");
+    DBG_PRINTLN("WLAN-Client deaktiviert. Nur SoftAP aktiv.");
   }
 
   // MQTT ist rein additiv. Fehlender Broker/WLAN darf die Regelung nie blockieren.
@@ -430,33 +508,33 @@ void AppFSM::stateInitNetwork() {
 }
 
 void AppFSM::stateInitUi() {
-  Serial.println("INIT_UI gestartet");
+  DBG_PRINTLN("INIT_UI gestartet");
   UI::begin(ctx_);
   changeState(SystemState::INIT_SENSORS);
 }
 
 void AppFSM::stateInitSensors() {
   
-  Serial.println("INIT_SENSORS gestartet");
-  Serial.flush();
+  DBG_PRINTLN("INIT_SENSORS gestartet");
+  DBG_FLUSH();
   
-  Serial.println("SinkSensor::begin...");
-  Serial.flush();
+  DBG_PRINTLN("SinkSensor::begin...");
+  DBG_FLUSH();
   bool sinkBusOk = SinkSensor::begin();
-  Serial.println(sinkBusOk ? "SinkSensor OK" : "SinkSensor FEHLER");
-  Serial.flush();
+  DBG_PRINTLN(sinkBusOk ? "SinkSensor OK" : "SinkSensor FEHLER");
+  DBG_FLUSH();
 
-  Serial.println("HeatSourcesMax::begin...");
-  Serial.flush();
+  DBG_PRINTLN("HeatSourcesMax::begin...");
+  DBG_FLUSH();
   bool heatSourcesOk = HeatSourcesMax::begin(ctx_);
-  Serial.println(heatSourcesOk ? "HeatSourcesMax OK" : "HeatSourcesMax FEHLER");
-  Serial.flush();
+  DBG_PRINTLN(heatSourcesOk ? "HeatSourcesMax OK" : "HeatSourcesMax FEHLER");
+  DBG_FLUSH();
 
-  Serial.println("SinkSensor::scanBus...");
-  Serial.flush();
+  DBG_PRINTLN("SinkSensor::scanBus...");
+  DBG_FLUSH();
   SinkSensor::scanBus(ctx_.ds18b20);
-  Serial.println("scanBus fertig");
-  Serial.flush();
+  DBG_PRINTLN("scanBus fertig");
+  DBG_FLUSH();
 
   if (!sinkBusOk) {
     copyFaultText(
@@ -480,8 +558,8 @@ void AppFSM::stateInitSensors() {
     return;
   }
 
-  Serial.println("SensorAssignments::resolveAssignments...");
-  Serial.flush();
+  DBG_PRINTLN("SensorAssignments::resolveAssignments...");
+  DBG_FLUSH();
 
   if (!SensorAssignments::resolveAssignments(ctx_.ds18b20, ctx_.config, ctx_.assignments)) {
     if (ctx_.ds18b20.count == 0) {
@@ -500,54 +578,64 @@ void AppFSM::stateInitSensors() {
       Alarms::raise("ds18b20_role_assignment_required", Alarms::Severity::CRITICAL, "DS18B20 Rollen-Zuordnung erforderlich", false);
     }
 
-    Serial.println("SensorAssignments FEHLER");
-    Serial.flush();
+    DBG_PRINTLN("SensorAssignments FEHLER");
+    DBG_FLUSH();
 
     changeState(SystemState::FAULT);
     return;
   }
 
-  Serial.println("SensorAssignments OK");
-  Serial.flush();
+  DBG_PRINTLN("SensorAssignments OK");
+  DBG_FLUSH();
   Alarms::clear("ds18b20_init_failed");
   Alarms::clear("ds18b20_not_found");
   Alarms::clear("ds18b20_role_assignment_required");
   Alarms::clear("max31865_init_failed");
 
-  Serial.println("Storage::saveSensorAssignments...");
-  Serial.flush();
+  DBG_PRINTLN("Storage::saveSensorAssignments...");
+  DBG_FLUSH();
   Storage::saveSensorAssignments(ctx_.assignments);
-  Serial.println("SensorAssignments gespeichert");
-  Serial.flush();
+  DBG_PRINTLN("SensorAssignments gespeichert");
+  DBG_FLUSH();
 
-  Serial.println("RelayOutputs::begin...");
-  Serial.flush();
+  DBG_PRINTLN("RelayOutputs::begin...");
+  DBG_FLUSH();
   RelayOutputs::begin(ctx_);
   RelayOutputs::allOff(ctx_);
-  Serial.println("RelayOutputs init fertig");
-  Serial.flush();
+  DBG_PRINTLN("RelayOutputs init fertig");
+  DBG_FLUSH();
 
-  Serial.println("Pumps::begin...");
-  Serial.flush();
+  DBG_PRINTLN("Pumps::begin...");
+  DBG_FLUSH();
   Pumps::begin(ctx_);
-  Serial.println("Pumps init fertig");
-  Serial.flush();
+  DBG_PRINTLN("Pumps init fertig");
+  DBG_FLUSH();
 
-  Serial.println("INIT_SENSORS fertig -> SELF_TEST");
-  Serial.flush();
+  DBG_PRINTLN("INIT_SENSORS fertig -> SELF_TEST");
+  DBG_FLUSH();
   SafetyManager::begin(ctx_);
 
   changeState(SystemState::SELF_TEST);
 }
 
 void AppFSM::stateSelfTest() {
-  HeatSourcesMax::startCycle(ctx_);
-
-  while (!HeatSourcesMax::cycleComplete(ctx_)) {
-    HeatSourcesMax::process(ctx_);
-    yield();
+  // Beide Sensorwelten starten denselben Self-Test-Zyklus. Der DS18B20-Pfad
+  // wartet nicht mehr blockierend auf die Conversion, sondern kehrt sofort zurueck.
+  if (!selfTestSensorCycleStarted_) {
+    SinkSensor::startCycle(ctx_.ds18b20);
+    HeatSourcesMax::startCycle(ctx_);
+    selfTestSensorCycleStarted_ = true;
+    return;
   }
 
+  SinkSensor::process(ctx_.ds18b20);
+  HeatSourcesMax::process(ctx_);
+
+  if (!SinkSensor::cycleComplete() || !HeatSourcesMax::cycleComplete(ctx_)) {
+    return;
+  }
+
+  selfTestSensorCycleStarted_ = false;
   EnergyMeter::process(ctx_);
 
   Ds18Role sinkRole = Ds18Role::NONE;
@@ -558,18 +646,18 @@ void AppFSM::stateSelfTest() {
     ctx_.sensors.sinkValid
   );
 
-  Serial.print("SELF_TEST activeHeatSource.role: ");
-  Serial.println((int)ctx_.sensors.activeHeatSource.role);
+  DBG_PRINT("SELF_TEST activeHeatSource.role: ");
+  DBG_PRINTLN((int)ctx_.sensors.activeHeatSource.role);
 
-  Serial.print("SELF_TEST activeHeatSource.tempC: ");
-  Serial.print(ctx_.sensors.activeHeatSource.tempC);
-  Serial.print(" | valid: ");
-  Serial.println(ctx_.sensors.activeHeatSource.valid ? "JA" : "NEIN");
+  DBG_PRINT("SELF_TEST activeHeatSource.tempC: ");
+  DBG_PRINT(ctx_.sensors.activeHeatSource.tempC);
+  DBG_PRINT(" | valid: ");
+  DBG_PRINTLN(ctx_.sensors.activeHeatSource.valid ? "JA" : "NEIN");
 
-  Serial.print("SELF_TEST sinkC: ");
-  Serial.print(ctx_.sensors.sinkC);
-  Serial.print(" | valid: ");
-  Serial.println(ctx_.sensors.sinkValid ? "JA" : "NEIN");
+  DBG_PRINT("SELF_TEST sinkC: ");
+  DBG_PRINT(ctx_.sensors.sinkC);
+  DBG_PRINT(" | valid: ");
+  DBG_PRINTLN(ctx_.sensors.sinkValid ? "JA" : "NEIN");
 
   if (!ctx_.sensors.activeHeatSource.valid || !ctx_.sensors.sinkValid) {
     ctx_.diag.sensorErrorCount++;
@@ -603,15 +691,19 @@ void AppFSM::stateIdle() {
 }
 
 void AppFSM::stateReadSensors() {
+  // Beide Messzyklen werden gemeinsam angestossen. DS18B20 und MAX31865
+  // laufen ab hier als nicht-blockierende FSMs im Hintergrund.
+  SinkSensor::startCycle(ctx_.ds18b20);
   HeatSourcesMax::startCycle(ctx_);
   ctx_.lastSampleAtMs = millis();
   changeState(SystemState::VALIDATE_SENSORS);
 }
 
 void AppFSM::stateValidateSensors() {
+  SinkSensor::process(ctx_.ds18b20);
   HeatSourcesMax::process(ctx_);
 
-  if (!HeatSourcesMax::cycleComplete(ctx_)) {
+  if (!SinkSensor::cycleComplete() || !HeatSourcesMax::cycleComplete(ctx_)) {
     return;
   }
 
@@ -625,15 +717,15 @@ void AppFSM::stateValidateSensors() {
     ctx_.sensors.sinkValid
   );
 
-  Serial.print("READ activeHeatSource.tempC: ");
-  Serial.print(ctx_.sensors.activeHeatSource.tempC);
-  Serial.print(" | valid: ");
-  Serial.println(ctx_.sensors.activeHeatSource.valid ? "JA" : "NEIN");
+  DBG_PRINT("READ activeHeatSource.tempC: ");
+  DBG_PRINT(ctx_.sensors.activeHeatSource.tempC);
+  DBG_PRINT(" | valid: ");
+  DBG_PRINTLN(ctx_.sensors.activeHeatSource.valid ? "JA" : "NEIN");
 
-  Serial.print("READ sinkC: ");
-  Serial.print(ctx_.sensors.sinkC);
-  Serial.print(" | valid: ");
-  Serial.println(ctx_.sensors.sinkValid ? "JA" : "NEIN");
+  DBG_PRINT("READ sinkC: ");
+  DBG_PRINT(ctx_.sensors.sinkC);
+  DBG_PRINT(" | valid: ");
+  DBG_PRINTLN(ctx_.sensors.sinkValid ? "JA" : "NEIN");
 
   if (!ctx_.sensors.activeHeatSource.valid || !ctx_.sensors.sinkValid) {
     ctx_.diag.sensorErrorCount++;
@@ -665,9 +757,9 @@ void AppFSM::stateComputeControl() {
   const auto& safetyStatus = SafetyManager::status();
 
   if (safetyStatus.blockNormalPumpControl) {
-    Serial.print("SAFETY ACTIVE: ");
-    Serial.println(safetyStatus.message);
-    Serial.flush();
+    DBG_PRINT("SAFETY ACTIVE: ");
+    DBG_PRINTLN(safetyStatus.message);
+    DBG_FLUSH();
 
     SafetyManager::applyOutputs(ctx_);
     changeState(SystemState::IDLE);
@@ -675,22 +767,26 @@ void AppFSM::stateComputeControl() {
   }
 
   if (ctx_.commissioning.active) {
-    Serial.println("TESTMODUS AKTIV - Regelung pausiert");
-    Serial.flush();
+    DBG_PRINTLN("TESTMODUS AKTIV - Regelung pausiert");
+    DBG_FLUSH();
     return;
   }
 
   if (UI::commissioningTestActive()) {
-    Serial.println("INBETRIEBNAHME TESTMODUS: normale Ausgangslogik pausiert");
-    Serial.flush();
+    DBG_PRINTLN("INBETRIEBNAHME TESTMODUS: normale Ausgangslogik pausiert");
+    DBG_FLUSH();
     changeState(SystemState::IDLE);
     return;
   }
 
-  Valves::process(ctx_);
-  AuxHeater::process(ctx_);
-  OvenControl::process(ctx_);
+  // Sensorsnapshot-getriebene Regelung:
+  // Pumps::process() enthaelt die temperaturbasierte Differenz-/PID-Regelung
+  // und darf deshalb exakt einmal pro neuem Sensorsnapshot laufen.
   Pumps::process(ctx_);
+
+  // Heizkreis-Sollwerte und Pumpenanforderung bleiben snapshot-getrieben.
+  // HeatingCircuits::process() setzt nur den Mischer-Richtungsauftrag; die
+  // physische Puls-/Pause-FSM laeuft im 100-ms-Fast-Control.
   HeatingCircuits::process(ctx_);
 
   ctx_.diag.lastCollectorC = ctx_.sensors.activeHeatSource.tempC;

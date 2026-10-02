@@ -1,6 +1,7 @@
 #include "feature_servo_driver.h"
 #include "config.h"
 
+#include "feature_build_flags.h"
 namespace {
 
 static constexpr uint32_t SERVO_PWM_FREQUENCY_HZ = 50;
@@ -45,9 +46,9 @@ bool begin() {
   // direkt danach von OvenControl gesetzt. So gibt es auch beim Start keinen
   // kurzen Sprung ausserhalb des kalibrierten Arbeitsbereichs.
 
-  Serial.print("ServoDriver::begin OK GPIO");
-  Serial.println(OVEN_SERVO_PIN);
-  Serial.flush();
+  DBG_PRINT("ServoDriver::begin OK GPIO");
+  DBG_PRINTLN(OVEN_SERVO_PIN);
+  DBG_FLUSH();
 
   return true;
 }

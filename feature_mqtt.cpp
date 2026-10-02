@@ -391,12 +391,6 @@ void publishDiscovery(AppContext& ctx) {
 
   // Schreibbare normale Anlagenkonfiguration. Hardware-, Netzwerk- und Safety-Zuordnungen bleiben bewusst read-only.
   discoverSelect("cfg_active_sink", "Priorität Wärmeabnehmer", "config/active_sink", "config/active_sink", "[\"Boiler\",\"Puffer\"]");
-  discoverNumber("cfg_diff_on", "Solar Einschaltdifferenz", "config/diff_on_c", "config/diff_on_c", 0.5f, 30.0f, 0.5f, "K");
-  discoverNumber("cfg_diff_off", "Solar Ausschaltdifferenz", "config/diff_off_c", "config/diff_off_c", 0.0f, 20.0f, 0.5f, "K");
-  discoverNumber("cfg_pwm_start_diff", "Solar PWM Startdifferenz", "config/pwm_start_diff_c", "config/pwm_start_diff_c", 0.5f, 30.0f, 0.5f, "K");
-  discoverNumber("cfg_pwm_start_pct", "Solar PWM Start", "config/pwm_start_pct", "config/pwm_start_pct", 0, 100, 1, "%");
-  discoverNumber("cfg_pwm_full_diff", "Solar PWM Volldifferenz", "config/pwm_full_diff_c", "config/pwm_full_diff_c", 1, 50, 0.5f, "K");
-  discoverNumber("cfg_pwm_full_pct", "Solar PWM Voll", "config/pwm_full_pct", "config/pwm_full_pct", 0, 100, 1, "%");
 
   for (uint8_t i = 0; i < MAX_PUMPS; ++i) {
     const String n = String(i + 1);
@@ -453,12 +447,6 @@ void publishDiscovery(AppContext& ctx) {
 
 void publishConfigStates(AppContext& ctx) {
   publishState("config/active_sink", ctx.config.activeSinkTarget == SinkTarget::BUFFER_TOP ? "Puffer" : "Boiler");
-  publishState("config/diff_on_c", numberPayload(ctx.config.diffOnC, 2));
-  publishState("config/diff_off_c", numberPayload(ctx.config.diffOffC, 2));
-  publishState("config/pwm_start_diff_c", numberPayload(ctx.config.pwmStartDiffC, 2));
-  publishState("config/pwm_start_pct", String(ctx.config.pwmStartPercent));
-  publishState("config/pwm_full_diff_c", numberPayload(ctx.config.pwmFullDiffC, 2));
-  publishState("config/pwm_full_pct", String(ctx.config.pwmFullPercent));
 
   for (uint8_t i = 0; i < MAX_PUMPS; ++i) {
     const PumpConfig& p = ctx.config.pumps[i];
@@ -610,24 +598,6 @@ bool applyConfigCommand(AppContext& ctx, const String& key, const String& payloa
     if (payload == "Puffer") candidate.activeSinkTarget = SinkTarget::BUFFER_TOP;
     else if (payload == "Boiler") candidate.activeSinkTarget = SinkTarget::BOILER_TOP;
     else { error = "Prioritaet muss Boiler oder Puffer sein"; return false; }
-  } else if (key == "diff_on_c") {
-    if (!inRange(f, 0.5f, 30)) { error = "Einschaltdifferenz ausserhalb 0.5..30 K"; return false; }
-    candidate.diffOnC = f;
-  } else if (key == "diff_off_c") {
-    if (!inRange(f, 0, 20)) { error = "Ausschaltdifferenz ausserhalb 0..20 K"; return false; }
-    candidate.diffOffC = f;
-  } else if (key == "pwm_start_diff_c") {
-    if (!inRange(f, 0.5f, 30)) { error = "PWM-Startdifferenz ausserhalb 0.5..30 K"; return false; }
-    candidate.pwmStartDiffC = f;
-  } else if (key == "pwm_start_pct") {
-    if (iv < 0 || iv > 100) { error = "PWM-Start ausserhalb 0..100 %"; return false; }
-    candidate.pwmStartPercent = (uint8_t)iv;
-  } else if (key == "pwm_full_diff_c") {
-    if (!inRange(f, 1, 50)) { error = "PWM-Volldifferenz ausserhalb 1..50 K"; return false; }
-    candidate.pwmFullDiffC = f;
-  } else if (key == "pwm_full_pct") {
-    if (iv < 0 || iv > 100) { error = "PWM-Voll ausserhalb 0..100 %"; return false; }
-    candidate.pwmFullPercent = (uint8_t)iv;
   } else if (key.startsWith("pump/")) {
     const int slash = key.indexOf('/', 5);
     if (slash < 0) { error = "Pumpenparameter ungueltig"; return false; }

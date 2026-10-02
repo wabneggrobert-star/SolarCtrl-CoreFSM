@@ -9,6 +9,7 @@
 #include <math.h>
 #include <string.h>
 
+#include "feature_build_flags.h"
 namespace {
   SPIClass maxSpi(HSPI);
 
@@ -120,6 +121,13 @@ namespace {
     setStatus(out, "disabled");
   }
 
+  void markRuntimeIoError(MaxChannelReading& out) {
+    resetReading(out);
+    out.present = false;
+    out.valid = false;
+    setStatus(out, "io_error");
+  }
+
   void settleUs(uint32_t us) {
     const uint32_t t0 = micros();
     while ((uint32_t)(micros() - t0) < us) {
@@ -167,6 +175,51 @@ namespace {
     maxSpi.transfer(value);
     maxSpi.endTransaction();
     deselectChannel();
+  }
+
+  // Runtime SPI access for the non-blocking FSM. The PCF8574 I2C write
+  // itself already takes far longer than the MAX31865 CS setup/hold minimum.
+  // Therefore the old millisecond busy-waits are intentionally NOT used here.
+  // Every helper performs one short bus transaction and immediately returns.
+  bool runtimeSelect(MaxChannel ch) {
+    if (!Pcf8574Io::deselectMaxCs()) return false;
+    return Pcf8574Io::selectMax(ch);
+  }
+
+  void runtimeDeselect() {
+    Pcf8574Io::deselectMaxCs();
+  }
+
+  bool runtimeWrite8(MaxChannel ch, uint8_t reg, uint8_t value) {
+    if (!runtimeSelect(ch)) return false;
+    maxSpi.beginTransaction(SPISettings(MAX_SPI_HZ, MSBFIRST, SPI_MODE1));
+    maxSpi.transfer(reg | 0x80);
+    maxSpi.transfer(value);
+    maxSpi.endTransaction();
+    runtimeDeselect();
+    return true;
+  }
+
+  bool runtimeRead8(MaxChannel ch, uint8_t reg, uint8_t& value) {
+    if (!runtimeSelect(ch)) return false;
+    maxSpi.beginTransaction(SPISettings(MAX_SPI_HZ, MSBFIRST, SPI_MODE1));
+    maxSpi.transfer(reg & 0x7F);
+    value = maxSpi.transfer(0x00);
+    maxSpi.endTransaction();
+    runtimeDeselect();
+    return true;
+  }
+
+  bool runtimeRead16(MaxChannel ch, uint8_t regMsb, uint16_t& value) {
+    if (!runtimeSelect(ch)) return false;
+    maxSpi.beginTransaction(SPISettings(MAX_SPI_HZ, MSBFIRST, SPI_MODE1));
+    maxSpi.transfer(regMsb & 0x7F);
+    const uint8_t msb = maxSpi.transfer(0x00);
+    const uint8_t lsb = maxSpi.transfer(0x00);
+    maxSpi.endTransaction();
+    runtimeDeselect();
+    value = (uint16_t(msb) << 8) | uint16_t(lsb);
+    return true;
   }
 
   uint8_t baseConfig(bool includeOneShot = false, bool includeFaultClear = false) {
@@ -613,44 +666,48 @@ namespace {
 namespace HeatSourcesMax {
 
 bool begin(AppContext& ctx) {
-  Serial.println("HeatSourcesMax::begin() START");
-  Serial.flush();
+  DBG_PRINTLN("HeatSourcesMax::begin() START");
+  DBG_FLUSH();
 
-  Serial.println("MAX-PCF begin...");
-  Serial.flush();
+  DBG_PRINTLN("MAX-PCF begin...");
+  DBG_FLUSH();
 
   if (!Pcf8574Io::begin()) {
-    Serial.println("MAX-PCF FEHLER");
-    Serial.flush();
+    DBG_PRINTLN("MAX-PCF FEHLER");
+    DBG_FLUSH();
     g_started = false;
     return false;
   }
 
-  Serial.println("MAX-PCF OK");
-  Serial.flush();
+  DBG_PRINTLN("MAX-PCF OK");
+  DBG_FLUSH();
 
-  Serial.println("MAX-CS deselect...");
-  Serial.flush();
+  DBG_PRINTLN("MAX-CS deselect...");
+  DBG_FLUSH();
   Pcf8574Io::deselectMaxCs();
 
-  Serial.println("MAX SPI begin...");
-  Serial.flush();
+  DBG_PRINTLN("MAX SPI begin...");
+  DBG_FLUSH();
   maxSpi.begin(PIN_MAX_SCK, PIN_MAX_MISO, PIN_MAX_MOSI);
 
-  Serial.println("MAX runtime reset...");
-  Serial.flush();
+  DBG_PRINTLN("MAX runtime reset...");
+  DBG_FLUSH();
 
   for (uint8_t i = 0; i < MAX_MAX31865_CHANNELS; i++) {
     ctx.maxRuntime[i].step = MaxReadStep::IDLE;
     ctx.maxRuntime[i].tMarkUs = 0;
     ctx.maxRuntime[i].cycleDone = true;
+    ctx.maxRuntime[i].pendingRawRtd = 0;
+    ctx.maxRuntime[i].pendingFault = 0;
+    ctx.maxReadings[i].lastUpdateMs = 0;
+    ctx.maxReadings[i].sequence = 0;
     markDisabled(ctx.maxReadings[i]);
   }
 
   g_started = true;
 
-  Serial.println("HeatSourcesMax::begin() OK");
-  Serial.flush();
+  DBG_PRINTLN("HeatSourcesMax::begin() OK");
+  DBG_FLUSH();
 
   return true;
 }
@@ -695,6 +752,8 @@ bool readChannelNow(AppContext& ctx, MaxChannel ch) {
   const uint8_t fault = spiRead8(ch, REG_FAULT_STAT);
 
   evaluateRawReading(out, cfgFor(ctx, ch), raw, fault);
+  out.lastUpdateMs = millis();
+  out.sequence++;
 
   if (out.fault != 0 || out.rawFaultBit) {
     clearFault(ch);
@@ -716,17 +775,147 @@ void startCycle(AppContext& ctx) {
   if (!g_started) return;
   if (anyCycleInProgress(ctx)) return;
 
-  // Centralized runtime read: startCycle now performs a complete measurement
-  // cycle synchronously, so status, regulation and debug use one authoritative
-  // MAX31865 reading path.
-  readAllNow(ctx);
+  // Keep the previous completed reading visible while a new conversion runs.
+  // Consumers therefore always see the latest complete snapshot, never a
+  // half-filled one. Each enabled channel starts the same FSM independently.
+  const MaxChannel channels[MAX_MAX31865_CHANNELS] = {
+    MaxChannel::CH1, MaxChannel::CH2, MaxChannel::CH3, MaxChannel::CH4
+  };
+
+  for (uint8_t i = 0; i < MAX_MAX31865_CHANNELS; i++) {
+    MaxChannelRuntime& rt = ctx.maxRuntime[i];
+    rt.tMarkUs = 0;
+    rt.pendingRawRtd = 0;
+    rt.pendingFault = 0;
+
+    if (!channelEnabled(ctx, channels[i])) {
+      rt.step = MaxReadStep::IDLE;
+      rt.cycleDone = true;
+      markDisabled(ctx.maxReadings[i]);
+      continue;
+    }
+
+    rt.step = MaxReadStep::CLEAR_FAULT;
+    rt.cycleDone = false;
+  }
 }
 
 void process(AppContext& ctx) {
   if (!g_started) return;
 
-  // The runtime read is synchronous in startCycle(). Keep this function for the
-  // existing FSM contract and make sure heat sources are resolved after reads.
+  const MaxChannel channels[MAX_MAX31865_CHANNELS] = {
+    MaxChannel::CH1, MaxChannel::CH2, MaxChannel::CH3, MaxChannel::CH4
+  };
+
+  // Advance every enabled channel by AT MOST ONE FSM state per call. Waiting
+  // states only compare micros(); there is no delay()/busy wait in runtime.
+  for (uint8_t i = 0; i < MAX_MAX31865_CHANNELS; i++) {
+    const MaxChannel ch = channels[i];
+    MaxChannelRuntime& rt = ctx.maxRuntime[i];
+    MaxChannelReading& out = ctx.maxReadings[i];
+
+    if (rt.cycleDone || rt.step == MaxReadStep::IDLE) continue;
+
+    switch (rt.step) {
+      case MaxReadStep::CLEAR_FAULT:
+        if (!runtimeWrite8(ch, REG_CONFIG, baseConfig(false, true))) {
+          markRuntimeIoError(out);
+          out.lastUpdateMs = millis();
+          out.sequence++;
+          rt.step = MaxReadStep::IDLE;
+          rt.cycleDone = true;
+          break;
+        }
+        rt.step = MaxReadStep::BIAS_ON;
+        break;
+
+      case MaxReadStep::BIAS_ON:
+        if (!runtimeWrite8(ch, REG_CONFIG, baseConfig(false, false))) {
+          markRuntimeIoError(out);
+          out.lastUpdateMs = millis();
+          out.sequence++;
+          rt.step = MaxReadStep::IDLE;
+          rt.cycleDone = true;
+          break;
+        }
+        rt.tMarkUs = micros();
+        rt.step = MaxReadStep::WAIT_BIAS;
+        break;
+
+      case MaxReadStep::WAIT_BIAS:
+        if ((uint32_t)(micros() - rt.tMarkUs) >= MAX_BIAS_WAIT_US) {
+          rt.step = MaxReadStep::START_1SHOT;
+        }
+        break;
+
+      case MaxReadStep::START_1SHOT:
+        if (!runtimeWrite8(ch, REG_CONFIG, baseConfig(true, false))) {
+          markRuntimeIoError(out);
+          out.lastUpdateMs = millis();
+          out.sequence++;
+          rt.step = MaxReadStep::IDLE;
+          rt.cycleDone = true;
+          break;
+        }
+        rt.tMarkUs = micros();
+        rt.step = MaxReadStep::WAIT_CONVERSION;
+        break;
+
+      case MaxReadStep::WAIT_CONVERSION:
+        if ((uint32_t)(micros() - rt.tMarkUs) >= MAX_CONV_WAIT_US) {
+          rt.step = MaxReadStep::READ_RTD;
+        }
+        break;
+
+      case MaxReadStep::READ_RTD:
+        if (!runtimeRead16(ch, REG_RTD_MSB, rt.pendingRawRtd)) {
+          markRuntimeIoError(out);
+          out.lastUpdateMs = millis();
+          out.sequence++;
+          rt.step = MaxReadStep::IDLE;
+          rt.cycleDone = true;
+          break;
+        }
+        rt.step = MaxReadStep::READ_FAULT;
+        break;
+
+      case MaxReadStep::READ_FAULT:
+        if (!runtimeRead8(ch, REG_FAULT_STAT, rt.pendingFault)) {
+          markRuntimeIoError(out);
+          out.lastUpdateMs = millis();
+          out.sequence++;
+          rt.step = MaxReadStep::IDLE;
+          rt.cycleDone = true;
+          break;
+        }
+        rt.step = MaxReadStep::FINALIZE;
+        break;
+
+      case MaxReadStep::FINALIZE:
+        evaluateRawReading(out, cfgFor(ctx, ch), rt.pendingRawRtd, rt.pendingFault);
+        out.lastUpdateMs = millis();
+        out.sequence++;
+
+        // Fault cleanup is one short register write, never a timed wait.
+        if (out.fault != 0 || out.rawFaultBit) {
+          runtimeWrite8(ch, REG_CONFIG, baseConfig(false, true));
+        }
+
+        rt.step = MaxReadStep::IDLE;
+        rt.cycleDone = true;
+        break;
+
+      case MaxReadStep::IDLE:
+      default:
+        rt.step = MaxReadStep::IDLE;
+        rt.cycleDone = true;
+        break;
+    }
+  }
+
+  // Publish the heat-source snapshot only after every enabled MAX channel has a
+  // complete result from this cycle. This preserves the existing controller
+  // contract and avoids mixed-generation source data.
   if (allDone(ctx)) {
     HeatSourceAssignments::resolveHeatSources(ctx);
   }
@@ -736,6 +925,7 @@ bool cycleComplete(const AppContext& ctx) {
   return allDone(ctx);
 }
 
+#if SOLARCTRL_MAX_DIAGNOSTICS
 String debugJson(AppContext& ctx, bool runOneShot) {
   String json = "{";
   json += "\"started\":" + String(g_started ? "true" : "false") + ",";
@@ -842,5 +1032,6 @@ String sequenceDiagnosticJson(AppContext& ctx) {
   json += "}";
   return json;
 }
+#endif
 
 }

@@ -116,12 +116,6 @@ static constexpr const char* DEFAULT_SERVICE_PIN = "1234";
 // ======================================================
 // Regelungs-Defaults
 // ======================================================
-static constexpr float   DEFAULT_DIFF_ON         = 3.0f;
-static constexpr float   DEFAULT_DIFF_OFF        = 2.0f;
-static constexpr float   DEFAULT_PWM_START_DIFF  = 3.0f;
-static constexpr uint8_t DEFAULT_PWM_START_PCT   = 30;
-static constexpr float   DEFAULT_PWM_FULL_DIFF   = 10.0f;
-static constexpr uint8_t DEFAULT_PWM_FULL_PCT    = 100;
 
 // Frostschutz
 static constexpr bool    DEFAULT_FROST_ENABLED          = true;

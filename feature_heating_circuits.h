@@ -4,6 +4,17 @@
 namespace HeatingCircuits {
   void begin(AppContext& ctx);
   void process(AppContext& ctx);
+
+  // 100-ms-Mischer-FSM. Fuehrt nur die bereits vom langsamen Regler
+  // angeforderte Mischerrichtung als PULSE -> WAIT -> PULSE aus.
+  void processFast(AppContext& ctx, bool safetyOverride);
+
+  // Vor jedem Safety-Apply werden alte Safety-Mischerauftraege verworfen.
+  void prepareSafetyCycle(AppContext& ctx);
+
+  // Nach Konfigurationsaenderungen/Testbetrieb kann ein einzelner
+  // Mischerzustand sicher verworfen werden.
+  void resetMixerFsm(AppContext& ctx, uint8_t circuitIndex);
   void allOff(AppContext& ctx);
   // Emergency heat dump from a critically hot configured storage through safe
   // mixed heating circuits. Only runs with valid flow/return sensors and never

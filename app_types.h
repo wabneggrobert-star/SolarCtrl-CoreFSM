@@ -185,11 +185,14 @@ enum class HeatSourceKind : uint8_t {
 
 enum class MaxReadStep : uint8_t {
   IDLE = 0,
+  CLEAR_FAULT,
   BIAS_ON,
   WAIT_BIAS,
   START_1SHOT,
   WAIT_CONVERSION,
-  READ_RESULT
+  READ_RTD,
+  READ_FAULT,
+  FINALIZE
 };
 
 struct CommissioningState {
@@ -200,28 +203,33 @@ struct MaxChannelRuntime {
   MaxReadStep step = MaxReadStep::IDLE;
   uint32_t tMarkUs = 0;
   bool cycleDone = false;
+  uint16_t pendingRawRtd = 0;
+  uint8_t pendingFault = 0;
 };
 
-// ===================== DS18B20 Inventar =====================
+// ===================== DS18B20 Inventar / FSM-Snapshot =====================
+enum class Ds18Error : uint8_t {
+  NONE = 0,
+  NOT_READ,
+  DISCONNECTED,
+  OUT_OF_RANGE
+};
+
 struct Ds18b20DeviceInfo {
   bool present = false;
   uint8_t address[8] = {0};
   char addressText[24] = "";
   float lastTempC = NAN;
   bool lastValid = false;
+  uint32_t lastUpdateMs = 0;
+  uint32_t sequence = 0;
+  Ds18Error error = Ds18Error::NOT_READ;
   Ds18Role role = Ds18Role::NONE;
 };
 
 struct Ds18b20Inventory {
   uint8_t count = 0;
   Ds18b20DeviceInfo devices[MAX_DS18B20_SENSORS];
-};
-
-// Kompatibilitätsstruktur alter Sink-Pfad
-struct SensorAssignment {
-  bool sinkAssigned = false;
-  uint8_t sinkAddress[8] = {0};
-  char sinkAddressText[24] = "";
 };
 
 struct Ds18RoleAssignment {
@@ -253,6 +261,8 @@ struct MaxChannelReading {
   uint16_t rtdCode = 0;       // 15-bit RTD-Code: rawRtd >> 1
   uint8_t fault = 0;
   bool rawFaultBit = false;
+  uint32_t lastUpdateMs = 0;  // Zeitpunkt des letzten abgeschlossenen Messwerts
+  uint32_t sequence = 0;      // steigt bei jedem abgeschlossenen Messwert
   char status[40] = "not_read";
 };
 
@@ -403,6 +413,16 @@ struct PumpConfig {
   float pidKi = 0.2f;
   float pidKd = 0.0f;
 
+  // ML V2 Block 3: harte Benutzergrenzen fuer lernbare Solar-Betriebsparameter.
+  // 0.0 / ungueltiges Min/Max-Paar bedeutet: konservative automatische Bounds
+  // relativ zum jeweiligen Basiswert verwenden.
+  float mlStartDiffMinC = 0.0f;
+  float mlStartDiffMaxC = 0.0f;
+  float mlTargetDiffMinC = 0.0f;
+  float mlTargetDiffMaxC = 0.0f;
+  float mlHysteresisMinC = 0.0f;
+  float mlHysteresisMaxC = 0.0f;
+
   // Zuordnung
   // sourceRole: Waermequelle, deren Temperatur fuer diese Pumpe verwendet wird.
   // sinkRole: Ziel-/Abnehmer-Messstelle. NONE bedeutet: aktuell priorisierter Sink aus Config.
@@ -499,16 +519,7 @@ struct AuxHeaterConfig {
 
   Ds18Role sinkRole = Ds18Role::NONE;
 
-  // Legacy-Feld bleibt fuer bestehende system.cfg-Dateien erhalten.
-  // Neue Runtime/UI verwendet pumpOutput, damit die Zusatzheizungs-Pumpe auch auf PO-Schaltausgaengen liegen kann.
-  uint8_t pumpRelay = PIN_UNUSED;
   OutputRef pumpOutput;
-
-  // Legacy-Felder bleiben fuer bestehende system.cfg-Dateien erhalten.
-  // Neue Runtime/UI verwendet heaterOutput1..3, damit Heizstaebe auch auf PO-Schaltausgaengen liegen koennen.
-  uint8_t heaterRelay1 = PIN_UNUSED;
-  uint8_t heaterRelay2 = PIN_UNUSED;
-  uint8_t heaterRelay3 = PIN_UNUSED;
 
   OutputRef heaterOutput1;
   OutputRef heaterOutput2;
@@ -522,7 +533,6 @@ struct AuxHeaterConfig {
 struct OvenConfig {
   bool enabled = false;
 
-  uint8_t pumpRelay = PIN_UNUSED;
   Ds18Role targetSinkRole = Ds18Role::NONE;
 
   // Standby / Startlogik
@@ -540,12 +550,6 @@ struct OvenConfig {
   float pumpOnTemperatureDifferenceC = 8.0f;
   float pumpOffTemperatureDifferenceC = 2.0f;
   float pumpStopDropFromPeakC = 5.0f;
-
-  // Legacy-Winkel bleiben fuer bestehende Configs/API kompatibel, werden aber
-  // fuer die Luftklappenregelung nicht mehr direkt verwendet.
-  uint8_t servoMinimumAngle = 20;
-  uint8_t servoMaximumAngle = 90;
-  uint8_t servoBaseAngle = 0;
 
   // Luftklappen-Kalibrierung: Die Ofenlogik arbeitet in 0..100 % Oeffnung.
   // Erst ganz am Ende wird daraus der echte Servo-Winkel berechnet.
@@ -595,12 +599,6 @@ enum class HeatingCircuitControlMode : uint8_t {
   WEATHER_COMPENSATED = 1
 };
 
-enum class HeatingCircuitPumpMode : uint8_t {
-  NONE = 0,
-  SWITCHED = 1,
-  PWM = 2
-};
-
 struct HeatingCircuitConfig {
   bool enabled = false;
 
@@ -609,11 +607,6 @@ struct HeatingCircuitConfig {
 
   OutputRef mixerOpenOutput;
   OutputRef mixerCloseOutput;
-
-  HeatingCircuitPumpMode pumpMode = HeatingCircuitPumpMode::NONE;
-  OutputRef pumpOutput;
-  uint8_t pumpMinPercent = 30;
-  uint8_t pumpMaxPercent = 100;
 
   Ds18Role flowSensorRole = Ds18Role::NONE;
   Ds18Role returnSensorRole = Ds18Role::NONE;
@@ -706,14 +699,6 @@ struct EnergyMeterRuntime {
 struct ConfigData {
   SinkTarget activeSinkTarget = SinkTarget::BOILER_TOP;
 
-  float diffOnC = 3.0f;
-  float diffOffC = 2.0f;
-
-  float pwmStartDiffC = 3.0f;
-  uint8_t pwmStartPercent = 30;
-
-  float pwmFullDiffC = 10.0f;
-  uint8_t pwmFullPercent = 100;
 
   uint32_t sampleIntervalMs = 2000;
   uint32_t runtimeSaveIntervalMs = 60000;

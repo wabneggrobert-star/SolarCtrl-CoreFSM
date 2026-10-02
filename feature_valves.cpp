@@ -6,6 +6,7 @@
 
 #include <Arduino.h>
 
+#include "feature_build_flags.h"
 namespace {
 
 struct ValveRuntimeState {
@@ -81,14 +82,14 @@ bool isConfigured(const AppContext& ctx, uint8_t valveIndex) {
 
 bool requestPosition(AppContext& ctx, uint8_t valveIndex, ValvePosition position) {
   if (!validValveIndex(valveIndex)) {
-    Serial.println("VALVE V2 ERROR: invalid index");
+    DBG_PRINTLN("VALVE V2 ERROR: invalid index");
     return false;
   }
 
   ValveConfig& cfg = ctx.config.valves[valveIndex];
   if (!isConfigured(ctx, valveIndex)) {
-    Serial.print("VALVE V2 ERROR: valve not configured index=");
-    Serial.println(valveIndex);
+    DBG_PRINT("VALVE V2 ERROR: valve not configured index=");
+    DBG_PRINTLN(valveIndex);
     return false;
   }
 
@@ -102,13 +103,13 @@ bool requestPosition(AppContext& ctx, uint8_t valveIndex, ValvePosition position
     rt.moving = true;
     rt.moveStartedMs = millis();
 
-    Serial.print("VALVE V2 START V");
-    Serial.print(valveIndex + 1);
-    Serial.print(" -> ");
-    Serial.print(positionToKey(position));
-    Serial.print(" Fahrzeit ms=");
-    Serial.println(cfg.travelTimeMs);
-    Serial.flush();
+    DBG_PRINT("VALVE V2 START V");
+    DBG_PRINT(valveIndex + 1);
+    DBG_PRINT(" -> ");
+    DBG_PRINT(positionToKey(position));
+    DBG_PRINT(" Fahrzeit ms=");
+    DBG_PRINTLN(cfg.travelTimeMs);
+    DBG_FLUSH();
   }
 
   if (cfg.travelTimeMs == 0) {
@@ -138,11 +139,11 @@ void process(AppContext& ctx) {
       rt.moving = false;
       driveValveOutput(ctx, cfg, rt.current);
 
-      Serial.print("VALVE V2 END V");
-      Serial.print(i + 1);
-      Serial.print(" = ");
-      Serial.println(positionToKey(rt.current));
-      Serial.flush();
+      DBG_PRINT("VALVE V2 END V");
+      DBG_PRINT(i + 1);
+      DBG_PRINT(" = ");
+      DBG_PRINTLN(positionToKey(rt.current));
+      DBG_FLUSH();
     }
   }
 }

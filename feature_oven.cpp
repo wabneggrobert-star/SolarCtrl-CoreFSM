@@ -4,12 +4,14 @@
 #include "feature_relay_outputs.h"
 #include "feature_pwm_pca9685.h"
 #include "feature_pumps.h"
+#include "feature_ml_optimizer.h"
 #include "feature_safety_manager.h"
 #include "feature_servo_driver.h"
 
 #include <Arduino.h>
 #include <math.h>
 
+#include "feature_build_flags.h"
 namespace {
 
 enum class OvenState : uint8_t {
@@ -30,6 +32,7 @@ uint8_t g_servoAngle = 0;
 uint8_t g_servoOpeningPercent = 0;
 float g_ovenTemperatureC = NAN;
 float g_lastStandbyTemperatureC = NAN;
+uint32_t g_standbyRiseReferenceMs = 0;
 float g_peakTemperatureC = NAN;
 float g_burnoutMinimumTemperatureC = NAN;
 
@@ -101,7 +104,7 @@ bool readTargetTemperature(AppContext& ctx, float& temperatureC) {
   if (role == Ds18Role::NONE) return false;
 
   bool valid = false;
-  SensorAssignments::readByRole(ctx.assignments, role, temperatureC, valid);
+  SensorAssignments::readByRole(ctx.ds18b20, ctx.assignments, role, temperatureC, valid);
   return valid && !isnan(temperatureC);
 }
 
@@ -134,6 +137,8 @@ void initPeak(float ovenTemperatureC) {
   }
 }
 
+void resetStandbyRiseReference(float ovenTemperatureC = NAN);
+
 void updatePeak(float ovenTemperatureC) {
   if (isnan(ovenTemperatureC)) return;
 
@@ -164,6 +169,10 @@ void enterStandby(AppContext& ctx) {
   g_burnoutMinimumTemperatureC = NAN;
   g_lastPumpActive = false;
   clearPeak();
+
+  // Beim Eintritt in Standby beginnt ein neues, zeitlich begrenztes
+  // Autostart-Beobachtungsfenster.
+  resetStandbyRiseReference(g_ovenTemperatureC);
 }
 
 void startBurnoutVenting(AppContext& ctx) {
@@ -177,8 +186,8 @@ void startBurnoutVenting(AppContext& ctx) {
   g_autoStarted = false;
   g_state = OvenState::BURNOUT_VENTING;
 
-  Serial.println("OVEN: Abbrand-/Nachlauf gestartet");
-  Serial.flush();
+  DBG_PRINTLN("OVEN: Abbrand-/Nachlauf gestartet");
+  DBG_FLUSH();
 }
 
 uint32_t burnoutMainMs(const OvenConfig& cfg) {
@@ -188,6 +197,24 @@ uint32_t burnoutMainMs(const OvenConfig& cfg) {
 
 uint32_t burnoutEmberMs(const OvenConfig& cfg) {
   return burnoutMainMs(cfg) / 2UL;
+}
+
+uint32_t autoStartRiseWindowMs(const OvenConfig& cfg) {
+  // Bewusst kein zusaetzlicher UI-Parameter:
+  // Das gleiche Zeitfenster wie Peak-/Abbrandzeit wird fuer die
+  // Autostart-Anstiegserkennung verwendet.
+  return burnoutMainMs(cfg);
+}
+
+void resetStandbyRiseReference(float ovenTemperatureC) {
+  if (isnan(ovenTemperatureC)) {
+    g_lastStandbyTemperatureC = NAN;
+    g_standbyRiseReferenceMs = 0;
+    return;
+  }
+
+  g_lastStandbyTemperatureC = ovenTemperatureC;
+  g_standbyRiseReferenceMs = millis();
 }
 
 bool peakTimeoutReached(const OvenConfig& cfg) {
@@ -223,12 +250,12 @@ bool updateBurnoutVenting(AppContext& ctx, float ovenTemperatureC) {
       ovenTemperatureC >= (g_burnoutMinimumTemperatureC + cfg.autoStartRiseC);
 
   if (restartByRise) {
-    Serial.print("OVEN: Erneuter Abbrand erkannt, Rueckkehr in Regelbetrieb (min=");
-    Serial.print(g_burnoutMinimumTemperatureC, 1);
-    Serial.print(" C, aktuell=");
-    Serial.print(ovenTemperatureC, 1);
-    Serial.println(" C)");
-    Serial.flush();
+    DBG_PRINT("OVEN: Erneuter Abbrand erkannt, Rueckkehr in Regelbetrieb (min=");
+    DBG_PRINT(g_burnoutMinimumTemperatureC, 1);
+    DBG_PRINT(" C, aktuell=");
+    DBG_PRINT(ovenTemperatureC, 1);
+    DBG_PRINTLN(" C)");
+    DBG_FLUSH();
 
     g_state = OvenState::REGULATING;
     g_userRequestedActive = false;
@@ -292,19 +319,85 @@ void activateOven(const OvenConfig& cfg, bool automaticStart) {
 }
 
 void updateAutoStart(const OvenConfig& cfg, float ovenTemperatureC) {
-  if (!cfg.autoStartEnabled) return;
   if (g_userRequestedActive || g_autoStarted) return;
 
-  bool startByTemperature = ovenTemperatureC >= cfg.autoStartTemperatureC;
+  const uint32_t now = millis();
+  const uint32_t riseWindowMs =
+    autoStartRiseWindowMs(cfg);
+
+  // Referenz immer pflegen, auch wenn Auto-Start im UI gerade deaktiviert ist.
+  // Wird Auto-Start spaeter wieder aktiviert, darf keine stundenalte
+  // Raumtemperatur als Referenz verwendet werden.
+  if (isnan(g_lastStandbyTemperatureC) ||
+      g_standbyRiseReferenceMs == 0) {
+    resetStandbyRiseReference(ovenTemperatureC);
+  }
+
+  // Sinkt die Ofentemperatur, wird der tiefere Standby-Wert sofort zur neuen
+  // Referenz. Damit kann ein echter neuer Temperaturanstieg sauber erkannt
+  // werden.
+  if (!isnan(g_lastStandbyTemperatureC) &&
+      ovenTemperatureC < g_lastStandbyTemperatureC) {
+    resetStandbyRiseReference(ovenTemperatureC);
+  }
+
+  // Ist das Zeitfenster abgelaufen, wird die aktuelle Temperatur zur neuen
+  // Referenz. Langsame Raumtemperatur-Aenderungen koennen sich dadurch nicht
+  // ueber Stunden zu autoStartRiseC aufsummieren.
+  if (riseWindowMs > 0 &&
+      g_standbyRiseReferenceMs != 0 &&
+      (uint32_t)(now - g_standbyRiseReferenceMs) > riseWindowMs) {
+    resetStandbyRiseReference(ovenTemperatureC);
+  }
+
+  if (!cfg.autoStartEnabled) return;
+
+  const bool startByTemperature =
+    ovenTemperatureC >= cfg.autoStartTemperatureC;
 
   bool startByRise = false;
-  if (!isnan(g_lastStandbyTemperatureC) && cfg.autoStartRiseC > 0.1f) {
-    startByRise = (ovenTemperatureC - g_lastStandbyTemperatureC) >= cfg.autoStartRiseC;
+
+  if (riseWindowMs > 0 &&
+      cfg.autoStartRiseC > 0.1f &&
+      !isnan(g_lastStandbyTemperatureC) &&
+      g_standbyRiseReferenceMs != 0) {
+    const uint32_t elapsedMs =
+      (uint32_t)(now - g_standbyRiseReferenceMs);
+
+    startByRise =
+      elapsedMs <= riseWindowMs &&
+      (
+        ovenTemperatureC -
+        g_lastStandbyTemperatureC
+      ) >= cfg.autoStartRiseC;
   }
 
   if (startByTemperature || startByRise) {
-    Serial.println("OVEN: Automatischer Start erkannt");
-    Serial.flush();
+    DBG_PRINT("OVEN: Automatischer Start erkannt (");
+    DBG_PRINT(
+      startByTemperature
+        ? "Temperatur"
+        : "schneller Anstieg"
+    );
+
+    if (startByRise) {
+      DBG_PRINT(", Delta=");
+      DBG_PRINT(
+        ovenTemperatureC -
+        g_lastStandbyTemperatureC,
+        1
+      );
+      DBG_PRINT(" K in ");
+      DBG_PRINT(
+        (uint32_t)(now - g_standbyRiseReferenceMs) /
+        60000UL
+      );
+      DBG_PRINT(" min");
+    }
+
+    DBG_PRINTLN(")");
+    DBG_FLUSH();
+
     activateOven(cfg, true);
   }
 }
@@ -359,7 +452,16 @@ void updateServoControl(AppContext& ctx, float ovenTemperatureC) {
   const uint8_t lowReg = (minReg < maxReg) ? minReg : maxReg;
   const uint8_t highReg = (minReg > maxReg) ? minReg : maxReg;
   const uint8_t step = cfg.servoStepPercent == 0 ? 1 : clampPercent(cfg.servoStepPercent);
-  const float deadband = cfg.servoDeadbandC < 0.0f ? 0.0f : cfg.servoDeadbandC;
+  const float baseDeadband =
+    cfg.servoDeadbandC < 0.0f
+      ? 0.0f
+      : cfg.servoDeadbandC;
+
+  const float deadband =
+    MlOptimizer::adjustOvenServoDeadband(
+      ctx,
+      baseDeadband
+    );
 
   if (!g_targetTemperatureReached) {
     openAirFlapForStart(cfg);
@@ -399,6 +501,15 @@ void updateServoControl(AppContext& ctx, float ovenTemperatureC) {
     return;
   }
 
+  // ML V2 darf erst nach seiner eigenen Domain-Freigabe und nur innerhalb der
+  // vom Benutzer gesetzten Min-/Max-Oeffnung korrigieren. Der Optimizer
+  // verhindert zusaetzlich eine Korrektur in thermisch falscher Richtung.
+  nextOpening = MlOptimizer::adjustOvenServoOpening(
+    ctx,
+    nextOpening,
+    ovenTemperatureC
+  );
+
   writeServoOpening(cfg, nextOpening);
 }
 
@@ -411,8 +522,8 @@ void begin(AppContext& ctx) {
   closeAirFlap(ctx.config.oven);
   resetServoControl();
 
-  Serial.println("OvenControl::begin OK");
-  Serial.flush();
+  DBG_PRINTLN("OvenControl::begin OK");
+  DBG_FLUSH();
 }
 
 void allOff(AppContext& ctx) {
@@ -525,9 +636,10 @@ void process(AppContext& ctx) {
     g_burnoutStartedMs = 0;
     g_burnoutMinimumTemperatureC = NAN;
     clearPeak();
+    resetStandbyRiseReference(ovenTemperature);
 
-    Serial.println("OVEN SAFETY: Luftklappe geschlossen");
-    Serial.flush();
+    DBG_PRINTLN("OVEN SAFETY: Luftklappe geschlossen");
+    DBG_FLUSH();
     return;
   }
 
@@ -550,16 +662,12 @@ void process(AppContext& ctx) {
     g_lastPumpActive = false;
     clearPeak();
 
-    if (isnan(g_lastStandbyTemperatureC)) {
-      g_lastStandbyTemperatureC = ovenTemperature;
-    } else if (ovenTemperature < g_lastStandbyTemperatureC) {
-      // Referenz langsam nach unten nachfuehren.
-      g_lastStandbyTemperatureC = ovenTemperature;
-    }
     return;
   }
 
-  g_lastStandbyTemperatureC = ovenTemperature;
+  // Im aktiven Regelbetrieb ist die aktuelle Ofentemperatur die Referenz fuer
+  // einen spaeteren erneuten Standby-Zyklus.
+  resetStandbyRiseReference(ovenTemperature);
   activateOven(cfg, false);
   if (isnan(g_peakTemperatureC)) {
     initPeak(ovenTemperature);

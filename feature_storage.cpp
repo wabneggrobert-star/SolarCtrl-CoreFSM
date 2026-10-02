@@ -82,47 +82,6 @@ namespace {
     return String((double)v, (unsigned int)decimals);
   }
 
-  int findValveByOutput(const ConfigData& cfg, OutputKind kind, uint8_t index) {
-    if (index == PIN_UNUSED || kind == OutputKind::NONE) return -1;
-    for (uint8_t i = 0; i < MAX_VALVES; i++) {
-      const ValveConfig& v = cfg.valves[i];
-      if (v.enabled && v.output.kind == kind && v.output.index == index) return i;
-    }
-    return -1;
-  }
-
-  int findFreeValveSlot(const ConfigData& cfg, uint8_t preferred) {
-    if (preferred < MAX_VALVES) {
-      const ValveConfig& v = cfg.valves[preferred];
-      if (!v.enabled && v.output.index == PIN_UNUSED) return preferred;
-    }
-
-    for (uint8_t i = 0; i < MAX_VALVES; i++) {
-      const ValveConfig& v = cfg.valves[i];
-      if (!v.enabled && v.output.index == PIN_UNUSED) return i;
-    }
-    return -1;
-  }
-
-  void migrateLegacySwitchValve(ConfigData& cfg, uint8_t pumpIndex, bool enabled, uint8_t relayIndex, uint32_t travelTimeMs, bool stateForTargetA) {
-    if (!enabled || relayIndex == PIN_UNUSED || pumpIndex >= MAX_PUMPS) return;
-    if (cfg.pumps[pumpIndex].valveIndex != PIN_UNUSED) return;
-
-    int valveIndex = findValveByOutput(cfg, OutputKind::RELAY, relayIndex);
-    if (valveIndex < 0) valveIndex = findFreeValveSlot(cfg, pumpIndex);
-    if (valveIndex < 0 || valveIndex >= MAX_VALVES) return;
-
-    ValveConfig& valve = cfg.valves[valveIndex];
-    valve.enabled = true;
-    valve.output.kind = OutputKind::RELAY;
-    valve.output.index = relayIndex;
-    valve.travelTimeMs = travelTimeMs > 0 ? travelTimeMs : 15000UL;
-    valve.activeHighForB = !stateForTargetA;
-    valve.safetyPosition = ValvePosition::A;
-
-    cfg.pumps[pumpIndex].valveIndex = (uint8_t)valveIndex;
-  }
-
   RelayFunction relayFunctionFromInt(int v) {
     switch (v) {
       case 1: return RelayFunction::PUMP_ENABLE;
@@ -213,14 +172,6 @@ namespace {
   void setDefaults(ConfigData& cfg) {
     cfg.activeSinkTarget = SinkTarget::BOILER_TOP;
 
-    cfg.diffOnC = DEFAULT_DIFF_ON;
-    cfg.diffOffC = DEFAULT_DIFF_OFF;
-
-    cfg.pwmStartDiffC = DEFAULT_PWM_START_DIFF;
-    cfg.pwmStartPercent = DEFAULT_PWM_START_PCT;
-
-    cfg.pwmFullDiffC = DEFAULT_PWM_FULL_DIFF;
-    cfg.pwmFullPercent = DEFAULT_PWM_FULL_PCT;
 
     cfg.sampleIntervalMs = DEFAULT_SAMPLE_INTERVAL_MS;
     cfg.runtimeSaveIntervalMs = DEFAULT_RUNTIME_SAVE_INTERVAL_MS;
@@ -345,6 +296,12 @@ namespace {
       cfg.pumps[i].pidKp = 10.0f;
       cfg.pumps[i].pidKi = 0.2f;
       cfg.pumps[i].pidKd = 0.0f;
+      cfg.pumps[i].mlStartDiffMinC = 0.0f;
+      cfg.pumps[i].mlStartDiffMaxC = 0.0f;
+      cfg.pumps[i].mlTargetDiffMinC = 0.0f;
+      cfg.pumps[i].mlTargetDiffMaxC = 0.0f;
+      cfg.pumps[i].mlHysteresisMinC = 0.0f;
+      cfg.pumps[i].mlHysteresisMaxC = 0.0f;
       cfg.pumps[i].sourceType = PumpSourceType::HEAT_SOURCE_ROLE;
       cfg.pumps[i].sourceRole = HeatSourceRole::NONE;
       cfg.pumps[i].sourceSensorRole = Ds18Role::NONE;
@@ -391,11 +348,7 @@ namespace {
     cfg.auxHeater.targetTemperatureC = 55.0f;
     cfg.auxHeater.hysteresisC = 2.0f;
     cfg.auxHeater.sinkRole = Ds18Role::NONE;
-    cfg.auxHeater.pumpRelay = PIN_UNUSED;
     cfg.auxHeater.pumpOutput = OutputRef{};
-    cfg.auxHeater.heaterRelay1 = PIN_UNUSED;
-    cfg.auxHeater.heaterRelay2 = PIN_UNUSED;
-    cfg.auxHeater.heaterRelay3 = PIN_UNUSED;
     cfg.auxHeater.heaterOutput1 = OutputRef{};
     cfg.auxHeater.heaterOutput2 = OutputRef{};
     cfg.auxHeater.heaterOutput3 = OutputRef{};
@@ -409,10 +362,6 @@ namespace {
       hk.controlMode = HeatingCircuitControlMode::FIXED_FLOW;
       hk.mixerOpenOutput = OutputRef{};
       hk.mixerCloseOutput = OutputRef{};
-      hk.pumpMode = HeatingCircuitPumpMode::NONE;
-      hk.pumpOutput = OutputRef{};
-      hk.pumpMinPercent = 30;
-      hk.pumpMaxPercent = 100;
       hk.pumpTargetDeltaC = 5.0f;
       hk.pumpFullDeltaC = 12.0f;
       hk.flowSensorRole = Ds18Role::NONE;
@@ -494,24 +443,6 @@ bool loadConfig(ConfigData& cfg) {
   if (v.length()) {
     cfg.activeSinkTarget = (v.toInt() == 1) ? SinkTarget::BUFFER_TOP : SinkTarget::BOILER_TOP;
   }
-
-  v = valueOf(text, "diffOnC");
-  if (v.length()) cfg.diffOnC = v.toFloat();
-
-  v = valueOf(text, "diffOffC");
-  if (v.length()) cfg.diffOffC = v.toFloat();
-
-  v = valueOf(text, "pwmStartDiffC");
-  if (v.length()) cfg.pwmStartDiffC = v.toFloat();
-
-  v = valueOf(text, "pwmStartPercent");
-  if (v.length()) cfg.pwmStartPercent = (uint8_t)v.toInt();
-
-  v = valueOf(text, "pwmFullDiffC");
-  if (v.length()) cfg.pwmFullDiffC = v.toFloat();
-
-  v = valueOf(text, "pwmFullPercent");
-  if (v.length()) cfg.pwmFullPercent = (uint8_t)v.toInt();
 
   v = valueOf(text, "sampleIntervalMs");
   if (v.length()) cfg.sampleIntervalMs = (uint32_t)v.toInt();
@@ -745,15 +676,6 @@ bool loadConfig(ConfigData& cfg) {
     if (v.length()) cfg.pwmOutputs[i].profile = pwmProfileFromInt(v.toInt());
   }
 
-  bool legacySwitchValveEnabled[MAX_PUMPS] = {};
-  uint8_t legacySwitchValveRelayIndex[MAX_PUMPS];
-  uint32_t legacySwitchValveTravelTimeMs[MAX_PUMPS];
-  bool legacySwitchValveStateForTargetA[MAX_PUMPS] = {};
-  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
-    legacySwitchValveRelayIndex[i] = PIN_UNUSED;
-    legacySwitchValveTravelTimeMs[i] = 15000UL;
-  }
-
   // Pumpen-Konfiguration wird hier bereits vorbereitet, UI folgt im naechsten Schritt.
   for (uint8_t i = 0; i < MAX_PUMPS; i++) {
     const String prefix = "pump" + String(i) + "_";
@@ -809,25 +731,29 @@ bool loadConfig(ConfigData& cfg) {
     v = valueOf(text, prefix + "pidKd");
     if (v.length()) cfg.pumps[i].pidKd = v.toFloat();
 
+    v = valueOf(text, prefix + "mlStartDiffMinC");
+    if (v.length()) cfg.pumps[i].mlStartDiffMinC = v.toFloat();
+
+    v = valueOf(text, prefix + "mlStartDiffMaxC");
+    if (v.length()) cfg.pumps[i].mlStartDiffMaxC = v.toFloat();
+
+    v = valueOf(text, prefix + "mlTargetDiffMinC");
+    if (v.length()) cfg.pumps[i].mlTargetDiffMinC = v.toFloat();
+
+    v = valueOf(text, prefix + "mlTargetDiffMaxC");
+    if (v.length()) cfg.pumps[i].mlTargetDiffMaxC = v.toFloat();
+
+    v = valueOf(text, prefix + "mlHysteresisMinC");
+    if (v.length()) cfg.pumps[i].mlHysteresisMinC = v.toFloat();
+
+    v = valueOf(text, prefix + "mlHysteresisMaxC");
+    if (v.length()) cfg.pumps[i].mlHysteresisMaxC = v.toFloat();
+
     v = valueOf(text, prefix + "minPwmPercent");
     if (v.length()) cfg.pumps[i].minPwmPercent = v.toFloat();
 
     v = valueOf(text, prefix + "maxPwmPercent");
     if (v.length()) cfg.pumps[i].maxPwmPercent = v.toFloat();
-
-    // Legacy-Import fuer alte SD-Konfigurationen. Diese Werte werden nur
-    // zwischengespeichert und nach dem Laden von Valve V2 migriert.
-    v = valueOf(text, prefix + "switchValveEnabled");
-    if (v.length()) legacySwitchValveEnabled[i] = (v.toInt() != 0);
-
-    v = valueOf(text, prefix + "switchValveRelayIndex");
-    if (v.length()) legacySwitchValveRelayIndex[i] = (uint8_t)v.toInt();
-
-    v = valueOf(text, prefix + "switchValveTravelTimeMs");
-    if (v.length()) legacySwitchValveTravelTimeMs[i] = (uint32_t)v.toInt();
-
-    v = valueOf(text, prefix + "switchValveStateForTargetA");
-    if (v.length()) legacySwitchValveStateForTargetA[i] = (v.toInt() != 0);
 
     for (uint8_t t = 0; t < PUMP_ROUTE_TARGET_COUNT; t++) {
       const String tPrefix = prefix + "target" + String(t) + "_";
@@ -879,19 +805,6 @@ bool loadConfig(ConfigData& cfg) {
     if (v.length()) cfg.valves[i].lastRequestedPosition = (v.toInt() == 1) ? ValvePosition::B : ValvePosition::A;
   }
 
-  // Abschluss der Legacy-Migration erst nach Valve V2 Load, damit bereits
-  // vorhandene valveX_* Eintraege Vorrang vor alten pumpX_switchValve* Keys haben.
-  for (uint8_t i = 0; i < MAX_PUMPS; i++) {
-    migrateLegacySwitchValve(
-      cfg,
-      i,
-      legacySwitchValveEnabled[i],
-      legacySwitchValveRelayIndex[i],
-      legacySwitchValveTravelTimeMs[i],
-      legacySwitchValveStateForTargetA[i]
-    );
-  }
-
   v = valueOf(text, "auxHeaterEnabled");
   if (v.length()) cfg.auxHeater.enabled = (v.toInt() != 0);
 
@@ -910,56 +823,25 @@ bool loadConfig(ConfigData& cfg) {
   v = valueOf(text, "auxHeaterSinkRole");
   if (v.length()) cfg.auxHeater.sinkRole = ds18RoleFromInt(v.toInt());
 
-  v = valueOf(text, "auxHeaterPumpRelay");
-  if (v.length()) cfg.auxHeater.pumpRelay = (uint8_t)v.toInt();
-
-  bool auxPumpOutputConfigured = false;
   v = valueOf(text, "auxHeaterPumpOutputKind");
-  if (v.length()) { cfg.auxHeater.pumpOutput.kind = (OutputKind)v.toInt(); auxPumpOutputConfigured = true; }
+  if (v.length()) cfg.auxHeater.pumpOutput.kind = (OutputKind)v.toInt();
   v = valueOf(text, "auxHeaterPumpOutputIndex");
-  if (v.length()) { cfg.auxHeater.pumpOutput.index = (uint8_t)v.toInt(); auxPumpOutputConfigured = true; }
-  if (!auxPumpOutputConfigured && cfg.auxHeater.pumpRelay != PIN_UNUSED) {
-    cfg.auxHeater.pumpOutput = OutputRef{OutputKind::RELAY, cfg.auxHeater.pumpRelay};
-  }
-
-  v = valueOf(text, "auxHeaterRelay1");
-  if (v.length()) cfg.auxHeater.heaterRelay1 = (uint8_t)v.toInt();
-
-  v = valueOf(text, "auxHeaterRelay2");
-  if (v.length()) cfg.auxHeater.heaterRelay2 = (uint8_t)v.toInt();
-
-  v = valueOf(text, "auxHeaterRelay3");
-  if (v.length()) cfg.auxHeater.heaterRelay3 = (uint8_t)v.toInt();
-
-  // Neue OutputRef-Konfiguration fuer Heizstab-Stufen.
-  // Legacy auxHeaterRelayX wird weiterhin geladen und auf RELAY migriert,
-  // wenn noch keine neuen auxHeaterOutputXKind/Index-Werte vorhanden sind.
-  bool auxOut1Configured = false;
-  bool auxOut2Configured = false;
-  bool auxOut3Configured = false;
+  if (v.length()) cfg.auxHeater.pumpOutput.index = (uint8_t)v.toInt();
 
   v = valueOf(text, "auxHeaterOutput1Kind");
-  if (v.length()) { cfg.auxHeater.heaterOutput1.kind = (OutputKind)v.toInt(); auxOut1Configured = true; }
+  if (v.length()) cfg.auxHeater.heaterOutput1.kind = (OutputKind)v.toInt();
   v = valueOf(text, "auxHeaterOutput1Index");
-  if (v.length()) { cfg.auxHeater.heaterOutput1.index = (uint8_t)v.toInt(); auxOut1Configured = true; }
+  if (v.length()) cfg.auxHeater.heaterOutput1.index = (uint8_t)v.toInt();
 
   v = valueOf(text, "auxHeaterOutput2Kind");
-  if (v.length()) { cfg.auxHeater.heaterOutput2.kind = (OutputKind)v.toInt(); auxOut2Configured = true; }
+  if (v.length()) cfg.auxHeater.heaterOutput2.kind = (OutputKind)v.toInt();
   v = valueOf(text, "auxHeaterOutput2Index");
-  if (v.length()) { cfg.auxHeater.heaterOutput2.index = (uint8_t)v.toInt(); auxOut2Configured = true; }
+  if (v.length()) cfg.auxHeater.heaterOutput2.index = (uint8_t)v.toInt();
 
   v = valueOf(text, "auxHeaterOutput3Kind");
-  if (v.length()) { cfg.auxHeater.heaterOutput3.kind = (OutputKind)v.toInt(); auxOut3Configured = true; }
+  if (v.length()) cfg.auxHeater.heaterOutput3.kind = (OutputKind)v.toInt();
   v = valueOf(text, "auxHeaterOutput3Index");
-  if (v.length()) { cfg.auxHeater.heaterOutput3.index = (uint8_t)v.toInt(); auxOut3Configured = true; }
-
-  if (!auxOut1Configured && cfg.auxHeater.heaterRelay1 != PIN_UNUSED) cfg.auxHeater.heaterOutput1 = OutputRef{OutputKind::RELAY, cfg.auxHeater.heaterRelay1};
-  if (!auxOut2Configured && cfg.auxHeater.heaterRelay2 != PIN_UNUSED) cfg.auxHeater.heaterOutput2 = OutputRef{OutputKind::RELAY, cfg.auxHeater.heaterRelay2};
-  if (!auxOut3Configured && cfg.auxHeater.heaterRelay3 != PIN_UNUSED) cfg.auxHeater.heaterOutput3 = OutputRef{OutputKind::RELAY, cfg.auxHeater.heaterRelay3};
-
-  cfg.auxHeater.heaterRelay1 = (cfg.auxHeater.heaterOutput1.kind == OutputKind::RELAY) ? cfg.auxHeater.heaterOutput1.index : PIN_UNUSED;
-  cfg.auxHeater.heaterRelay2 = (cfg.auxHeater.heaterOutput2.kind == OutputKind::RELAY) ? cfg.auxHeater.heaterOutput2.index : PIN_UNUSED;
-  cfg.auxHeater.heaterRelay3 = (cfg.auxHeater.heaterOutput3.kind == OutputKind::RELAY) ? cfg.auxHeater.heaterOutput3.index : PIN_UNUSED;
+  if (v.length()) cfg.auxHeater.heaterOutput3.index = (uint8_t)v.toInt();
 
   v = valueOf(text, "auxHeaterPreRunMs");
   if (v.length()) cfg.auxHeater.preRunMs = (uint32_t)v.toInt();
@@ -969,9 +851,6 @@ bool loadConfig(ConfigData& cfg) {
 
   v = valueOf(text, "ovenEnabled");
   if (v.length()) cfg.oven.enabled = (v.toInt() != 0);
-
-  v = valueOf(text, "ovenPumpRelay");
-  if (v.length()) cfg.oven.pumpRelay = (uint8_t)v.toInt();
 
   v = valueOf(text, "ovenTargetOvenTemperatureC");
   if (v.length()) cfg.oven.targetOvenTemperatureC = v.toFloat();
@@ -991,51 +870,11 @@ bool loadConfig(ConfigData& cfg) {
   v = valueOf(text, "ovenPumpOffTemperatureDifferenceC");
   if (v.length()) cfg.oven.pumpOffTemperatureDifferenceC = v.toFloat();
 
-  v = valueOf(text, "ovenServoMinimumAngle");
-  if (v.length()) cfg.oven.servoMinimumAngle = (uint8_t)v.toInt();
-
-  v = valueOf(text, "ovenServoMaximumAngle");
-  if (v.length()) cfg.oven.servoMaximumAngle = (uint8_t)v.toInt();
-
-  v = valueOf(text, "ovenServoBaseAngle");
-  if (v.length()) cfg.oven.servoBaseAngle = (uint8_t)v.toInt();
-
-  // Sicherheitsmigration: Die alte Bedeutung von ovenServoBaseAngle war
-  // eine Regel-/Startgrundstellung. Ab jetzt ist sie die Standby-/
-  // Sicherheitsstellung und muss 0° sein, damit die Luftklappe im Standby,
-  // bei Stop und nach einem Neustart nicht offen bleibt.
-  cfg.oven.servoBaseAngle = 0;
-
-  v = valueOf(text, "ovenPidKp");
-  if (v.length()) cfg.oven.pidKp = v.toFloat();
-
-  v = valueOf(text, "ovenPidKi");
-  if (v.length()) cfg.oven.pidKi = v.toFloat();
-
-  v = valueOf(text, "ovenPidKd");
-  if (v.length()) cfg.oven.pidKd = v.toFloat();
-  
-  v = valueOf(text, "ovenTargetSinkRole");
-  if (v.length()) cfg.oven.targetSinkRole = ds18RoleFromInt(v.toInt());
-  v = valueOf(text, "ovenAutoStartEnabled");
-  if (v.length()) cfg.oven.autoStartEnabled = (v.toInt() != 0);
-
-  v = valueOf(text, "ovenAutoStartTemperatureC");
-  if (v.length()) cfg.oven.autoStartTemperatureC = v.toFloat();
-
-  v = valueOf(text, "ovenAutoStartRiseC");
-  if (v.length()) cfg.oven.autoStartRiseC = v.toFloat();
-
-  v = valueOf(text, "ovenAutoReturnToStandbyTemperatureC");
-  if (v.length()) cfg.oven.autoReturnToStandbyTemperatureC = v.toFloat();
-
-  v = valueOf(text, "ovenPumpStopDropFromPeakC");
-  if (v.length()) cfg.oven.pumpStopDropFromPeakC = v.toFloat();
-
   v = valueOf(text, "ovenServoClosedAngle");
   if (v.length()) cfg.oven.servoClosedAngle = (uint8_t)v.toInt();
   v = valueOf(text, "ovenServoOpenAngle");
   if (v.length()) cfg.oven.servoOpenAngle = (uint8_t)v.toInt();
+
   v = valueOf(text, "ovenServoStandbyOpeningPercent");
   if (v.length()) cfg.oven.servoStandbyOpeningPercent = (uint8_t)v.toInt();
   v = valueOf(text, "ovenServoStartOpeningPercent");
@@ -1075,17 +914,8 @@ bool loadConfig(ConfigData& cfg) {
     v = valueOf(text, prefix + "mixerCloseOutputIndex");
     if (v.length()) hk.mixerCloseOutput.index = (uint8_t)v.toInt();
 
-    v = valueOf(text, prefix + "pumpMode");
-    if (v.length()) hk.pumpMode = (HeatingCircuitPumpMode)v.toInt();
-    v = valueOf(text, prefix + "pumpOutputKind");
-    if (v.length()) hk.pumpOutput.kind = (OutputKind)v.toInt();
-    v = valueOf(text, prefix + "pumpOutputIndex");
-    if (v.length()) hk.pumpOutput.index = (uint8_t)v.toInt();
+    // Historische direkte Heizkreis-Pumpenhardware wird ignoriert.
 
-    v = valueOf(text, prefix + "pumpMinPercent");
-    if (v.length()) hk.pumpMinPercent = (uint8_t)v.toInt();
-    v = valueOf(text, prefix + "pumpMaxPercent");
-    if (v.length()) hk.pumpMaxPercent = (uint8_t)v.toInt();
     v = valueOf(text, prefix + "pumpTargetDeltaC");
     if (v.length()) hk.pumpTargetDeltaC = v.toFloat();
     v = valueOf(text, prefix + "pumpFullDeltaC");
@@ -1147,15 +977,6 @@ bool saveConfig(const ConfigData& cfg) {
   String text;
 
   text += "activeSinkTarget=" + String(cfg.activeSinkTarget == SinkTarget::BUFFER_TOP ? 1 : 0) + "\n";
-
-  text += "diffOnC=" + String(cfg.diffOnC, 2) + "\n";
-  text += "diffOffC=" + String(cfg.diffOffC, 2) + "\n";
-
-  text += "pwmStartDiffC=" + String(cfg.pwmStartDiffC, 2) + "\n";
-  text += "pwmStartPercent=" + String(cfg.pwmStartPercent) + "\n";
-
-  text += "pwmFullDiffC=" + String(cfg.pwmFullDiffC, 2) + "\n";
-  text += "pwmFullPercent=" + String(cfg.pwmFullPercent) + "\n";
 
   text += "sampleIntervalMs=" + String(cfg.sampleIntervalMs) + "\n";
   text += "runtimeSaveIntervalMs=" + String(cfg.runtimeSaveIntervalMs) + "\n";
@@ -1298,6 +1119,12 @@ bool saveConfig(const ConfigData& cfg) {
     text += prefix + "pidKp=" + String(cfg.pumps[i].pidKp, 4) + "\n";
     text += prefix + "pidKi=" + String(cfg.pumps[i].pidKi, 4) + "\n";
     text += prefix + "pidKd=" + String(cfg.pumps[i].pidKd, 4) + "\n";
+    text += prefix + "mlStartDiffMinC=" + String(cfg.pumps[i].mlStartDiffMinC, 2) + "\n";
+    text += prefix + "mlStartDiffMaxC=" + String(cfg.pumps[i].mlStartDiffMaxC, 2) + "\n";
+    text += prefix + "mlTargetDiffMinC=" + String(cfg.pumps[i].mlTargetDiffMinC, 2) + "\n";
+    text += prefix + "mlTargetDiffMaxC=" + String(cfg.pumps[i].mlTargetDiffMaxC, 2) + "\n";
+    text += prefix + "mlHysteresisMinC=" + String(cfg.pumps[i].mlHysteresisMinC, 2) + "\n";
+    text += prefix + "mlHysteresisMaxC=" + String(cfg.pumps[i].mlHysteresisMaxC, 2) + "\n";
     text += prefix + "minPwmPercent=" + String(cfg.pumps[i].minPwmPercent, 2) + "\n";
     text += prefix + "maxPwmPercent=" + String(cfg.pumps[i].maxPwmPercent, 2) + "\n";
 
@@ -1330,12 +1157,8 @@ bool saveConfig(const ConfigData& cfg) {
   text += "auxHeaterTargetTemperatureC=" + String(cfg.auxHeater.targetTemperatureC, 2) + "\n";
   text += "auxHeaterHysteresisC=" + String(cfg.auxHeater.hysteresisC, 2) + "\n";
   text += "auxHeaterSinkRole=" + String(ds18RoleToInt(cfg.auxHeater.sinkRole)) + "\n";
-  text += "auxHeaterPumpRelay=" + String((cfg.auxHeater.pumpOutput.kind == OutputKind::RELAY) ? cfg.auxHeater.pumpOutput.index : PIN_UNUSED) + "\n";
   text += "auxHeaterPumpOutputKind=" + String((int)cfg.auxHeater.pumpOutput.kind) + "\n";
   text += "auxHeaterPumpOutputIndex=" + String(cfg.auxHeater.pumpOutput.index) + "\n";
-  text += "auxHeaterRelay1=" + String((cfg.auxHeater.heaterOutput1.kind == OutputKind::RELAY) ? cfg.auxHeater.heaterOutput1.index : PIN_UNUSED) + "\n";
-  text += "auxHeaterRelay2=" + String((cfg.auxHeater.heaterOutput2.kind == OutputKind::RELAY) ? cfg.auxHeater.heaterOutput2.index : PIN_UNUSED) + "\n";
-  text += "auxHeaterRelay3=" + String((cfg.auxHeater.heaterOutput3.kind == OutputKind::RELAY) ? cfg.auxHeater.heaterOutput3.index : PIN_UNUSED) + "\n";
   text += "auxHeaterOutput1Kind=" + String((int)cfg.auxHeater.heaterOutput1.kind) + "\n";
   text += "auxHeaterOutput1Index=" + String(cfg.auxHeater.heaterOutput1.index) + "\n";
   text += "auxHeaterOutput2Kind=" + String((int)cfg.auxHeater.heaterOutput2.kind) + "\n";
@@ -1346,16 +1169,12 @@ bool saveConfig(const ConfigData& cfg) {
   text += "auxHeaterCooldownMs=" + String(cfg.auxHeater.cooldownMs) + "\n";
 
   text += "ovenEnabled=" + String(cfg.oven.enabled ? 1 : 0) + "\n";
-  text += "ovenPumpRelay=" + String(cfg.oven.pumpRelay) + "\n";
   text += "ovenTargetOvenTemperatureC=" + String(cfg.oven.targetOvenTemperatureC) + "\n";
   text += "ovenCriticalOvenTemperatureC=" + String(cfg.oven.criticalOvenTemperatureC) + "\n";
   text += "ovenPumpOnTemperatureC=" + String(cfg.oven.pumpOnTemperatureC) + "\n";
   text += "ovenPumpHysteresisC=" + String(cfg.oven.pumpHysteresisC) + "\n";
   text += "ovenPumpOnTemperatureDifferenceC=" + String(cfg.oven.pumpOnTemperatureDifferenceC) + "\n";
   text += "ovenPumpOffTemperatureDifferenceC=" + String(cfg.oven.pumpOffTemperatureDifferenceC) + "\n";
-  text += "ovenServoMinimumAngle=" +  String(cfg.oven.servoMinimumAngle) + "\n";
-  text += "ovenServoMaximumAngle=" + String(cfg.oven.servoMaximumAngle) + "\n";
-  text += "ovenServoBaseAngle=" + String(cfg.oven.servoBaseAngle) + "\n";
   text += "ovenPidKp=" + String(cfg.oven.pidKp) + "\n";
   text += "ovenPidKi=" + String(cfg.oven.pidKi) + "\n";
   text += "ovenPidKd=" + String(cfg.oven.pidKd) + "\n";
@@ -1390,11 +1209,6 @@ bool saveConfig(const ConfigData& cfg) {
     text += prefix + "mixerOpenOutputIndex=" + String(hk.mixerOpenOutput.index) + "\n";
     text += prefix + "mixerCloseOutputKind=" + String((int)hk.mixerCloseOutput.kind) + "\n";
     text += prefix + "mixerCloseOutputIndex=" + String(hk.mixerCloseOutput.index) + "\n";
-    text += prefix + "pumpMode=" + String((int)hk.pumpMode) + "\n";
-    text += prefix + "pumpOutputKind=" + String((int)hk.pumpOutput.kind) + "\n";
-    text += prefix + "pumpOutputIndex=" + String(hk.pumpOutput.index) + "\n";
-    text += prefix + "pumpMinPercent=" + String(hk.pumpMinPercent) + "\n";
-    text += prefix + "pumpMaxPercent=" + String(hk.pumpMaxPercent) + "\n";
     text += prefix + "pumpTargetDeltaC=" + String(hk.pumpTargetDeltaC, 2) + "\n";
     text += prefix + "pumpFullDeltaC=" + String(hk.pumpFullDeltaC, 2) + "\n";
     text += prefix + "flowSensorRole=" + String(ds18RoleToInt(hk.flowSensorRole)) + "\n";

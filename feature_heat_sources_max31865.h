@@ -1,5 +1,6 @@
 #pragma once
 #include "app_types.h"
+#include "feature_build_flags.h"
 
 namespace HeatSourcesMax {
 
@@ -9,11 +10,13 @@ namespace HeatSourcesMax {
   void process(AppContext& ctx);
   bool cycleComplete(const AppContext& ctx);
 
-  // Blocking one-shot read. This is the single authoritative MAX31865
-  // read routine used by the normal runtime path and the debug endpoint.
+  // Blocking helpers are retained only for explicit diagnostics/service use.
+  // The normal controller path uses startCycle()/process() and never waits for
+  // MAX31865 bias or conversion timing inside one loop pass.
   bool readChannelNow(AppContext& ctx, MaxChannel ch);
   void readAllNow(AppContext& ctx);
 
+#if SOLARCTRL_MAX_DIAGNOSTICS
   // Blocking debug read for browser endpoint /api/max-debug.
   // Does not change application configuration; it only toggles MAX31865 CS lines
   // and optionally triggers one-shot conversions for diagnosis.
@@ -29,5 +32,6 @@ namespace HeatSourcesMax {
   // ADC3/ADC4 register reads to expose possible CS cross-talk. CONFIG is
   // restored afterwards; threshold registers are never written.
   String sequenceDiagnosticJson(AppContext& ctx);
+#endif
 
 }

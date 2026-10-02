@@ -215,6 +215,11 @@ bool validateConfig(const ConfigData& cfg, String& error) {
 
     if ((pump.mode == PumpMode::RELAY || pump.mode == PumpMode::PWM) &&
         pump.relayIndex != PIN_UNUSED) {
+      const OutputRef enableRef{OutputKind::RELAY, pump.relayIndex};
+      if (!outputSupportsFunction(cfg, enableRef, RelayFunction::PUMP_ENABLE)) {
+        error = "Pumpe " + String(i + 1) + ": Pump Enable Ausgang ungueltig";
+        return false;
+      }
       if (!addOutput(
               relaySlots,
               pwmSlots,
@@ -285,6 +290,26 @@ bool validateConfig(const ConfigData& cfg, String& error) {
   const AuxHeaterConfig& aux = cfg.auxHeater;
 
   if (aux.enabled) {
+    if (outputRefAssigned(aux.pumpOutput) &&
+        !outputSupportsFunction(cfg, aux.pumpOutput, RelayFunction::PUMP_ENABLE)) {
+      error = "Zusatzheizung Pumpe: falsche Ausgangsfunktion";
+      return false;
+    }
+    if (outputRefAssigned(aux.heaterOutput1) &&
+        !outputSupportsFunction(cfg, aux.heaterOutput1, RelayFunction::HEATER_ROD)) {
+      error = "Zusatzheizung Heizstab 1: falsche Ausgangsfunktion";
+      return false;
+    }
+    if (outputRefAssigned(aux.heaterOutput2) &&
+        !outputSupportsFunction(cfg, aux.heaterOutput2, RelayFunction::HEATER_ROD)) {
+      error = "Zusatzheizung Heizstab 2: falsche Ausgangsfunktion";
+      return false;
+    }
+    if (outputRefAssigned(aux.heaterOutput3) &&
+        !outputSupportsFunction(cfg, aux.heaterOutput3, RelayFunction::HEATER_ROD)) {
+      error = "Zusatzheizung Heizstab 3: falsche Ausgangsfunktion";
+      return false;
+    }
     if (!addOutputRef(relaySlots, pwmSlots, aux.pumpOutput, "Zusatzheizung Pumpe", error)) return false;
     if (!addOutputRef(relaySlots, pwmSlots, aux.heaterOutput1, "Zusatzheizung Heizstab Stufe 1", error)) return false;
     if (!addOutputRef(relaySlots, pwmSlots, aux.heaterOutput2, "Zusatzheizung Heizstab Stufe 2", error)) return false;
@@ -324,7 +349,16 @@ bool validateConfig(const ConfigData& cfg, String& error) {
     if (!validateHeatingCircuitInternal(hk, i, error)) {
       return false;
     }
-
+    if (outputRefAssigned(hk.mixerOpenOutput) &&
+        !outputSupportsFunction(cfg, hk.mixerOpenOutput, RelayFunction::MIXER)) {
+      error = "HK" + String(i + 1) + ": Mischer AUF hat falsche Ausgangsfunktion";
+      return false;
+    }
+    if (outputRefAssigned(hk.mixerCloseOutput) &&
+        !outputSupportsFunction(cfg, hk.mixerCloseOutput, RelayFunction::MIXER)) {
+      error = "HK" + String(i + 1) + ": Mischer ZU hat falsche Ausgangsfunktion";
+      return false;
+    }
     if (!addOutputRef(relaySlots, pwmSlots, hk.mixerOpenOutput, "HK" + String(i + 1) + " Mischer AUF", error)) return false;
     if (!addOutputRef(relaySlots, pwmSlots, hk.mixerCloseOutput, "HK" + String(i + 1) + " Mischer ZU", error)) return false;
   }

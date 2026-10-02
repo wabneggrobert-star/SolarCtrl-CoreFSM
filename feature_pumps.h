@@ -5,6 +5,12 @@ namespace Pumps {
 
   void begin(AppContext& ctx);
   void process(AppContext& ctx);
+
+  // Schneller, nicht-regelnder Pumpendienst fuer den Fast-Control-Scheduler.
+  // Aktualisiert nur die nonblocking Feedback-Erfassung und fuehrt KEINEN
+  // PID-/Differenz-/Routing-Schritt aus. Dadurch wird derselbe Sensorsnapshot
+  // nicht mehrfach in den PID integriert.
+  void processFast(AppContext& ctx);
   void allOff(AppContext& ctx);
   void safetyAllOff(AppContext& ctx);
   void safetyAllOffExceptOven(AppContext& ctx);

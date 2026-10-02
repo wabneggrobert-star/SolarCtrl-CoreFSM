@@ -161,7 +161,7 @@ void ensureForecastCsv() {
 
 float roleTemp(const AppContext& ctx, Ds18Role role) {
   float t=NAN; bool valid=false;
-  SensorAssignments::readByRole(ctx.assignments, role, t, valid);
+  SensorAssignments::readByRole(ctx.ds18b20, ctx.assignments, role, t, valid);
   return valid ? t : NAN;
 }
 

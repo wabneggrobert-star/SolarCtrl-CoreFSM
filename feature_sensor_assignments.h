@@ -9,7 +9,7 @@ namespace SensorAssignments {
   bool removeRole(SensorAssignmentTable& table, Ds18Role role);
   bool inventoryContainsAddress(const Ds18b20Inventory& inventory, const uint8_t address[8]);
   bool assignRoleByAddressText(const Ds18b20Inventory& inventory, const String& addressText, Ds18Role role, SensorAssignmentTable& table);
-  bool readByRole(const SensorAssignmentTable& table, Ds18Role role, float& tempC, bool& valid);
+  bool readByRole(const Ds18b20Inventory& inventory, const SensorAssignmentTable& table, Ds18Role role, float& tempC, bool& valid);
   Ds18Role activeSinkRole(const ConfigData& config);
   bool autoAssignSingleSensorAsActiveSink(const Ds18b20Inventory& inventory, const ConfigData& config, SensorAssignmentTable& table);
   bool resolveAssignments(const Ds18b20Inventory& inventory, const ConfigData& config, SensorAssignmentTable& table);

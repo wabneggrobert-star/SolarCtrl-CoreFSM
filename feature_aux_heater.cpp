@@ -9,6 +9,7 @@
 #include <Arduino.h>
 #include <math.h>
 
+#include "feature_build_flags.h"
 namespace {
 
 enum class AuxState : uint8_t {
@@ -61,9 +62,9 @@ bool sameOutputRef(const OutputRef& a, const OutputRef& b) {
 
 OutputRef stageOutput(const AuxHeaterConfig& cfg, uint8_t stageIndex) {
   switch (stageIndex) {
-    case 0: return outputAssigned(cfg.heaterOutput1) ? cfg.heaterOutput1 : OutputRef{OutputKind::RELAY, cfg.heaterRelay1};
-    case 1: return outputAssigned(cfg.heaterOutput2) ? cfg.heaterOutput2 : OutputRef{OutputKind::RELAY, cfg.heaterRelay2};
-    case 2: return outputAssigned(cfg.heaterOutput3) ? cfg.heaterOutput3 : OutputRef{OutputKind::RELAY, cfg.heaterRelay3};
+    case 0: return cfg.heaterOutput1;
+    case 1: return cfg.heaterOutput2;
+    case 2: return cfg.heaterOutput3;
     default: return OutputRef{};
   }
 }
@@ -120,7 +121,7 @@ void resetOutputCache() {
 }
 
 OutputRef pumpOutput(const AuxHeaterConfig& cfg) {
-  return outputAssigned(cfg.pumpOutput) ? cfg.pumpOutput : OutputRef{OutputKind::RELAY, cfg.pumpRelay};
+  return cfg.pumpOutput;
 }
 
 void setPump(AppContext& ctx, bool on) {
@@ -234,6 +235,7 @@ bool readTargetTemperature(AppContext& ctx, float& temperatureC) {
 
   bool valid = false;
   if (!SensorAssignments::readByRole(
+        ctx.ds18b20,
         ctx.assignments,
         ctx.config.auxHeater.sinkRole,
         temperatureC,
@@ -310,8 +312,8 @@ void resumeAfterTestMode() {
   // dort weiterlaufen, wo er vorher war.
   resetOutputCache();
 
-  Serial.println("AUX HEATER: Testmodus beendet - Ausgangs-Cache verworfen");
-  Serial.flush();
+  DBG_PRINTLN("AUX HEATER: Testmodus beendet - Ausgangs-Cache verworfen");
+  DBG_FLUSH();
 }
 
 bool heatingActive() {
@@ -376,13 +378,13 @@ void process(AppContext& ctx) {
       if (targetTemperatureC < cfg.minimumTemperatureC) {
         if (MlOptimizer::shouldDelayAuxHeater(ctx, targetTemperatureC)) {
           // Komfortfunktion: nur verzögern, niemals Grundregelung oder Safety ersetzen.
-          Serial.println("AUX HEATER: Forecast-Verzoegerung aktiv");
+          DBG_PRINTLN("AUX HEATER: Forecast-Verzoegerung aktiv");
           break;
         }
         setPump(ctx, true);
         g_state = AuxState::PRE_RUN;
         g_stateStartedMs = now;
-        Serial.println("AUX HEATER: Pumpenvorlauf gestartet");
+        DBG_PRINTLN("AUX HEATER: Pumpenvorlauf gestartet");
       }
       break;
 
@@ -391,7 +393,7 @@ void process(AppContext& ctx) {
       setPump(ctx, true);
 
       if (!cfg.userReleaseEnabled) {
-        Serial.println("AUX HEATER: Freigabe im Vorlauf entzogen, Nachlauf gestartet");
+        DBG_PRINTLN("AUX HEATER: Freigabe im Vorlauf entzogen, Nachlauf gestartet");
         enterCooldown(ctx);
         break;
       }
@@ -410,7 +412,7 @@ void process(AppContext& ctx) {
         g_stateStartedMs = now;
         g_activeStageCount = 0;
         g_lastStageChangeMs = 0;
-        Serial.println("AUX HEATER: Heizbetrieb gestartet");
+        DBG_PRINTLN("AUX HEATER: Heizbetrieb gestartet");
       }
       break;
 
@@ -418,7 +420,7 @@ void process(AppContext& ctx) {
       setPump(ctx, true);
 
       if (!cfg.userReleaseEnabled) {
-        Serial.println("AUX HEATER: Freigabe entzogen, geordnetes Abschalten gestartet");
+        DBG_PRINTLN("AUX HEATER: Freigabe entzogen, geordnetes Abschalten gestartet");
         beginReleaseRampdown(ctx, now);
         break;
       }
@@ -426,7 +428,7 @@ void process(AppContext& ctx) {
       // Optionaler ML-Overlay: nur bei freigegebenem Modell und niemals unterhalb
       // der vom Nutzer gesetzten Mindesttemperatur. Safety bleibt davor dominant.
       if (MlOptimizer::shouldStopAuxHeaterEarly(ctx, targetTemperatureC)) {
-        Serial.println("AUX HEATER: ML empfiehlt fruehes Abschalten, Nachlauf gestartet");
+        DBG_PRINTLN("AUX HEATER: ML empfiehlt fruehes Abschalten, Nachlauf gestartet");
         enterCooldown(ctx);
         break;
       }
@@ -434,7 +436,7 @@ void process(AppContext& ctx) {
       const uint8_t requestedStages = requestedStageCount(cfg, targetTemperatureC);
 
       if (requestedStages == 0) {
-        Serial.println("AUX HEATER: Zieltemperatur erreicht, Nachlauf gestartet");
+        DBG_PRINTLN("AUX HEATER: Zieltemperatur erreicht, Nachlauf gestartet");
         enterCooldown(ctx);
         break;
       }
@@ -450,14 +452,14 @@ void process(AppContext& ctx) {
           (uint32_t)(now - g_lastStageChangeMs) >= AUX_STAGE_STEP_DELAY_MS) {
         setHeaterStageCount(ctx, g_activeStageCount - 1);
         g_lastStageChangeMs = now;
-        Serial.print("AUX HEATER: Freigabe aus - Reststufen ");
-        Serial.println(g_activeStageCount);
+        DBG_PRINT("AUX HEATER: Freigabe aus - Reststufen ");
+        DBG_PRINTLN(g_activeStageCount);
       }
 
       if (g_activeStageCount == 0) {
         g_state = AuxState::COOLDOWN;
         g_stateStartedMs = now;
-        Serial.println("AUX HEATER: Heizstaebe aus, Pumpennachlauf gestartet");
+        DBG_PRINTLN("AUX HEATER: Heizstaebe aus, Pumpennachlauf gestartet");
       }
       break;
 
@@ -469,7 +471,7 @@ void process(AppContext& ctx) {
         setPump(ctx, false);
         g_state = AuxState::IDLE;
         g_stateStartedMs = now;
-        Serial.println("AUX HEATER: Nachlauf beendet");
+        DBG_PRINTLN("AUX HEATER: Nachlauf beendet");
       }
       break;
   }
