@@ -10,6 +10,12 @@ public:
   void loop();
   void update() { loop(); }
 
+  // Phase 1C: explicit runtime boundary. Both functions still execute on the
+  // Arduino loop task in Stage 1; later the control side can be pinned to
+  // Core 0 without moving service code with it.
+  void updateControl();
+  void updateServices();
+
   AppContext& context() { return ctx_; }
 
 private:

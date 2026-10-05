@@ -26,6 +26,8 @@
 #include "feature_ml_optimizer.h"
 #include "feature_fluid_properties.h"
 #include "feature_history.h"
+#include "feature_runtime_diag.h"
+#include "feature_ui_bridge.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -69,6 +71,50 @@ namespace {
   // Fuer den globalen Plausibilitaetscheck wird deshalb zuerst ein tatsaechlich
   // konfiguriertes Pumpenziel gesucht. Nur wenn keines vorhanden ist, folgen die
   // Legacy-Prioritaet und zuletzt irgendein gueltig zugewiesener Speichersensor.
+
+  void processUiCommandQueue(AppContext& ctx) {
+    // Bound the amount of command work per control pass. Commands are fixed-size
+    // and never wait for the UI/Web core.
+    for (uint8_t processed = 0; processed < 2; ++processed) {
+      UIBridge::ControlCommand command;
+      if (!UIBridge::dequeueCommand(command)) return;
+
+      if (command.type != UIBridge::CommandType::USER_COMMAND) {
+        UIBridge::completeCommand(command.id, false, 400, "unknown_command_type");
+        continue;
+      }
+
+      switch ((UIBridge::ControlAction)command.action) {
+        case UIBridge::ControlAction::BUZZER_MUTE:
+          Alarms::setBuzzerMuted(command.valueA != 0);
+          UIBridge::completeCommand(command.id, true, 200, "applied");
+          break;
+
+        case UIBridge::ControlAction::OVEN_START:
+          if (!ctx.config.oven.enabled) {
+            UIBridge::completeCommand(command.id, false, 409, "oven_disabled");
+          } else if (!ctx.sensors.heatSources.altSourceOvenValid) {
+            UIBridge::completeCommand(command.id, false, 409, "oven_source_invalid");
+          } else if (SafetyManager::status().ovenOvertemperatureActive) {
+            UIBridge::completeCommand(command.id, false, 409, "oven_safety_active");
+          } else {
+            OvenControl::requestStart();
+            UIBridge::completeCommand(command.id, true, 200, "applied");
+          }
+          break;
+
+        case UIBridge::ControlAction::OVEN_STOP:
+          OvenControl::requestStop(ctx);
+          UIBridge::completeCommand(command.id, true, 200, "applied");
+          break;
+
+        default:
+          UIBridge::completeCommand(command.id, false, 400, "unknown_action");
+          break;
+      }
+    }
+  }
+
   bool readConfiguredStorageSink(AppContext& ctx, Ds18Role& role, float& tempC, bool& valid) {
     role = Ds18Role::NONE;
     tempC = NAN;
@@ -129,6 +175,7 @@ AppFSM::AppFSM() {
 }
 
 void AppFSM::begin() {
+  UIBridge::begin();
   Serial.begin(SERIAL_BAUDRATE);
   delay(50);
 
@@ -143,6 +190,20 @@ void AppFSM::begin() {
 }
 
 void AppFSM::loop() {
+  // Compatibility wrapper. Phase 1C Stage 1 keeps execution single-core while
+  // establishing a hard code boundary between control and services.
+  updateControl();
+  updateServices();
+}
+
+void AppFSM::updateControl() {
+  uint32_t tSection = micros();
+  const uint8_t stateBefore = (uint8_t)ctx_.state;
+
+  // Phase 1D Stage 2: consume only bounded fixed-size UI commands here.
+  // The web/UI side never calls these control mutations directly anymore.
+  processUiCommandQueue(ctx_);
+
   switch (ctx_.state) {
     case SystemState::BOOT:
       changeState(SystemState::INIT_HW);
@@ -209,27 +270,53 @@ void AppFSM::loop() {
       break;
   }
 
-  // Zeitkritische Aktor-/Timerlogik ist vom langsamen Sensorsample getrennt.
-  // Der Scheduler arbeitet auch waehrend DS18B20/MAX31865 auf ihre Conversion
-  // warten. Safety bleibt dabei immer vorrangig.
+  const uint32_t elapsed = (uint32_t)(micros() - tSection);
+  RuntimeDiag::recordSection(RuntimeDiag::ControlSection::STATE, elapsed);
+  RuntimeDiag::recordState(stateBefore, elapsed);
+
+  tSection = micros();
   runFastControlScheduler();
+  RuntimeDiag::recordSection(RuntimeDiag::ControlSection::FAST_CONTROL, (uint32_t)(micros() - tSection));
+
+  // Phase 1D: publish a fixed, immutable UI snapshot. In Stage 1 this is still
+  // same-core; after the core split the UI reads only this buffer.
+  UIBridge::publish(ctx_);
+}
+
+void AppFSM::updateServices() {
+  uint32_t tSection = 0;
 
   if (ctx_.networkInitialized) {
+    tSection = micros();
     serviceNetwork();
+    RuntimeDiag::recordSection(RuntimeDiag::ControlSection::NETWORK, (uint32_t)(micros() - tSection));
+
+    tSection = micros();
     TimeService::process(ctx_);
+    RuntimeDiag::recordSection(RuntimeDiag::ControlSection::TIME_SERVICE, (uint32_t)(micros() - tSection));
+
+    tSection = micros();
     Forecast::process(ctx_);
+    RuntimeDiag::recordSection(RuntimeDiag::ControlSection::FORECAST, (uint32_t)(micros() - tSection));
+
+    tSection = micros();
     MqttBridge::process(ctx_);
+    RuntimeDiag::recordSection(RuntimeDiag::ControlSection::MQTT, (uint32_t)(micros() - tSection));
   }
-  // ML ist ein optionaler Overlay-Layer. Es darf weder Safety noch die normale
-  // FSM blockieren; bei fehlenden Daten bleibt es automatisch passiv.
+
+  tSection = micros();
   MlOptimizer::process(ctx_, ctx_.commissioning.active || UI::commissioningTestActive());
-  // History ist optional und laeuft nur in einer freien IDLE-Phase. Bei aktivem
-  // Safety-Eingriff wird bewusst nicht auf SD geschrieben, damit Schutz und
-  // normale Regelung immer Vorrang vor Logging haben.
+  RuntimeDiag::recordSection(RuntimeDiag::ControlSection::ML, (uint32_t)(micros() - tSection));
+
   if (ctx_.state == SystemState::IDLE && !SafetyManager::status().blockNormalPumpControl) {
+    tSection = micros();
     History::process(ctx_);
+    RuntimeDiag::recordSection(RuntimeDiag::ControlSection::HISTORY, (uint32_t)(micros() - tSection));
   }
+
+  tSection = micros();
   Alarms::process(ctx_);
+  RuntimeDiag::recordSection(RuntimeDiag::ControlSection::ALARMS, (uint32_t)(micros() - tSection));
 }
 
 void AppFSM::runFastControlScheduler() {

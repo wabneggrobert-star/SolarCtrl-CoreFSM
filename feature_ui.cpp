@@ -31,8 +31,12 @@
 #include <WebServer.h>
 #include <SD.h>
 #include <WiFi.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "feature_build_flags.h"
+#include "feature_runtime_diag.h"
+#include "feature_ui_bridge.h"
 static WebServer server(80);
 
 namespace {
@@ -154,6 +158,11 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
     File file = SD.open(path);
     if (!file) return false;
 
+    // Phase 1D: the complete static UI, including HTML, is cacheable on the
+    // client. UI updates use the versioned URL convention (?v=<UI_VERSION>).
+    // Dynamic APIs explicitly use no-store in their handlers.
+    server.sendHeader("Cache-Control", "public, max-age=31536000, immutable");
+    server.sendHeader("X-SolarCtrl-UI-Version", String(UIBridge::UI_VERSION));
     server.streamFile(file, contentType(path));
     file.close();
     return true;
@@ -162,8 +171,17 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
   void handleRoot() {
     DBG_PRINTLN("HTTP GET ROOT");
 
-    if (serveSdFile("/index.html")) return;
-    if (serveSdFile("/www/index.html")) return;
+    // The root itself is only a tiny version selector and is intentionally not
+    // cached. The actual HTML remains long-term cached under its versioned URL.
+    // This prevents an immutable old /index.html from trapping the browser on
+    // an obsolete UI after a firmware/UI update.
+    if (SD.exists("/index.html") || SD.exists("/www/index.html")) {
+      const String target = String("/index.html?v=") + String(UIBridge::UI_VERSION);
+      server.sendHeader("Cache-Control", "no-store");
+      server.sendHeader("Location", target);
+      server.send(302, "text/plain", "");
+      return;
+    }
 
     server.send(404, "text/plain", "Keine index.html gefunden");
   }
@@ -219,8 +237,33 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
     return true;
   }
 
-  void appendSdWebDirectoryJson(String& json, const char* dirPath, bool& first) {
-    File dir = SD.open(dirPath);
+  bool sdWebDirectoryAllowed(const String& rawPath) {
+    String path = rawPath;
+    path.trim();
+    if (!path.startsWith("/")) return false;
+    if (path.indexOf("..") >= 0 || path.indexOf('\\') >= 0) return false;
+    if (path == "/config" || path.startsWith("/config/")) return false;
+    if (path == "/runtime" || path.startsWith("/runtime/")) return false;
+    if (path == "/logs" || path.startsWith("/logs/")) return false;
+    if (path.startsWith("/.")) return false;
+    return true;
+  }
+
+  // Service-Files is an on-demand maintenance view.  Walk the SD tree only
+  // when that page explicitly asks for it.  A hard entry/depth limit prevents
+  // a malformed or unexpectedly large card from monopolising the sync server.
+  static constexpr uint16_t SD_WEB_TREE_MAX_FILES = 256;
+  static constexpr uint8_t SD_WEB_TREE_MAX_DEPTH = 8;
+
+  void appendSdWebTreeJson(String& json,
+                           const String& dirPath,
+                           bool& first,
+                           uint16_t& fileCount,
+                           bool& truncated,
+                           uint8_t depth) {
+    if (truncated || depth > SD_WEB_TREE_MAX_DEPTH || !sdWebDirectoryAllowed(dirPath)) return;
+
+    File dir = SD.open(dirPath.c_str());
     if (!dir || !dir.isDirectory()) {
       if (dir) dir.close();
       return;
@@ -228,25 +271,38 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
 
     File entry = dir.openNextFile();
     while (entry) {
-      if (!entry.isDirectory()) {
-        String name = String(entry.name());
-        String fullPath;
-        if (name.startsWith("/")) {
-          fullPath = name;
-        } else if (String(dirPath) == "/") {
-          fullPath = "/" + name;
-        } else {
-          fullPath = String(dirPath) + "/" + name;
-        }
+      String name = String(entry.name());
+      String fullPath;
+      if (name.startsWith("/")) {
+        fullPath = name;
+      } else if (dirPath == "/") {
+        fullPath = "/" + name;
+      } else {
+        fullPath = dirPath + "/" + name;
+      }
 
+      if (entry.isDirectory()) {
+        entry.close();
+        if (sdWebDirectoryAllowed(fullPath)) {
+          appendSdWebTreeJson(json, fullPath, first, fileCount, truncated, depth + 1);
+        }
+      } else {
+        const uint32_t size = (uint32_t)entry.size();
+        entry.close();
         if (sdWebPathAllowed(fullPath)) {
+          if (fileCount >= SD_WEB_TREE_MAX_FILES) {
+            truncated = true;
+            break;
+          }
           if (!first) json += ",";
           first = false;
           json += "{\"path\":\"" + jsonEscape(fullPath.c_str()) + "\",";
-          json += "\"size\":" + String((uint32_t)entry.size()) + "}";
+          json += "\"size\":" + String(size) + "}";
+          fileCount++;
         }
       }
-      entry.close();
+
+      if (truncated) break;
       entry = dir.openNextFile();
     }
     dir.close();
@@ -262,14 +318,16 @@ String pwmOutputModeLabel(PwmOutputMode mode) {
       return;
     }
 
-    String json = "{\"files\":[";
+    String json;
+    json.reserve(4096);
+    json = "{\"files\":[";
     bool first = true;
-    appendSdWebDirectoryJson(json, "/", first);
-    appendSdWebDirectoryJson(json, "/www", first);
-    appendSdWebDirectoryJson(json, "/js", first);
-    appendSdWebDirectoryJson(json, "/css", first);
-    appendSdWebDirectoryJson(json, "/img", first);
-    json += "]}";
+    bool truncated = false;
+    uint16_t fileCount = 0;
+    appendSdWebTreeJson(json, "/", first, fileCount, truncated, 0);
+    json += "],\"count\":" + String(fileCount) + ",\"truncated\":";
+    json += truncated ? "true" : "false";
+    json += "}";
     server.send(200, "application/json", json);
   }
 
@@ -692,6 +750,99 @@ void handleAssignmentsJson() {
     return maximumC;
   }
 
+
+void handleUiVersionJson() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json",
+              String("{\"uiVersion\":") + String(UIBridge::UI_VERSION) +
+              ",\"binaryProtocol\":" + String(UIBridge::PROTOCOL_VERSION) + "}");
+}
+
+
+void sendQueuedControlCommand(UIBridge::ControlAction action, int32_t valueA = 0, int32_t valueB = 0) {
+  UIBridge::ControlCommand command;
+  command.type = UIBridge::CommandType::USER_COMMAND;
+  command.action = (uint16_t)action;
+  command.valueA = valueA;
+  command.valueB = valueB;
+
+  if (!UIBridge::submitCommand(command)) {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(503, "application/json", "{\"ok\":false,\"error\":\"command_queue_full\"}");
+    return;
+  }
+
+  char body[96];
+  snprintf(body, sizeof(body), "{\"ok\":true,\"queued\":true,\"commandId\":%lu}", (unsigned long)command.id);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(202, "application/json", body);
+}
+
+void handleQueuedBuzzerMute() {
+  bool mute = true;
+  if (server.hasArg("state")) {
+    String v = server.arg("state");
+    v.toLowerCase();
+    mute = !(v == "0" || v == "off" || v == "false");
+  }
+  sendQueuedControlCommand(UIBridge::ControlAction::BUZZER_MUTE, mute ? 1 : 0);
+}
+
+void handleQueuedOvenStart() {
+  sendQueuedControlCommand(UIBridge::ControlAction::OVEN_START);
+}
+
+void handleQueuedOvenStop() {
+  sendQueuedControlCommand(UIBridge::ControlAction::OVEN_STOP);
+}
+
+void handleUiCommandStatus() {
+  if (!server.hasArg("id")) {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(400, "application/json", "{\"error\":\"id_missing\"}");
+    return;
+  }
+
+  const uint32_t id = (uint32_t)strtoul(server.arg("id").c_str(), nullptr, 10);
+  UIBridge::CommandResult result;
+  if (!UIBridge::getCommandResult(id, result)) {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(404, "application/json", "{\"error\":\"command_unknown\"}");
+    return;
+  }
+
+  const char* state = "unknown";
+  switch (result.state) {
+    case UIBridge::CommandState::PENDING: state = "pending"; break;
+    case UIBridge::CommandState::APPLIED: state = "applied"; break;
+    case UIBridge::CommandState::REJECTED: state = "rejected"; break;
+    default: break;
+  }
+
+  char body[192];
+  snprintf(body, sizeof(body),
+           "{\"commandId\":%lu,\"state\":\"%s\",\"status\":%u,\"message\":\"%s\"}",
+           (unsigned long)result.id, state, (unsigned)result.httpStatus, result.message);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", body);
+}
+
+void handlePlantLiveBinary() {
+  // Fixed stack buffer; no JSON String and no heap allocation for the payload.
+  uint8_t packet[512];
+  const size_t len = UIBridge::encodePlantLiveV2(packet, sizeof(packet));
+  if (!len) {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(503, "text/plain", "snapshot unavailable");
+    return;
+  }
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("X-SolarCtrl-Binary-Protocol", String(UIBridge::PROTOCOL_VERSION));
+  server.setContentLength(len);
+  server.send(200, "application/octet-stream", "");
+  server.sendContent((const char*)packet, len);
+}
 
 void handlePlantLiveJson() {
   if (!s_ctx) {
@@ -4533,6 +4684,9 @@ void begin(AppContext& ctx) {
   server.on("/api/plant", HTTP_GET, handlePlantJson);
   server.on("/api/plant-overview", HTTP_GET, handlePlantJson);
   server.on("/api/plant-live", HTTP_GET, handlePlantLiveJson);
+  server.on("/api/plant-live.bin", HTTP_GET, handlePlantLiveBinary);
+  server.on("/api/ui-version", HTTP_GET, handleUiVersionJson);
+  server.on("/api/ui-command-status", HTTP_GET, handleUiCommandStatus);
   server.on("/api/heat-sources", HTTP_GET, handleHeatSourcesJson);
   server.on("/api/max-status", HTTP_GET, handleMaxStatusJson);
 #if SOLARCTRL_MAX_DIAGNOSTICS
@@ -4559,15 +4713,15 @@ void begin(AppContext& ctx) {
   server.on("/service-valve-config", HTTP_POST, handleValveConfig);
   server.on("/api/oven", HTTP_GET, handleOvenJson);
   server.on("/service-save-oven", HTTP_POST, handleOvenSave);
-  server.on("/service-oven-start", HTTP_POST, handleOvenStart);
-  server.on("/service-oven-stop", HTTP_POST, handleOvenStop);
+  server.on("/service-oven-start", HTTP_POST, handleQueuedOvenStart);
+  server.on("/service-oven-stop", HTTP_POST, handleQueuedOvenStop);
   server.on("/api/test/servo", HTTP_GET, handleTestServoJson);
   server.on("/api/test/sensors", HTTP_GET, handleTestSensorsJson);
   server.on("/api/test/safety", HTTP_GET, handleTestSafetyJson);
   server.on("/api/test/diagnostics", HTTP_GET, handleTestDiagnosticsJson);
   server.on("/api/alarms", HTTP_GET, handleAlarmsJson);
   server.on("/service-alarms-ack", HTTP_POST, handleAlarmsAck);
-  server.on("/service-alarm-buzzer-mute", HTTP_POST, handleBuzzerMute);
+  server.on("/service-alarm-buzzer-mute", HTTP_POST, handleQueuedBuzzerMute);
   server.on("/service-alarms-clear-history", HTTP_POST, handleAlarmsClearHistory);
   server.on("/api/testmode", HTTP_GET, handleTestModeGet);
   server.on("/service-testmode", HTTP_POST, handleTestModeSet);
@@ -4579,9 +4733,13 @@ void begin(AppContext& ctx) {
   server.on("/service-test-pump-output", HTTP_POST, handleTestPumpOutput);
   server.on("/service-test-heating-circuit-output", HTTP_POST, handleTestHeatingCircuitOutput);
   server.on("/service-test-all-off", HTTP_POST, handleTestAllOff);
+  server.on("/api/runtime-diag", HTTP_GET, []() { server.send(200, "application/json", RuntimeDiag::json()); });
   server.on("/api/sd/files", HTTP_GET, handleSdFilesJson);
   server.on("/api/sd/download", HTTP_GET, handleSdDownload);
   server.on("/api/sd/upload", HTTP_POST, handleSdUploadComplete, handleSdUploadStream);
+  // Legacy/dev-tool compatible upload alias. Uses the exact same PIN, path,
+  // temp-file and .bak commit logic as /api/sd/upload.
+  server.on("/sd-upload-direct", HTTP_POST, handleSdUploadComplete, handleSdUploadStream);
   server.on("/api/sd/delete", HTTP_POST, handleSdDelete);
   server.on("/service-factory-reset", HTTP_POST, handleFactoryReset);
   server.on("/service-restart", HTTP_POST, handleServiceRestart);
@@ -4607,7 +4765,7 @@ void update() {
   server.handleClient();
   if (g_restartScheduled && (int32_t)(millis() - g_restartAtMs) >= 0) {
     DBG_PRINTLN("Geplanter Neustart wird ausgefuehrt...");
-    delay(50);
+    DBG_FLUSH();
     ESP.restart();
   }
 }
