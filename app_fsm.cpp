@@ -27,6 +27,7 @@
 #include "feature_fluid_properties.h"
 #include "feature_history.h"
 #include "feature_runtime_diag.h"
+#include "feature_sensor_ring.h"
 #include "feature_ui_bridge.h"
 
 #include <Arduino.h>
@@ -176,6 +177,7 @@ AppFSM::AppFSM() {
 
 void AppFSM::begin() {
   UIBridge::begin();
+  SensorRing::begin();
   Serial.begin(SERIAL_BAUDRATE);
   delay(50);
 
@@ -795,6 +797,11 @@ void AppFSM::stateValidateSensors() {
   }
 
   EnergyMeter::process(ctx_);
+
+  // Stage 3A: Erst jetzt sind beide Sensorwelten vollstaendig abgeschlossen.
+  // Der Ring bekommt genau einen konsistenten Record pro regulaerem Messzyklus.
+  // Er ist rein beobachtend; Control/Safety lesen weiterhin unveraendert aus ctx_.
+  SensorRing::capture(ctx_);
 
   Ds18Role sinkRole = Ds18Role::NONE;
   readConfiguredStorageSink(

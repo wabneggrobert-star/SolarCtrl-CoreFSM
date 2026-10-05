@@ -36,6 +36,7 @@
 
 #include "feature_build_flags.h"
 #include "feature_runtime_diag.h"
+#include "feature_sensor_ring.h"
 #include "feature_ui_bridge.h"
 static WebServer server(80);
 
@@ -4734,6 +4735,7 @@ void begin(AppContext& ctx) {
   server.on("/service-test-heating-circuit-output", HTTP_POST, handleTestHeatingCircuitOutput);
   server.on("/service-test-all-off", HTTP_POST, handleTestAllOff);
   server.on("/api/runtime-diag", HTTP_GET, []() { server.send(200, "application/json", RuntimeDiag::json()); });
+  server.on("/api/sensor-ring", HTTP_GET, []() { server.send(200, "application/json", SensorRing::json()); });
   server.on("/api/sd/files", HTTP_GET, handleSdFilesJson);
   server.on("/api/sd/download", HTTP_GET, handleSdDownload);
   server.on("/api/sd/upload", HTTP_POST, handleSdUploadComplete, handleSdUploadStream);

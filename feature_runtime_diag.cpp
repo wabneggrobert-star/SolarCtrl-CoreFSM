@@ -1,4 +1,5 @@
 #include "feature_runtime_diag.h"
+#include "feature_sensor_ring.h"
 
 namespace {
 portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -91,7 +92,7 @@ Snapshot snapshot() {
 String json() {
   const Snapshot d = snapshot();
   String out;
-  out.reserve(360);
+  out.reserve(560);
   out += "{";
   out += "\"loopCount\":" + String(d.loopCount) + ",";
   out += "\"maxLoopGapUs\":" + String(d.maxLoopGapUs) + ",";
@@ -122,7 +123,18 @@ String json() {
     if (i) out += ",";
     out += String(d.stateMaxUs[i]);
   }
-  out += "]}";
+  out += "],\"sensorRing\":{";
+  const SensorRing::Stats ring = SensorRing::stats();
+  out += "\"capacity\":" + String(ring.capacity) + ",";
+  out += "\"count\":" + String(ring.count) + ",";
+  out += "\"recordSize\":" + String(ring.recordSize) + ",";
+  out += "\"totalWrites\":" + String(ring.totalWrites) + ",";
+  out += "\"overwrites\":" + String(ring.overwrites) + ",";
+  out += "\"lastSequence\":" + String(ring.lastSequence) + ",";
+  out += "\"lastCapturedMs\":" + String(ring.lastCapturedMs) + ",";
+  out += "\"lastAgeMs\":" + String(ring.lastAgeMs) + ",";
+  out += "\"maxCaptureUs\":" + String(ring.maxCaptureUs);
+  out += "}}";
   return out;
 }
 
@@ -168,6 +180,19 @@ void printPeriodic(uint32_t intervalMs) {
     (unsigned long)d.sectionMaxUs[(uint8_t)ControlSection::ALARMS],
     (unsigned)d.slowestState,
     (unsigned long)d.slowestStateUs
+  );
+
+  const SensorRing::Stats ring = SensorRing::stats();
+  Serial.printf(
+    "SENSORRING: count=%u/%u writes=%lu overwrites=%lu seq=%lu age=%lums record=%uB captureMax=%luus\n",
+    (unsigned)ring.count,
+    (unsigned)ring.capacity,
+    (unsigned long)ring.totalWrites,
+    (unsigned long)ring.overwrites,
+    (unsigned long)ring.lastSequence,
+    (unsigned long)ring.lastAgeMs,
+    (unsigned)ring.recordSize,
+    (unsigned long)ring.maxCaptureUs
   );
 }
 
