@@ -26,6 +26,28 @@ struct Record {
   float max31865C[MAX_MAX31865_CHANNELS];
 };
 
+enum class CursorStart : uint8_t {
+  OLDEST_AVAILABLE = 0,
+  NEXT_NEW = 1
+};
+
+// Per-consumer cursor. It contains no pointer into the ring and therefore
+// remains valid across wrap-around. Consumers advance by sequence number.
+struct Cursor {
+  uint32_t nextSequence = 0;
+  uint32_t totalReads = 0;
+  uint32_t droppedRecords = 0;
+  bool initialized = false;
+};
+
+struct CursorStats {
+  bool initialized = false;
+  uint32_t nextSequence = 0;
+  uint32_t totalReads = 0;
+  uint32_t droppedRecords = 0;
+  uint32_t pending = 0;
+};
+
 struct Stats {
   uint16_t capacity = CAPACITY;
   uint16_t count = 0;
@@ -53,6 +75,15 @@ bool copyLatest(Record& out);
 // age=0 = neuester Record, age=1 = vorletzter usw.
 // Diese Schnittstelle ist fuer spaetere Stage-3B-Consumer vorbereitet.
 bool copyNewest(uint16_t age, Record& out);
+
+// Stage 3B consumer API. A cursor can start with the oldest currently buffered
+// record or wait for the next newly captured record. readNext() copies at most
+// one fixed-size record per call. If a slow consumer falls behind beyond the
+// 64-record window, the cursor skips to the oldest available sequence and
+// accounts the lost records in droppedRecords.
+void initCursor(Cursor& cursor, CursorStart start = CursorStart::NEXT_NEW);
+bool readNext(Cursor& cursor, Record& out);
+CursorStats cursorStats(const Cursor& cursor);
 
 // Diagnose-Endpunkt fuer Stage-3A-Abnahme. Erzeugt Strings nur auf der
 // Service/UI-Seite; capture() selbst bleibt heap- und String-frei.

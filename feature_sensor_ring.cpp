@@ -114,6 +114,66 @@ bool copyLatest(Record& out) {
   return copyNewest(0, out);
 }
 
+void initCursor(Cursor& cursor, CursorStart start) {
+  cursor = Cursor{};
+  portENTER_CRITICAL(&g_ringMux);
+  if (start == CursorStart::OLDEST_AVAILABLE && g_count > 0) {
+    cursor.nextSequence = g_lastSequence - (uint32_t)g_count + 1U;
+  } else {
+    cursor.nextSequence = g_lastSequence + 1U;
+  }
+  cursor.initialized = true;
+  portEXIT_CRITICAL(&g_ringMux);
+}
+
+bool readNext(Cursor& cursor, Record& out) {
+  if (!cursor.initialized) initCursor(cursor, CursorStart::NEXT_NEW);
+
+  bool ok = false;
+  portENTER_CRITICAL(&g_ringMux);
+  if (g_count > 0) {
+    const uint32_t oldestSequence = g_lastSequence - (uint32_t)g_count + 1U;
+    const uint32_t newestSequence = g_lastSequence;
+
+    if (cursor.nextSequence < oldestSequence) {
+      cursor.droppedRecords += oldestSequence - cursor.nextSequence;
+      cursor.nextSequence = oldestSequence;
+    }
+
+    if (cursor.nextSequence <= newestSequence) {
+      const uint16_t oldestIndex = (uint16_t)((g_writeIndex + CAPACITY - g_count) % CAPACITY);
+      const uint32_t offset = cursor.nextSequence - oldestSequence;
+      const uint16_t index = (uint16_t)((oldestIndex + (uint16_t)offset) % CAPACITY);
+      out = g_records[index];
+      cursor.nextSequence = out.sequence + 1U;
+      ++cursor.totalReads;
+      ok = true;
+    }
+  }
+  portEXIT_CRITICAL(&g_ringMux);
+  return ok;
+}
+
+CursorStats cursorStats(const Cursor& cursor) {
+  CursorStats out;
+  out.initialized = cursor.initialized;
+  out.nextSequence = cursor.nextSequence;
+  out.totalReads = cursor.totalReads;
+  out.droppedRecords = cursor.droppedRecords;
+
+  if (!cursor.initialized) return out;
+
+  portENTER_CRITICAL(&g_ringMux);
+  if (g_count > 0) {
+    const uint32_t oldestSequence = g_lastSequence - (uint32_t)g_count + 1U;
+    uint32_t next = cursor.nextSequence;
+    if (next < oldestSequence) next = oldestSequence;
+    if (next <= g_lastSequence) out.pending = g_lastSequence - next + 1U;
+  }
+  portEXIT_CRITICAL(&g_ringMux);
+  return out;
+}
+
 String json() {
   const Stats s = stats();
   Record latest;

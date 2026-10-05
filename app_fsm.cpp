@@ -28,6 +28,7 @@
 #include "feature_history.h"
 #include "feature_runtime_diag.h"
 #include "feature_sensor_ring.h"
+#include "feature_sensor_ring_consumer.h"
 #include "feature_ui_bridge.h"
 
 #include <Arduino.h>
@@ -178,6 +179,7 @@ AppFSM::AppFSM() {
 void AppFSM::begin() {
   UIBridge::begin();
   SensorRing::begin();
+  SensorRingConsumer::begin();
   Serial.begin(SERIAL_BAUDRATE);
   delay(50);
 
@@ -287,6 +289,10 @@ void AppFSM::updateControl() {
 
 void AppFSM::updateServices() {
   uint32_t tSection = 0;
+
+  // Stage 3B: active bounded proof-consumer. It reads at most two fixed-size
+  // snapshots per service pass and performs no SD/UI/control work.
+  SensorRingConsumer::process(2);
 
   if (ctx_.networkInitialized) {
     tSection = micros();

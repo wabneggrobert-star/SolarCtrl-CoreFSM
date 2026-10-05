@@ -1,5 +1,6 @@
 #include "feature_runtime_diag.h"
 #include "feature_sensor_ring.h"
+#include "feature_sensor_ring_consumer.h"
 
 namespace {
 portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -134,6 +135,16 @@ String json() {
   out += "\"lastCapturedMs\":" + String(ring.lastCapturedMs) + ",";
   out += "\"lastAgeMs\":" + String(ring.lastAgeMs) + ",";
   out += "\"maxCaptureUs\":" + String(ring.maxCaptureUs);
+  out += "},\"sensorRingConsumer\":{";
+  const SensorRingConsumer::Stats consumer = SensorRingConsumer::stats();
+  out += "\"initialized\":" + String(consumer.initialized ? "true" : "false") + ",";
+  out += "\"totalReads\":" + String(consumer.totalReads) + ",";
+  out += "\"droppedRecords\":" + String(consumer.droppedRecords) + ",";
+  out += "\"sequenceErrors\":" + String(consumer.sequenceErrors) + ",";
+  out += "\"lastSequence\":" + String(consumer.lastSequence) + ",";
+  out += "\"pending\":" + String(consumer.pending) + ",";
+  out += "\"maxProcessUs\":" + String(consumer.maxProcessUs) + ",";
+  out += "\"maxSingleReadUs\":" + String(consumer.maxSingleReadUs);
   out += "}}";
   return out;
 }
@@ -193,6 +204,18 @@ void printPeriodic(uint32_t intervalMs) {
     (unsigned long)ring.lastAgeMs,
     (unsigned)ring.recordSize,
     (unsigned long)ring.maxCaptureUs
+  );
+
+  const SensorRingConsumer::Stats consumer = SensorRingConsumer::stats();
+  Serial.printf(
+    "SRCONSUMER: reads=%lu dropped=%lu seqErr=%lu lastSeq=%lu pending=%lu processMax=%luus readMax=%luus\n",
+    (unsigned long)consumer.totalReads,
+    (unsigned long)consumer.droppedRecords,
+    (unsigned long)consumer.sequenceErrors,
+    (unsigned long)consumer.lastSequence,
+    (unsigned long)consumer.pending,
+    (unsigned long)consumer.maxProcessUs,
+    (unsigned long)consumer.maxSingleReadUs
   );
 }
 
